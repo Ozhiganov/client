@@ -1,11 +1,8 @@
-Recent changes:
----------------
-- Keybase has a new icon. We thank our departing ferret-dog mascot for his years of loyalty.
+• Administering groups is easier than ever with the redesigned Teams tab
+• Prettier icons
+• Better handling of audio attachments in info panel
+• Forward images and attachments in chat
+• Improved file sharing with email addresses
+• Updated some emojis
+• Fix some hotkeys that could stop working
 
-- Keybase Chat has launched! You can read more about it on the Keybase blog.
-
-- Sharing before signup: Go ahead and put data in /keybase/private/you,friend@twitter/. If you have any invite codes, this will pop up a window with a link to DM them. It also works for end-to-end encryption with Reddit, Coinbase, Github, and Hacker News users.
-
-What we are currently working on:
----------------------------------
-- Mobile apps!

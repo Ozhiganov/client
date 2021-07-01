@@ -1,13 +1,31 @@
-
 @namespace("keybase.1")
 protocol Common {
 
+  // Time represents a time instant as the number of milliseconds elapsed since
+  // the Unix epoch (see UnixTime).
+  // Note: when converting to/from time.Time in go, the zero value of time.Time{}
+  // (January 1, year 1, 00:00:00 UTC) gets mapped to 0 (i.e. Jan 1 1970)
+  // Note 2: the conversion functions in go try to avoid but do not explicitly
+  // check for overflows during conversion.
   @typedef("long")
   record Time {}
+
+  // UnixTime represents a time instant as the number of seconds that have
+  // elapsed since the Unix epoch, that is 00:00:00 UTC on 1 January 1970.
+  // Note: when converting to/from time.Time, the zero value of time.Time{}
+  // (January 1, year 1, 00:00:00 UTC) gets mapped to 0 (i.e. Jan 1 1970)
+  // Note 2: the conversion functions in go try to avoid but do not explicitly
+  // check for overflows during conversion.
+  @typedef("long")
+  record UnixTime {}
 
   // Duration in seconds
   @typedef("double")
   record DurationSec {}
+
+  // Duration in milliseconds
+  @typedef("double")
+  record DurationMsec {}
 
   record StringKVPair {
     string key;
@@ -24,19 +42,38 @@ protocol Common {
   @typedef("string")
   record UID {}
 
+  @typedef("string") @lint("ignore")
+  record VID {}
+
   @typedef("string")
   record DeviceID {}
 
   @typedef("string")
   record SigID {}
 
+  @typedef("string")
+  record LeaseID {}
+
   // Most appearances of KIDs in protocol are in hex....
   @typedef("string")
   record KID {}
 
+  // Phone number in E.164 format.
+  @typedef("string")
+  record PhoneNumber {}
+
+  // Phone number, coming from the user, in no particular format.
+  // Possibly invalid. Should be validated and converted to PhoneNumber
+  // for internal use.
+  @typedef("string")
+  record RawPhoneNumber {}
+
   // Chain link IDs
   @typedef("string")
   record LinkID {}
+
+  @typedef("bytes")
+  record BinaryLinkID {}
 
   // But sometimes we need binary kids...
   @typedef("bytes")
@@ -44,6 +81,64 @@ protocol Common {
 
   @typedef("string")
   record TLFID {}
+
+  @typedef("string")
+  record TeamID {}
+
+  @typedef("string")
+  record UserOrTeamID {}
+
+  @typedef("string")
+  record GitRepoName {}
+
+  @typedef("bytes")
+  record HashMeta {}
+
+  record UserVersion {
+    UID uid;
+    Seqno eldestSeqno;
+  }
+
+  enum TeamType {
+    NONE_0,
+    LEGACY_1,
+    MODERN_2
+  }
+
+  // CompatibilityTeamID can refer to either a legacy TLF ID or a new-style team ID.
+  // Might eventually be useful but haven't found a need yet.
+  variant CompatibilityTeamID switch (TeamType typ) {
+    case LEGACY: TLFID;
+    case MODERN: TeamID;
+  }
+
+  enum TLFVisibility {
+    ANY_0,
+    PUBLIC_1,
+    PRIVATE_2
+  }
+
+  record TeamIDWithVisibility {
+    TeamID teamID;
+    TLFVisibility visibility;
+  }
+
+  record TeamIDAndName {
+    TeamID id;
+    TeamName name;
+  }
+
+  @typedef("int64") @lint("ignore")
+  record Seqno {}
+
+  enum SeqType {
+    NONE_0,
+    PUBLIC_1,
+    PRIVATE_2,
+    SEMIPRIVATE_3,
+    USER_PRIVATE_HIDDEN_16,
+    TEAM_PRIVATE_HIDDEN_17
+  }
 
   fixed Bytes32(32);
 
@@ -70,14 +165,15 @@ protocol Common {
     string parentID;
     DeviceID deviceID;
     string deviceDescription;
-    string deviceType;
+    DeviceTypeV2 deviceType;
     Time cTime;
     Time eTime;
+    boolean isRevoked;
   }
 
   record KeybaseTime {
     Time unix;
-    int chain;
+    Seqno chain;
   }
 
   record RevokedKey {
@@ -92,9 +188,11 @@ protocol Common {
   }
 
   record Device {
-    string type;
+    DeviceTypeV2 type;
     string name;
     DeviceID deviceID;
+    // For the GUI to display the correct icon for the device
+    int deviceNumberOfType;
     Time cTime;
     Time mTime;
     Time lastUsedTime;
@@ -107,6 +205,10 @@ protocol Common {
     DESKTOP_0,
     MOBILE_1
   }
+
+  @typedef("string")
+  record DeviceTypeV2{}
+
 
   record Stream {
     int fd;
@@ -127,8 +229,15 @@ protocol Common {
   enum ClientType {
     NONE_0,
     CLI_1,
-    GUI_2,
-    KBFS_3
+    GUI_MAIN_2,
+    KBFS_3,
+    GUI_HELPER_4
+  }
+
+  record KBFSPathInfo {
+    string standardPath;
+    string deeplinkPath;
+    string platformAfterMountPath;
   }
 
   record UserVersionVector {
@@ -136,12 +245,31 @@ protocol Common {
       int sigHints;
       long sigChain;
       Time cachedAt;
-      Time lastIdentifiedAt;
+  }
+
+  // PerUserKeyGeneration describes which generation of secret we're talking about.
+  // The sequence starts at 1, and should increment every time the per-user-secret
+  // rotates, which is every time a device is revoked.
+  @typedef("int")
+  @lint("ignore")
+  record PerUserKeyGeneration {}
+
+  @lint("ignore")
+  record PerUserKey {
+      int gen;
+      Seqno seqno;
+      KID sigKID;
+      KID encKID;
+      KID signedByKID; // The sibkey that delegated this PUK.
   }
 
   record UserPlusKeys {
       UID uid;
       string username;
+      Seqno eldestSeqno;
+
+      // =0 for an active user, and =216 for a deleted user
+      StatusCode status;
 
       // deviceKeys is a list of active device keys.  It does
       // not include PGP keys.
@@ -154,10 +282,28 @@ protocol Common {
       int pgpKeyCount;
 
       UserVersionVector uvv;
-      
+
       // deletedDeviceKeys is a list of deleted device keys.
       // (i.e. keys that were used before an account reset)
       array<PublicKey> deletedDeviceKeys;
+
+      // perUserKeys is the vector of kid-pairs derived from
+      // per-user secrets one for every generation.
+      @lint("ignore")
+      array<PerUserKey> perUserKeys;
+
+      // All resets that follow user incarnations with device keys.
+      array<ResetSummary> resets;
+  }
+
+  record UserOrTeamLite {
+      UserOrTeamID id;
+      string name;
+  }
+
+  enum UserOrTeamResult {
+      USER_1,
+      TEAM_2
   }
 
   record RemoteTrack {
@@ -176,7 +322,8 @@ protocol Common {
   enum MerkleTreeID {
        MASTER_0,
        KBFS_PUBLIC_1,
-       KBFS_PRIVATE_2
+       KBFS_PRIVATE_2,
+       KBFS_PRIVATETEAM_3
   }
 
   /**
@@ -188,21 +335,95 @@ protocol Common {
 
   /**
     SocialAssertion contains a service and username for that service, that
-    together form an assertion about a user. Resolving an assertion requires
+    together form an assertion about a user. It can either be a social
+    assertion (like "facebook" or "twitter") or a server trust assertion (like
+    "phone" or "email").
+
+    If the assertion is for social network, resolving an assertion requires
     that the user posts a Keybase proof on the asserted service as the asserted
     user.
+
+    For server trust assertion, we have to trust the server.
     */
   record SocialAssertion {
       string user;
       SocialAssertionService service;
   }
 
-  /**
-    UserResolution maps how an unresolved user assertion has been resolved.
-    */
-  record UserResolution {
-      SocialAssertion assertion;
-      UID userID;
+  @typedef("string")
+  record FullName {}
+
+  enum FullNamePackageVersion {
+    V0_0,
+    V1_1,
+    V2_2
   }
 
+  record FullNamePackage {
+    FullNamePackageVersion version;
+    FullName fullName;
+    Seqno eldestSeqno;
+    StatusCode status;
+    Time cachedAt;
+  }
+
+  record ImageCropRect {
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+  }
+
+  record PhoneLookupResult {
+    UID uid;
+    string username;
+    UnixTime ctime;
+  }
+
+  // Used for searching by phone number or email
+  enum IdentityVisibility {
+      PRIVATE_0,
+      PUBLIC_1
+  }
+
+  record SizedImage {
+    string path;
+    int width;
+  }
+
+  enum OfflineAvailability {
+    NONE_0,
+    BEST_EFFORT_1
+  }
+
+  record UserReacji {
+    string name;
+    union { null, string } customAddr;
+    union { null, string } customAddrNoAnim;
+  }
+
+  // Primarily used in chat but defined here to avoid a circular import
+  enum ReacjiSkinTone {
+    NONE_0,
+    SKINTONE1_1,
+    SKINTONE2_2,
+    SKINTONE3_3,
+    SKINTONE4_4,
+    SKINTONE5_5
+  }
+
+  record UserReacjis {
+    // sorted array of frequently used reacjis
+    array<UserReacji> topReacjis;
+    // user preference for default reacji skin tone
+    ReacjiSkinTone skinTone;
+  }
+
+  enum WotStatusType {
+    NONE_0,
+    PROPOSED_1,
+    ACCEPTED_2,
+    REJECTED_3,
+    REVOKED_4
+  }
 }

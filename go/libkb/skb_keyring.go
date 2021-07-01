@@ -3,16 +3,21 @@ package libkb
 import (
 	"encoding/base64"
 	"fmt"
-	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"io"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/keybase/client/go/kbcrypto"
+	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/go-codec/codec"
+	context "golang.org/x/net/context"
 )
 
 type SKBKeyringFile struct {
 	Contextified
 	sync.Mutex
+	username NormalizedUsername
 	filename string
 	Blocks   []*SKB
 	fpIndex  map[PGPFingerprint]*SKB
@@ -20,20 +25,29 @@ type SKBKeyringFile struct {
 	dirty    bool
 }
 
-func NewSKBKeyringFile(g *GlobalContext, n string) *SKBKeyringFile {
+func NewSKBKeyringFile(g *GlobalContext, un NormalizedUsername) *SKBKeyringFile {
 	return &SKBKeyringFile{
 		Contextified: NewContextified(g),
-		filename:     n,
+		username:     un,
+		filename:     g.SKBFilenameForUser(un),
 		fpIndex:      make(map[PGPFingerprint]*SKB),
 		kidIndex:     make(map[keybase1.KID]*SKB),
 		dirty:        false,
 	}
 }
 
-func (k *SKBKeyringFile) Load() (err error) {
+func (k *SKBKeyringFile) Load(ctx context.Context) (err error) {
 	k.Lock()
 	defer k.Unlock()
-	return k.loadLocked()
+	return k.loadLocked(ctx)
+}
+
+func (k *SKBKeyringFile) Username() NormalizedUsername {
+	return k.username
+}
+
+func (k *SKBKeyringFile) IsForUsername(un NormalizedUsername) bool {
+	return k.username.Eq(un)
 }
 
 func (k *SKBKeyringFile) MTime() (mtime time.Time, err error) {
@@ -53,32 +67,90 @@ func (k *SKBKeyringFile) MarkDirty() {
 	k.dirty = true
 }
 
-func (k *SKBKeyringFile) loadLocked() (err error) {
-	k.G().Log.Debug("+ Loading SKB keyring: %s", k.filename)
-	var packets KeybasePackets
-	var file *os.File
-	if file, err = os.OpenFile(k.filename, os.O_RDONLY, 0); err == nil {
-		stream := base64.NewDecoder(base64.StdEncoding, file)
-		packets, err = DecodePacketsUnchecked(stream)
-		tmp := file.Close()
-		if err == nil && tmp != nil {
-			err = tmp
-		}
+type skbPacket struct {
+	skb *SKB
+}
+
+// Okay to panic in Codec{Encode,Decode}Self, since the
+// encoder/decoder catches panics and turns them back into errors.
+
+func (s *skbPacket) CodecEncodeSelf(e *codec.Encoder) {
+	err := kbcrypto.EncodePacket(s.skb, e)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (s *skbPacket) CodecDecodeSelf(d *codec.Decoder) {
+	var skb SKB
+	err := kbcrypto.DecodePacket(d, &skb)
+	if err != nil {
+		panic(err)
+	}
+	s.skb = &skb
+}
+
+func encodeSKBPacketList(skbs []*SKB, w io.Writer) error {
+	ch := kbcrypto.CodecHandle()
+	encoder := codec.NewEncoder(w, ch)
+
+	packets := make([]skbPacket, len(skbs))
+	for i := range skbs {
+		packets[i].skb = skbs[i]
 	}
 
+	return encoder.Encode(packets)
+}
+
+func decodeSKBPacketList(r io.Reader, g *GlobalContext) ([]*SKB, error) {
+	ch := kbcrypto.CodecHandle()
+	decoder := codec.NewDecoder(r, ch)
+
+	var packets []skbPacket
+	err := decoder.Decode(&packets)
+	if err != nil {
+		return nil, err
+	}
+
+	skbs := make([]*SKB, len(packets))
+	for i, s := range packets {
+		s.skb.SetGlobalContext(g)
+		skbs[i] = s.skb
+	}
+	return skbs, nil
+}
+
+func (k *SKBKeyringFile) loadLocked(ctx context.Context) (err error) {
+	k.G().Log.CDebugf(ctx, "+ Loading SKB keyring: %s", k.filename)
+
+	file, err := os.OpenFile(k.filename, os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			k.G().Log.Debug("| Keybase secret keyring doesn't exist: %s", k.filename)
+			k.G().Log.CDebugf(ctx, "| Keybase secret keyring doesn't exist: %s", k.filename)
 		} else {
-			k.G().Log.Warning("Error opening %s: %s", k.filename, err)
-		}
+			k.G().Log.CWarningf(ctx, "Error opening %s: %s", k.filename, err)
 
-	} else if err == nil {
-		k.Blocks, err = packets.ToListOfSKBs()
+			MobilePermissionDeniedCheck(k.G(), err, fmt.Sprintf("skb keyring: %s", k.filename))
+		}
+		return err
+	}
+	defer func() {
+		closeErr := file.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+
+	stream := base64.NewDecoder(base64.StdEncoding, file)
+	skbs, err := decodeSKBPacketList(stream, k.G())
+	if err != nil {
+		return err
 	}
 
-	k.G().Log.Debug("- Loaded SKB keyring: %s -> %s", k.filename, ErrToOk(err))
-	return
+	k.Blocks = skbs
+
+	k.G().Log.CDebugf(ctx, "- Loaded SKB keyring: %s -> %s", k.filename, ErrToOk(err))
+	return nil
 }
 
 func (k *SKBKeyringFile) addToIndexLocked(g GenericKey, b *SKB) {
@@ -198,7 +270,10 @@ func (k *SKBKeyringFile) RemoveAllPGPBlocks() error {
 	k.Blocks = blocks
 	k.fpIndex = make(map[PGPFingerprint]*SKB)
 	k.kidIndex = make(map[keybase1.KID]*SKB)
-	k.indexLocked()
+	err := k.indexLocked()
+	if err != nil {
+		return err
+	}
 	k.dirty = true
 
 	return nil
@@ -229,13 +304,20 @@ func (k *SKBKeyringFile) Save() error {
 
 func (k *SKBKeyringFile) saveLocked() error {
 	if !k.dirty {
+		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: not dirty, so skipping save", k.filename)
 		return nil
 	}
+	if err := MakeParentDirs(k.G().Log, k.filename); err != nil {
+		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: failed to make parent dirs: %s", k.filename, err)
+		return err
+	}
+	k.G().Log.Debug("SKBKeyringFile: saveLocked %s: dirty, safe saving", k.filename)
 	if err := SafeWriteToFile(k.G().Log, k, 0); err != nil {
+		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: SafeWriteToFile error: %s", k.filename, err)
 		return err
 	}
 	k.dirty = false
-	k.G().Log.Debug("Updated keyring %s", k.filename)
+	k.G().Log.Debug("SKBKeyringFile: saveLocked success for %s", k.filename)
 	return nil
 }
 
@@ -276,10 +358,10 @@ func (k *SKBKeyringFile) lookupByKidLocked(kid keybase1.KID) *SKB {
 	return ret
 }
 
-func (k *SKBKeyringFile) LoadAndIndex() error {
+func (k *SKBKeyringFile) LoadAndIndex(ctx context.Context) error {
 	k.Lock()
 	defer k.Unlock()
-	err := k.loadLocked()
+	err := k.loadLocked(ctx)
 	if err == nil {
 		err = k.indexLocked()
 	}
@@ -293,77 +375,83 @@ func (k *SKBKeyringFile) GetFilename() string { return k.filename }
 
 // WriteTo is similar to GetFilename described just above in terms of
 // locking discipline.
-func (k *SKBKeyringFile) WriteTo(w io.Writer) (int64, error) {
-	k.G().Log.Debug("+ WriteTo")
-	defer k.G().Log.Debug("- WriteTo")
-	packets := make(KeybasePackets, len(k.Blocks))
-	var err error
-	for i, b := range k.Blocks {
-		if packets[i], err = b.ToPacket(); err != nil {
-			return 0, err
-		}
-	}
+func (k *SKBKeyringFile) WriteTo(w io.Writer) (n int64, err error) {
+	k.G().Log.Debug("+ SKBKeyringFile WriteTo")
+	defer k.G().Log.Debug("- SKBKeyringFile WriteTo")
 	b64 := base64.NewEncoder(base64.StdEncoding, w)
-	if err = packets.EncodeTo(b64); err != nil {
+	defer func() {
+		// explicitly check for error on Close:
+		if closeErr := b64.Close(); closeErr != nil {
+			k.G().Log.Warning("SKBKeyringFile: WriteTo b64.Close() error: %s", closeErr)
+			if err == nil {
+				n = 0
+				err = closeErr
+				return
+			}
+		}
+		k.G().Log.Debug("SKBKeyringFile: b64 stream closed successfully")
+	}()
+
+	if err := encodeSKBPacketList(k.Blocks, b64); err != nil {
 		k.G().Log.Warning("Encoding problem: %s", err)
 		return 0, err
 	}
-	b64.Close()
+
 	return 0, nil
 }
 
-func (k *SKBKeyringFile) Bug3964Repair(lctx LoginContext, lks *LKSec, dkm DeviceKeyMap) (ret *SKBKeyringFile, serverHalfSet *LKSecServerHalfSet, err error) {
-	defer k.G().Trace("SKBKeyringFile#Bug3964Repair", func() error { return err })()
+func (k *SKBKeyringFile) Bug3964Repair(m MetaContext, lks *LKSec, dkm DeviceKeyMap) (ret *SKBKeyringFile, serverHalfSet *LKSecServerHalfSet, err error) {
+	defer m.Trace("SKBKeyringFile#Bug3964Repair", &err)()
 
 	var newBlocks []*SKB
 	var hitBug3964 bool
 
-	k.G().Log.Debug("| # of blocks=%d", len(k.Blocks))
+	m.Debug("| # of blocks=%d", len(k.Blocks))
 
 	for i, b := range k.Blocks {
 
 		if b.Priv.Data == nil {
-			k.G().Log.Debug("| Null private data at block=%d", i)
+			m.Debug("| Null private data at block=%d", i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		if b.Priv.Encryption != LKSecVersion {
-			k.G().Log.Debug("| Skipping non-LKSec encryption (%d) at block=%d", b.Priv.Encryption, i)
+			m.Debug("| Skipping non-LKSec encryption (%d) at block=%d", b.Priv.Encryption, i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		var decryption, reencryption []byte
 		var badMask LKSecServerHalf
-		decryption, badMask, err = lks.decryptForBug3964Repair(b.Priv.Data, dkm)
+		decryption, badMask, err = lks.decryptForBug3964Repair(m, b.Priv.Data, dkm)
 		if err != nil {
-			k.G().Log.Debug("| Decryption failed at block=%d; keeping as is (%s)", i, err)
+			m.Debug("| Decryption failed at block=%d; keeping as is (%s)", i, err)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		if badMask.IsNil() {
-			k.G().Log.Debug("| Nil badmask at block=%d", i)
+			m.Debug("| Nil badmask at block=%d", i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		hitBug3964 = true
-		k.G().Log.Debug("| Hit bug 3964 at SKB block=%d", i)
+		m.Debug("| Hit bug 3964 at SKB block=%d", i)
 		if serverHalfSet == nil {
 			serverHalfSet = NewLKSecServerHalfSet()
 		}
 		serverHalfSet.Add(badMask)
 
-		reencryption, err = lks.Encrypt(decryption)
+		reencryption, err = lks.Encrypt(m, decryption)
 		if err != nil {
-			k.G().Log.Debug("| reencryption bug at block=%d", i)
+			m.Debug("| reencryption bug at block=%d", i)
 			return nil, nil, err
 		}
 
 		newSKB := &SKB{
-			Contextified: NewContextified(k.G()),
+			Contextified: NewContextified(m.G()),
 			Pub:          b.Pub,
 			Type:         b.Type,
 			Priv: SKBPriv{
@@ -379,7 +467,7 @@ func (k *SKBKeyringFile) Bug3964Repair(lctx LoginContext, lks *LKSec, dkm Device
 		return nil, nil, nil
 	}
 
-	ret = NewSKBKeyringFile(k.G(), k.filename)
+	ret = NewSKBKeyringFile(k.G(), k.username)
 	ret.dirty = true
 	ret.Blocks = newBlocks
 

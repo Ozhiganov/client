@@ -1,20 +1,27 @@
+repos:
 -   repo: local
     hooks:
+    -   id: rn-story-mode
+        name: rn-story-mode
+        entry: shared/ios/Keybase/git-hook
+        language: script
+        files: shared/ios/Keybase/Storybook.m
     -   id: eslint
         name: eslint
-        entry: sh
-        language: system
-        files: \.js$
-        args: [-c, 'cd shared && yarn run lint']
-    -   id: flow
-        name: flow
-        entry: sh
-        language: system
-        files: ''
-        args: [-c, 'cd shared && yarn run flow']
-
--   repo: git@github.com:keybase/pre-commit-golang.git
-    sha: '04b422b4c7fabfcf586e563e54334c659e6fd189'
+        entry: shared/node_modules/.bin/eslint
+        language: node
+        files: \.(js|ts|tsx)$
+        args: [
+            '--quiet',
+            '--resolve-plugins-relative-to shared'
+        ]
+    -   id: prettier
+        name: prettier
+        entry: shared/node_modules/.bin/prettier --write
+        language: node
+        files: \.(js|ts|tsx)$
+-   repo: https://github.com/keybase/pre-commit-golang.git
+    rev: 314766a2c26b7f32641addbdb0e7e451320ff1f0
     hooks:
     -   id: go-fmt
     -   id: go-vet

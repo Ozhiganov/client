@@ -7,28 +7,28 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 )
 
 // OutputSignatureSuccess prints the details of a successful verification.
-func OutputSignatureSuccess(ctx *Context, fingerprint libkb.PGPFingerprint, owner *libkb.User, signatureTime time.Time) {
+func OutputSignatureSuccess(m libkb.MetaContext, fingerprint libkb.PGPFingerprint, owner *libkb.User, signatureTime time.Time, warnings libkb.HashSecurityWarnings) error {
 	arg := keybase1.OutputSignatureSuccessArg{
 		Fingerprint: fingerprint.String(),
 		Username:    owner.GetName(),
-		SignedAt:    keybase1.TimeFromSeconds(signatureTime.Unix()),
+		SignedAt:    keybase1.ToTime(signatureTime),
+		Warnings:    warnings.Strings(),
 	}
-	ctx.PgpUI.OutputSignatureSuccess(context.TODO(), arg)
+	return m.UIs().PgpUI.OutputSignatureSuccess(m.Ctx(), arg)
 }
 
-// OutputSignatureSuccessNonKeybase prints the details of successful signature verification
+// OutputSignatureNonKeybase prints the details of signature verification
 // when signing key is not known to keybase.
-func OutputSignatureSuccessNonKeybase(ctx *Context, keyID uint64, signatureTime time.Time) {
-	arg := keybase1.OutputSignatureSuccessNonKeybaseArg{
+func OutputSignatureNonKeybase(m libkb.MetaContext, keyID uint64, signatureTime time.Time, warnings libkb.HashSecurityWarnings) error {
+	arg := keybase1.OutputSignatureNonKeybaseArg{
 		KeyID:    fmt.Sprintf("%X", keyID),
-		SignedAt: keybase1.TimeFromSeconds(signatureTime.Unix()),
+		SignedAt: keybase1.ToTime(signatureTime),
+		Warnings: warnings.Strings(),
 	}
-	ctx.PgpUI.OutputSignatureSuccessNonKeybase(ctx.NetContext, arg)
+	return m.UIs().PgpUI.OutputSignatureNonKeybase(m.Ctx(), arg)
 }

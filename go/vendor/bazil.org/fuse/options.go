@@ -106,6 +106,21 @@ func NoAppleXattr() MountOption {
 	return noAppleXattr
 }
 
+// NoBrowse makes OSXFUSE mark the volume as non-browsable, so that
+// Finder won't automatically browse it.
+//
+// OS X only.  Others ignore this option.
+func NoBrowse() MountOption {
+	return noBrowse
+}
+
+// NoLocalCaches makes disables all kernel caching.
+//
+// OS X only.  Others ignore this option.
+func NoLocalCaches() MountOption {
+	return noLocalCaches
+}
+
 // ExclCreate causes O_EXCL flag to be set for only "truly" exclusive creates,
 // i.e. create calls for which the initiator explicitly set the O_EXCL flag.
 //
@@ -263,6 +278,12 @@ type OSXFUSEPaths struct {
 
 // Default paths for OSXFUSE. See OSXFUSELocations.
 var (
+	OSXFUSELocationV4 = OSXFUSEPaths{
+		DevicePrefix: "/dev/macfuse",
+		Load:         "/Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse",
+		Mount:        "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
+		DaemonVar:    "_FUSE_DAEMON_PATH",
+	}
 	OSXFUSELocationV3 = OSXFUSEPaths{
 		DevicePrefix: "/dev/osxfuse",
 		Load:         "/Library/Filesystems/osxfuse.fs/Contents/Resources/load_osxfuse",
@@ -293,6 +314,18 @@ func OSXFUSELocations(paths ...OSXFUSEPaths) MountOption {
 		// replace previous values, but make a copy so there's no
 		// worries about caller mutating their slice
 		conf.osxfuseLocations = append(conf.osxfuseLocations[:0], paths...)
+		return nil
+	}
+}
+
+// AllowNonEmptyMount allows the mounting over a non-empty directory.
+//
+// The files in it will be shadowed by the freshly created mount. By
+// default these mounts are rejected to prevent accidental covering up
+// of data, which could for example prevent automatic backup.
+func AllowNonEmptyMount() MountOption {
+	return func(conf *mountConfig) error {
+		conf.options["nonempty"] = ""
 		return nil
 	}
 }

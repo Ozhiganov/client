@@ -17,6 +17,8 @@ import (
 type PGPSignEngine struct {
 	arg *PGPSignArg
 	libkb.Contextified
+
+	warnings libkb.HashSecurityWarnings
 }
 
 type PGPSignArg struct {
@@ -27,7 +29,7 @@ type PGPSignArg struct {
 
 func (p *PGPSignEngine) Prereqs() Prereqs {
 	return Prereqs{
-		Session: true,
+		Device: true,
 	}
 }
 
@@ -38,6 +40,7 @@ func (p *PGPSignEngine) Name() string {
 func (p *PGPSignEngine) RequiredUIs() []libkb.UIKind {
 	return []libkb.UIKind{
 		libkb.SecretUIKind,
+		libkb.PgpUIKind,
 	}
 }
 
@@ -45,14 +48,14 @@ func (p *PGPSignEngine) SubConsumers() []libkb.UIConsumer {
 	return nil
 }
 
-func NewPGPSignEngine(arg *PGPSignArg, g *libkb.GlobalContext) *PGPSignEngine {
+func NewPGPSignEngine(g *libkb.GlobalContext, arg *PGPSignArg) *PGPSignEngine {
 	return &PGPSignEngine{
 		arg:          arg,
 		Contextified: libkb.NewContextified(g),
 	}
 }
 
-func (p *PGPSignEngine) Run(ctx *Context) (err error) {
+func (p *PGPSignEngine) Run(m libkb.MetaContext) (err error) {
 	var key libkb.GenericKey
 	var pgp *libkb.PGPKeyBundle
 	var ok bool
@@ -83,12 +86,26 @@ func (p *PGPSignEngine) Run(ctx *Context) (err error) {
 		KeyType:  libkb.PGPKeyType,
 		KeyQuery: p.arg.Opts.KeyQuery,
 	}
-	key, err = p.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(ska, "command-line signature"))
+	key, err = p.G().Keyrings.GetSecretKeyWithPrompt(m, m.SecretKeyPromptArg(ska, "command-line signature"))
 	if err != nil {
 		return
 	} else if pgp, ok = key.(*libkb.PGPKeyBundle); !ok {
-		err = fmt.Errorf("Can only sign with PGP keys (for now)")
+		err = fmt.Errorf("Can only sign with PGP keys")
 		return
+	}
+
+	p.warnings = libkb.HashSecurityWarnings{}
+	if w := pgp.SecurityWarnings(
+		libkb.HashSecurityWarningOurIdentityHash,
+	); len(w) > 0 {
+		p.warnings = append(p.warnings, w...)
+	}
+	for _, warning := range p.warnings.Strings() {
+		if err := m.UIs().PgpUI.OutputPGPWarning(m.Ctx(), keybase1.OutputPGPWarningArg{
+			Warning: warning,
+		}); err != nil {
+			return err
+		}
 	}
 
 	bo := p.arg.Opts.BinaryOut

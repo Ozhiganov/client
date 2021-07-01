@@ -9,10 +9,29 @@ import (
 	"github.com/keybase/saltpack"
 )
 
-func SaltpackDecrypt(
-	g *GlobalContext, source io.Reader, sink io.WriteCloser,
-	deviceEncryptionKey NaclDHKeyPair,
-	checkSender func(*saltpack.MessageKeyInfo) error) (*saltpack.MessageKeyInfo, error) {
+func getStatusCodeFromDecryptionError(err *DecryptionError) (code int) {
+	switch err.Cause.Err.(type) {
+	case APINetError:
+		code = SCAPINetworkError
+	case saltpack.ErrNoSenderKey:
+		code = SCDecryptionKeyNotFound
+	case saltpack.ErrWrongMessageType:
+		code = SCWrongCryptoMsgType
+	}
+	return code
+}
+
+func SaltpackDecrypt(m MetaContext, source io.Reader, sink io.WriteCloser,
+	decryptionKeyring saltpack.SigncryptKeyring,
+	checkSenderMki func(*saltpack.MessageKeyInfo) error,
+	checkSenderSigningKey func(saltpack.SigningPublicKey) error,
+	keyResolver saltpack.SymmetricKeyResolver) (mki *saltpack.MessageKeyInfo, err error) {
+	defer func() {
+		if derr, ok := err.(DecryptionError); ok {
+			derr.Cause.StatusCode = getStatusCodeFromDecryptionError(&derr)
+			err = derr
+		}
+	}()
 
 	sc, newSource, err := ClassifyStream(source)
 	if err != nil {
@@ -29,47 +48,39 @@ func SaltpackDecrypt(
 
 	source = newSource
 
-	var mki *saltpack.MessageKeyInfo
-	var plainsource io.Reader
-	var frame saltpack.Frame
-	if sc.Armored {
-		mki, plainsource, frame, err = saltpack.NewDearmor62DecryptStream(source, naclKeyring(deviceEncryptionKey))
-	} else {
-		mki, plainsource, err = saltpack.NewDecryptStream(source, naclKeyring(deviceEncryptionKey))
-	}
-
+	// mki will be set for DH mode, senderSigningKey will be set for signcryption mode
+	plainsource, typ, mki, senderSigningKey, isArmored, brand, _, err := saltpack.ClassifyEncryptedStreamAndMakeDecoder(source, decryptionKeyring, keyResolver)
 	if err != nil {
-		return mki, err
+		return mki, DecryptionError{Cause: ErrorCause{Err: err}}
 	}
 
-	if checkSender != nil {
-		if err = checkSender(mki); err != nil {
-			return mki, err
+	if typ == saltpack.MessageTypeEncryption && checkSenderMki != nil {
+		if err = checkSenderMki(mki); err != nil {
+			return mki, DecryptionError{Cause: ErrorCause{Err: err}}
+		}
+	}
+	if typ == saltpack.MessageTypeSigncryption && checkSenderSigningKey != nil {
+		if err = checkSenderSigningKey(senderSigningKey); err != nil {
+			return nil, DecryptionError{Cause: ErrorCause{Err: err}}
 		}
 	}
 
 	n, err := io.Copy(sink, plainsource)
 	if err != nil {
-		return mki, err
+		return mki, DecryptionError{Cause: ErrorCause{Err: err}}
 	}
 
-	// TODO: Check header inline, and only warn if the footer
-	// doesn't match.
-	if sc.Armored {
-		var brand string
-		brand, err = saltpack.CheckArmor62Frame(frame, saltpack.MessageTypeEncryption)
-		if err != nil {
-			return mki, err
-		}
+	if isArmored {
+		// Note: the following check always passes!
 		if err = checkSaltpackBrand(brand); err != nil {
-			return mki, err
+			return mki, DecryptionError{Cause: ErrorCause{Err: err}}
 		}
 	}
 
-	g.Log.Debug("Decrypt: read %d bytes", n)
+	m.Debug("Decrypt: read %d bytes", n)
 
 	if err := sink.Close(); err != nil {
-		return mki, err
+		return mki, DecryptionError{Cause: ErrorCause{Err: err}}
 	}
 	return mki, nil
 }

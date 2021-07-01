@@ -25,13 +25,14 @@ type PGPEncryptArg struct {
 // PGPEncrypt encrypts data read from a source into a sink
 // for a set of users.  It will track them if necessary.
 type PGPEncrypt struct {
-	arg *PGPEncryptArg
-	me  *libkb.User
+	arg      *PGPEncryptArg
+	me       *libkb.User
+	warnings libkb.HashSecurityWarnings
 	libkb.Contextified
 }
 
 // NewPGPEncrypt creates a PGPEncrypt engine.
-func NewPGPEncrypt(arg *PGPEncryptArg, g *libkb.GlobalContext) *PGPEncrypt {
+func NewPGPEncrypt(g *libkb.GlobalContext, arg *PGPEncryptArg) *PGPEncrypt {
 	return &PGPEncrypt{
 		arg:          arg,
 		Contextified: libkb.NewContextified(g),
@@ -51,7 +52,10 @@ func (e *PGPEncrypt) Prereqs() Prereqs {
 // RequiredUIs returns the required UIs.
 func (e *PGPEncrypt) RequiredUIs() []libkb.UIKind {
 	// context.SecretKeyPromptArg requires SecretUI
-	return []libkb.UIKind{libkb.SecretUIKind}
+	return []libkb.UIKind{
+		libkb.SecretUIKind,
+		libkb.PgpUIKind,
+	}
 }
 
 // SubConsumers returns the other UI consumers for this engine.
@@ -63,12 +67,9 @@ func (e *PGPEncrypt) SubConsumers() []libkb.UIConsumer {
 }
 
 // Run starts the engine.
-func (e *PGPEncrypt) Run(ctx *Context) error {
+func (e *PGPEncrypt) Run(m libkb.MetaContext) error {
 	// verify valid options based on logged in state:
-	ok, uid, err := IsLoggedIn(e, ctx)
-	if err != nil {
-		return err
-	}
+	ok, uid := isLoggedIn(m)
 
 	if !ok {
 		// not logged in.  this is fine, unless they requested signing the message.
@@ -78,10 +79,10 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 
 		// or trying to encrypt for self
 		if !e.arg.NoSelf {
-			return libkb.LoginRequiredError{Context: "you must be logged in to encrypt for yourself"}
+			return libkb.LoginRequiredError{Context: "you must be logged in to encrypt for yourself (or use --no-self flag)"}
 		}
 	} else {
-		me, err := libkb.LoadMeByUID(ctx.GetNetContext(), e.G(), uid)
+		me, err := libkb.LoadMeByMetaContextAndUID(m, uid)
 		if err != nil {
 			return err
 		}
@@ -96,7 +97,7 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 			KeyType:  libkb.PGPKeyType,
 			KeyQuery: e.arg.KeyQuery,
 		}
-		key, err := e.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(ska, "command-line signature"))
+		key, err := e.G().Keyrings.GetSecretKeyWithPrompt(m, m.SecretKeyPromptArg(ska, "command-line signature"))
 		if err != nil {
 			return err
 		}
@@ -109,7 +110,7 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 		signer = mykey
 	}
 
-	usernames, err := e.verifyUsers(ctx, e.arg.Recips, ok)
+	usernames, err := e.verifyUsers(m, e.arg.Recips, ok)
 	if err != nil {
 		return err
 	}
@@ -118,8 +119,8 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 		Usernames: usernames,
 	}
 
-	kf := NewPGPKeyfinder(kfarg, e.G())
-	if err := RunEngine(kf, ctx); err != nil {
+	kf := NewPGPKeyfinder(e.G(), kfarg)
+	if err := RunEngine2(m, kf); err != nil {
 		return err
 	}
 	uplus := kf.UsersPlusKeys()
@@ -136,6 +137,36 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 	}
 
 	ks := newKeyset()
+	e.warnings = libkb.HashSecurityWarnings{}
+
+	if mykey != nil {
+		if w := mykey.SecurityWarnings(
+			libkb.HashSecurityWarningOurIdentityHash,
+		); len(w) > 0 {
+			e.warnings = append(e.warnings, w...)
+		}
+	}
+
+	for _, up := range uplus {
+		for _, k := range up.Keys {
+			if len(k.Entity.Revocations)+len(k.Entity.UnverifiedRevocations) > 0 {
+				continue
+			}
+
+			if w := k.SecurityWarnings(
+				libkb.HashSecurityWarningRecipientsIdentityHash,
+			); len(w) > 0 {
+				e.warnings = append(e.warnings, w...)
+			}
+
+			ks.Add(k)
+		}
+	}
+
+	if len(e.arg.Recips) > 0 && len(ks.keys) == 0 {
+		return errors.New("Cannot encrypt - recipient does not have a non-revoked key.")
+	}
+
 	if !e.arg.NoSelf {
 		if mykey == nil {
 			// need to load the public key for the logged in user
@@ -151,9 +182,11 @@ func (e *PGPEncrypt) Run(ctx *Context) error {
 		}
 	}
 
-	for _, up := range uplus {
-		for _, k := range up.Keys {
-			ks.Add(k)
+	for _, warning := range e.warnings.Strings() {
+		if err := m.UIs().PgpUI.OutputPGPWarning(m.Ctx(), keybase1.OutputPGPWarningArg{
+			Warning: warning,
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -175,12 +208,12 @@ func (e *PGPEncrypt) loadSelfKey() (*libkb.PGPKeyBundle, error) {
 
 	keys := me.FilterActivePGPKeys(true, e.arg.KeyQuery)
 	if len(keys) == 0 {
-		return nil, libkb.NoKeyError{Msg: "No PGP key found for encrypting for self"}
+		return nil, libkb.NoKeyError{Msg: "No PGP key found for encrypting for self (add a PGP key or use --no-self flag)"}
 	}
 	return keys[0], nil
 }
 
-func (e *PGPEncrypt) verifyUsers(ctx *Context, assertions []string, loggedIn bool) ([]string, error) {
+func (e *PGPEncrypt) verifyUsers(m libkb.MetaContext, assertions []string, loggedIn bool) ([]string, error) {
 	var names []string
 	for _, userAssert := range assertions {
 		arg := keybase1.Identify2Arg{
@@ -188,14 +221,18 @@ func (e *PGPEncrypt) verifyUsers(ctx *Context, assertions []string, loggedIn boo
 			Reason: keybase1.IdentifyReason{
 				Type: keybase1.IdentifyReasonType_ENCRYPT,
 			},
-			AlwaysBlock: true,
+			AlwaysBlock:      true,
+			IdentifyBehavior: keybase1.TLFIdentifyBehavior_CLI,
 		}
 		eng := NewResolveThenIdentify2(e.G(), &arg)
-		if err := RunEngine(eng, ctx); err != nil {
+		if err := RunEngine2(m, eng); err != nil {
 			return nil, libkb.IdentifyFailedError{Assertion: userAssert, Reason: err.Error()}
 		}
-		res := eng.Result()
-		names = append(names, res.Upk.Username)
+		res, err := eng.Result(m)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, res.Upk.GetName())
 	}
 	return names, nil
 }

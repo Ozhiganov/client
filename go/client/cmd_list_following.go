@@ -5,7 +5,6 @@ package client
 
 import (
 	"fmt"
-	"strings"
 
 	"golang.org/x/net/context"
 
@@ -39,13 +38,14 @@ func (s *CmdListTracking) ParseArgv(ctx *cli.Context) error {
 	return nil
 }
 
-func displayTable(entries []keybase1.UserSummary, verbose bool, headers bool) (err error) {
+func displayTable(g *libkb.GlobalContext, entries []keybase1.UserSummary, verbose bool, headers bool) (err error) {
+	tui := g.UI.GetTerminalUI()
 	if verbose {
 		noun := "users"
 		if len(entries) == 1 {
 			noun = "user"
 		}
-		GlobUI.Printf("Following %d %s:\n\n", len(entries), noun)
+		tui.Printf("Following %d %s:\n\n", len(entries), noun)
 	}
 
 	var cols []string
@@ -54,10 +54,8 @@ func displayTable(entries []keybase1.UserSummary, verbose bool, headers bool) (e
 		if verbose {
 			cols = []string{
 				"Username",
-				"Sig ID",
-				"PGP fingerprints",
-				"When Followed",
-				"Proofs",
+				"UID",
+				"Link ID",
 			}
 		} else {
 			cols = []string{"Username"}
@@ -76,31 +74,21 @@ func displayTable(entries []keybase1.UserSummary, verbose bool, headers bool) (e
 			return []string{entry.Username}
 		}
 
-		fps := make([]string, len(entry.Proofs.PublicKeys))
-		for i, k := range entry.Proofs.PublicKeys {
-			if k.PGPFingerprint != "" {
-				fps[i] = k.PGPFingerprint
-			}
-		}
-
 		row := []string{
 			entry.Username,
-			entry.SigIDDisplay,
-			strings.Join(fps, ", "),
-			keybase1.FormatTime(entry.TrackTime),
-		}
-		for _, proof := range entry.Proofs.Social {
-			row = append(row, proof.IdString)
+			entry.Uid.String(),
+			entry.LinkID.String(),
 		}
 		return row
 	}
 
-	GlobUI.Tablify(cols, rowfunc)
+	libkb.Tablify(tui.OutputWriter(), cols, rowfunc)
 	return
 }
 
-func DisplayJSON(jsonStr string) error {
-	_, err := GlobUI.Println(jsonStr)
+func displayJSON(g *libkb.GlobalContext, jsonStr string) error {
+	tui := g.UI.GetTerminalUI()
+	_, err := tui.Printf("%s\n", jsonStr)
 	return err
 }
 
@@ -119,21 +107,21 @@ func (s *CmdListTracking) Run() error {
 		if err != nil {
 			return err
 		}
-		return DisplayJSON(jsonStr)
+		return displayJSON(s.G(), jsonStr)
 	}
 
-	table, err := cli.ListTracking(context.TODO(), keybase1.ListTrackingArg{Filter: s.filter, Assertion: s.assertion})
+	ret, err := cli.ListTracking(context.TODO(), keybase1.ListTrackingArg{Filter: s.filter, Assertion: s.assertion})
 	if err != nil {
 		return err
 	}
-	return displayTable(table, s.verbose, s.headers)
+	return displayTable(s.G(), ret.Users, s.verbose, s.headers)
 }
 
 func NewCmdListTracking(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Command {
 	return cli.Command{
 		Name:         "list-following",
 		ArgumentHelp: "<username>",
-		Usage:        "List who you or the given user is following",
+		Usage:        "List who you or the given user is publicly following",
 		Action: func(c *cli.Context) {
 			cl.ChooseCommand(&CmdListTracking{Contextified: libkb.NewContextified(g)}, "following", c)
 		},

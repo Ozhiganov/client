@@ -15,7 +15,7 @@ mkdir -p $build_dest
 # Flirting with custom configuration but xcodebuild archive will only do Release
 # configuration.
 xcode_configuration="Release"
-code_sign_identity="Developer ID Application: Keybase, Inc. (99229SGT5K)"
+code_sign_identity="9FC3A5BC09FA2EE307C04060C918486411869B65" # "Developer ID Application: Keybase, Inc. (99229SGT5K)"
 
 echo "Plist: $plist"
 app_version="`/usr/libexec/plistBuddy -c "Print :CFBundleShortVersionString" $plist`"
@@ -37,7 +37,7 @@ app_path="$build_dest/$app_name.app"
 rm -rf $archive_path
 
 echo "Archiving..."
-set -o pipefail && xcodebuild archive -scheme $scheme -workspace $dir/../Keybase.xcworkspace -configuration $xcode_configuration -archivePath $archive_path | xcpretty -c
+set -o pipefail && xcodebuild archive -scheme "$scheme" -workspace "$dir/../Keybase.xcworkspace" -configuration "$xcode_configuration" -archivePath "$archive_path" | xcpretty -c
 
 # echo "Copying to archive"
 # archive_hold_path="/Users/gabe/Library/Developer/Xcode/Archives/$archive_dir_day/$app_name $archive_postfix.xcarchive"
@@ -48,49 +48,49 @@ set -o pipefail && xcodebuild archive -scheme $scheme -workspace $dir/../Keybase
 # Export
 #
 
-rm -rf $app_path
+rm -rf "$app_path"
 
 echo "Exporting..."
-set -o pipefail && xcodebuild -exportArchive -archivePath $archive_path -exportFormat app -exportPath $app_path | xcpretty -c
+set -o pipefail && xcodebuild -exportArchive -archivePath $archive_path -exportOptionsPlist export.plist -exportPath "$build_dest" | xcpretty -c
+mv "$build_dest/Keybase.app" "$app_path"
 
 echo "Done"
 echo ""
 
-cd $build_dest
+cd "$build_dest"
+
+echo "Copying kbfuse.bundle..."
+ditto ../../Fuse/kbfuse.bundle $app_name.app/Contents/Resources/kbfuse.bundle
+
+echo "
+
+xCode has trouble signing with Developer IDs properly so we need to re-sign.
+
+NOTE: If codesigning fails (ambiguous certificate) you need to manually delete
+the (old) March 12th version of the certificate from your Keychain.
+
+Re-signing using identity:
+
+$code_sign_identity
+
+"
 
 helper="$app_name.app/Contents/Library/LaunchServices/keybase.Helper"
+codesign --verbose -o library --force --timestamp --options runtime --preserve-metadata=identifier,entitlements --sign "$code_sign_identity" "$helper"
 
-if [ -f "$helper" ]; then
-  echo "
+codesign --verbose -o library --force  --deep --timestamp --options runtime --sign  "$code_sign_identity"  $app_name.app
+echo " "
 
-  xCode has trouble signing with Developer IDs properly so we need to re-sign.
-
-  NOTE: If codesigning fails (ambiguous certificate) you need to manually delete
-  the (old) March 12th version of the certificate from your Keychain.
-
-  Re-signing using identitiy:
-
-  $code_sign_identity
-
-  "
-
-  codesign --verbose --force --preserve-metadata=identifier,entitlements --timestamp=none --sign "$code_sign_identity" $app_name.app/Contents/Library/LaunchServices/keybase.Helper
-  codesign --verbose --force --deep --timestamp=none --sign "$code_sign_identity" $app_name.app
-
-  # Verify
-  #codesign --verify --verbose=4 Keybase.app
-  #spctl --assess --verbose=4 /Applications/Keybase.app/Contents/Library/LaunchServices/keybase.Helper
-
-  echo "Checking app..."
-  codesign -dvvvv $app_name.app
-  echo " "
-  spctl --assess --verbose=4 $app_name.app
-  echo "Checking Helper..."
-  codesign -dvvvv $app_name.app/Contents/Library/LaunchServices/keybase.Helper
-  # You don't spctl assess binaries anymore (only bundles)
-  # http://www.openradar.me/25618668
-  #spctl --assess --verbose=4 $app_name.app/Contents/Library/LaunchServices/keybase.Helper
-fi
+echo "Checking app..."
+codesign -dvvvv $app_name.app
+echo " "
+spctl --assess --verbose=4 $app_name.app
+echo "Checking Helper..."
+codesign -dvvvv $app_name.app/Contents/Library/LaunchServices/keybase.Helper
+# You don't spctl assess binaries anymore (only bundles)
+# http://www.openradar.me/25618668
+#spctl --assess --verbose=4 $app_name.app/Contents/Library/LaunchServices/keybase.Helper
+echo " "
 
 tar zcvpf $app_name-$app_version-darwin.tgz $app_name.app
 

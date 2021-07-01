@@ -75,9 +75,10 @@ func (c *CmdPGPEncrypt) Run() error {
 		return err
 	}
 	protocols := []rpc.Protocol{
+		NewPgpUIProtocol(c.G()),
 		NewStreamUIProtocol(c.G()),
 		NewSecretUIProtocol(c.G()),
-		NewIdentifyTrackUIProtocol(c.G()),
+		NewIdentifyUIProtocol(c.G()),
 	}
 	if err := RegisterProtocolsWithContext(protocols, c.G()); err != nil {
 		return err
@@ -108,7 +109,7 @@ func (c *CmdPGPEncrypt) ParseArgv(ctx *cli.Context) error {
 	msg := ctx.String("message")
 	outfile := ctx.String("outfile")
 	infile := ctx.String("infile")
-	if err := c.FilterInit(msg, infile, outfile); err != nil {
+	if err := c.FilterInit(c.G(), msg, infile, outfile); err != nil {
 		return err
 	}
 	c.recipients = ctx.Args()

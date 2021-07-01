@@ -9,6 +9,8 @@ import (
 	"io"
 	"io/ioutil"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func newStreamFromBase64String(t *testing.T, s string) io.Reader {
@@ -22,7 +24,7 @@ func newStreamFromBase64String(t *testing.T, s string) io.Reader {
 func assertStreamEqBase64(t *testing.T, r io.Reader, m string) {
 	buf, err := ioutil.ReadAll(r)
 	if err != nil {
-		t.Fatalf("an error occured during stream draining")
+		t.Fatalf("an error occurred during stream draining")
 	}
 	m2 := base64.StdEncoding.EncodeToString(buf)
 	if m != m2 {
@@ -95,7 +97,7 @@ func TestClassifyTestVectors(t *testing.T) {
 			msg: "QkVHSU4gS0VZQkFTRSBTQUxUUEFDSyBTSUdORUQgTUVTU0FHRS4ga1lNNWgxcGc2cXo5VU1uIGo2RzdLQjJPVWZ1MFdJaSAxWmZ5amRjWVZ3dUwwOWsgZTMzZWpnbWFObWZWckdQIDNLMlZSbTFaSUtNY1pRMCBPQjFyd1VqRjNPZnVSSkQgOVBMSmtDcFU4RnFvZFlQIHV4UlFwdjZ3aG1LUVRnTiBqbkEyYkFrNzRHYjJDTzYgdmNXbkFoTTdSUGlBYzFYIGFrMGx6RDVxMlNOT2diNyBreUphOEwwSThwSndHR1ggemdFS1QyNXlWcEZqanhiIGZ5MUc4anFaYTdpUDZqTSBrb3RMb2taZDJoYzBsdWQgQWROb2w0bGRIQ2VSR20wIFZpOXpFOTA5Vk5RS3Z1QSA0dWFsUnhTRmlyUWhqUzMgQXdEU21kU09mTHJuOThEIFpVTmNsVTMwMnlzeUJsNSBnMDAuIEVORCBLRVlCQVNFIFNBTFRQQUNLIFNJR05FRCBNRVNTQUdFLgo=",
 			sc: StreamClassification{
 				Format:  CryptoMessageFormatSaltpack,
-				Type:    CryptoMessageTypeSignature,
+				Type:    CryptoMessageTypeAttachedSignature,
 				Armored: true,
 			},
 		}, {
@@ -113,7 +115,7 @@ func TestClassifyTestVectors(t *testing.T) {
 		r := newStreamFromBase64String(t, v.msg)
 		sc, r2, err := ClassifyStream(r)
 		if err != nil {
-			t.Fatalf("an error occured while stream classifying (%d)", i)
+			t.Fatalf("an error occurred while stream classifying (%d)", i)
 		}
 		if sc.Format != v.sc.Format {
 			t.Fatalf("Bad format (%d)", i)
@@ -126,4 +128,10 @@ func TestClassifyTestVectors(t *testing.T) {
 		}
 		assertStreamEqBase64(t, r2, v.msg)
 	}
+}
+
+func TestClassifyBadVectors(t *testing.T) {
+	_, _, err := ClassifyStream(bytes.NewBufferString("\n\n\n\n\n\n\n\n"))
+	require.Error(t, err)
+	require.IsType(t, UnknownStreamError{}, err)
 }

@@ -2,8 +2,12 @@ package libkb
 
 import (
 	"encoding/json"
-	"golang.org/x/net/context"
+	"reflect"
 	"testing"
+	"time"
+
+	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMerkleRootPayloadUnmarshalWithSkips(t *testing.T) {
@@ -43,7 +47,7 @@ func TestMerkleSkipVectors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = ss.verify(context.TODO(), tc.G, skipTestVectorsThisRoot, skipTestVectorsLastRoot)
+		err = ss.verify(NewMetaContextForTest(tc), skipTestVectorsThisRoot, skipTestVectorsLastRoot)
 
 		tc.G.Log.Info("Iteration %d: test %s: %v", i, v.name, err)
 
@@ -62,4 +66,120 @@ func TestMerkleSkipVectors(t *testing.T) {
 			t.Fatalf("Got wrong error type in test %s: %v != %v", v.name, me.t, v.e)
 		}
 	}
+}
+
+func TestComputeSetBitsBigEndian(t *testing.T) {
+	tests := []struct {
+		x        uint
+		expected []uint
+	}{
+		{0, nil},
+		{1, []uint{1}},
+		{10, []uint{2, 8}},
+		{500, []uint{4, 16, 32, 64, 128, 256}},
+		{1023, []uint{1, 2, 4, 8, 16, 32, 64, 128, 256, 512}},
+		{1024, []uint{1024}},
+		{1025, []uint{1, 1024}},
+		{20000, []uint{32, 512, 1024, 2048, 16384}},
+	}
+	for _, test := range tests {
+		got := computeSetBitsBigEndian(test.x)
+		if !reflect.DeepEqual(got, test.expected) {
+			t.Fatalf("Failed on input %d, expected %v, got %v.", test.x, test.expected, got)
+		}
+	}
+}
+
+func TestComputeLogPatternMerkleSkips(t *testing.T) {
+	tests := []struct {
+		start    int
+		end      int
+		expected []uint
+	}{
+		{100, 2033, []uint{1009, 497, 241, 113, 105, 101}},
+		{100, 102, nil},
+		{100, 103, []uint{101}},
+	}
+	for _, test := range tests {
+		got, err := computeLogPatternMerkleSkips(keybase1.Seqno(test.start), keybase1.Seqno(test.end))
+		require.NoError(t, err)
+		if !reflect.DeepEqual(got, test.expected) {
+			t.Fatalf("Failed on input (%d, %d), expected %v, got %v.", test.start, test.end, test.expected, got)
+		}
+	}
+
+	_, err := computeLogPatternMerkleSkips(keybase1.Seqno(1000), keybase1.Seqno(999))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "startSeqno > endSeqno")
+}
+
+func TestComputeExpectedRootSkips(t *testing.T) {
+	tests := []struct {
+		root     int
+		expected []uint
+	}{
+		{0, nil},
+		{1, nil},
+		{100, []uint{99, 98, 96, 92, 84, 68, 36}},
+		{255, []uint{254, 253, 251, 247, 239, 223, 191, 127}},
+		{256, []uint{255, 254, 252, 248, 240, 224, 192, 128}},
+		{257, []uint{256, 255, 253, 249, 241, 225, 193, 129, 1}},
+		{1000, []uint{999, 998, 996, 992, 984, 968, 936, 872, 744, 488}},
+		{2048, []uint{2047, 2046, 2044, 2040, 2032, 2016, 1984, 1920, 1792, 1536, 1024}},
+	}
+	for _, test := range tests {
+		got := computeExpectedRootSkips(uint(test.root))
+		if !reflect.DeepEqual(got, test.expected) {
+			t.Fatalf("Failed on input (%d), expected %v, got %v.", test.root, test.expected, got)
+		}
+	}
+}
+
+func TestFetchRootFromServer(t *testing.T) {
+	tc := SetupTest(t, "MerkleClient", 0)
+	defer tc.Cleanup()
+
+	mc := tc.G.GetMerkleClient()
+
+	root, err := mc.FetchRootFromServer(NewMetaContextForTest(tc), 0)
+	require.NoError(t, err)
+	require.NotNil(t, root)
+
+	origAPI := tc.G.API
+
+	// Ensure these calls do not go to the server but still succeed (by switching the api interface)
+	tc.G.API = &ErrorMockAPI{}
+
+	rootNew, err := mc.FetchRootFromServer(NewMetaContextForTest(tc), 30*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, *root, *rootNew)
+
+	rootNew, err = mc.FetchRootFromServerByMinSeqno(NewMetaContextForTest(tc), *root.Seqno())
+	require.NoError(t, err)
+	require.Equal(t, *root, *rootNew)
+
+	rootNew, err = mc.FetchRootFromServerByMinSeqno(NewMetaContextForTest(tc), *root.Seqno()-3)
+	require.NoError(t, err)
+	require.Equal(t, *root, *rootNew)
+
+	// These calls should instead result in api calls to the server and fail
+	rootNew, err = mc.FetchRootFromServer(NewMetaContextForTest(tc), 0)
+	require.Error(t, err)
+	require.Equal(t, errMockAPI, err)
+	require.Nil(t, rootNew)
+
+	rootNew, err = mc.FetchRootFromServer(NewMetaContextForTest(tc), 1*time.Nanosecond)
+	require.Error(t, err)
+	require.Equal(t, errMockAPI, err)
+	require.Nil(t, rootNew)
+
+	rootNew, err = mc.FetchRootFromServerByMinSeqno(NewMetaContextForTest(tc), *root.Seqno()+3)
+	require.Error(t, err)
+	require.Equal(t, errMockAPI, err)
+	require.Nil(t, rootNew)
+
+	// if we put the api back, the call should succeed again
+	tc.G.API = origAPI
+	_, err = mc.FetchRootFromServerByMinSeqno(NewMetaContextForTest(tc), 0)
+	require.NoError(t, err)
 }

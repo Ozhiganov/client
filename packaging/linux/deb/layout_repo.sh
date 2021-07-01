@@ -12,7 +12,7 @@
 
 set -e -u -o pipefail
 
-here="$(dirname "$BASH_SOURCE")"
+here="$(dirname "${BASH_SOURCE[0]}")"
 
 build_root="${1:-}"
 if [ -z "$build_root" ] ; then
@@ -32,7 +32,7 @@ repo_root="$build_root/deb_repo"
 # Write out the reprepro config. We could just check this in, but writing it
 # here means that we're free to nuke the entire prod/linux dir (generally just
 # to test this build), and it also means we can share the PGP fingerprint.
-code_signing_fingerprint="$(cat "$here/../code_signing_fingerprint")"
+code_signing_fingerprint="$("$here/../fingerprint.sh")"
 mkdir -p "$repo_root/repo/conf"
 cat > "$repo_root/repo/conf/distributions" << END
 Codename: stable
@@ -52,15 +52,15 @@ for debian_arch in amd64 i386 ; do
   # PGP fingerprint of our code signing key.
   reprepro --basedir "$repo_root/repo" includedeb stable "$debfile"
 
-  # Update the latest pointer. (We use * to handle the version, because there's
-  # package_binaries.sh has special handling of + chars, and we don't want to
-  # duplicate it here.)
-  (cd "$repo_root" &&
-    ln -sf "repo/pool/main/k/$name/${name}_"*"_${debian_arch}.deb" \
-    "$repo_root/$name-latest-$debian_arch.deb")
-done
+  # We use * to handle the version, because package_binaries.sh has special
+  # handling of + chars, and we don't want to duplicate it here.
+  package_path="$(cd "$repo_root" && ls "repo/pool/main/k/$name/${name}_"*"_${debian_arch}.deb")"
 
-# Because the reprepro hierarchy only contains one version of each architecture
-# at a time, copy the imported packages into our own "all" directory.
-mkdir -p "$repo_root/all"
-cp "$repo_root"/repo/pool/main/*/"$name"/*.deb "$repo_root/all"
+  gpg --detach-sign --armor --use-agent --local-user "$code_signing_fingerprint" \
+      -o "$repo_root/$package_path.sig" "$repo_root/$package_path"
+
+  # Update the latest pointer.
+  ln -sf "$package_path" "$repo_root/$name-latest-$debian_arch.deb"
+  ln -sf "$package_path.sig" "$repo_root/$name-latest-$debian_arch.deb.sig"
+
+done

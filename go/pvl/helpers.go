@@ -4,8 +4,6 @@
 package pvl
 
 import (
-	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"regexp"
@@ -14,7 +12,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	libkb "github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
-	jsonw "github.com/keybase/go-jsonw"
 )
 
 // Substitute register values for %{name} in the string.
@@ -29,11 +26,12 @@ func substituteExact(template string, state scriptState) (string, libkb.ProofErr
 	return substituteInner(template, state, false)
 }
 
+var nameRE = regexp.MustCompile(`%\{[\w]*\}`)
+
 func substituteInner(template string, state scriptState, regexEscape bool) (string, libkb.ProofError) {
 	var outerr libkb.ProofError
 	// Regex to find %{name} occurrences.
 	// Match broadly here so that even %{} is sent to the default case and reported as invalid.
-	re := regexp.MustCompile(`%\{[\w]*\}`)
 	substituteOne := func(vartag string) string {
 		// Strip off the %, {, and }
 		varname := vartag[2 : len(vartag)-1]
@@ -48,7 +46,7 @@ func substituteInner(template string, state scriptState, regexEscape bool) (stri
 		}
 		return value
 	}
-	res := re.ReplaceAllStringFunc(template, substituteOne)
+	res := nameRE.ReplaceAllStringFunc(template, substituteOne)
 	if outerr != nil {
 		return template, outerr
 	}
@@ -63,71 +61,6 @@ func serviceToString(service keybase1.ProofType) (string, libkb.ProofError) {
 	}
 
 	return "", libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL, "Unsupported service %v", service)
-}
-
-// Return the elements of an array.
-func jsonUnpackArray(w *jsonw.Wrapper) ([]*jsonw.Wrapper, error) {
-	w, err := w.ToArray()
-	if err != nil {
-		return nil, err
-	}
-	length, err := w.Len()
-	if err != nil {
-		return nil, err
-	}
-	res := make([]*jsonw.Wrapper, length)
-	for i := 0; i < length; i++ {
-		res[i] = w.AtIndex(i)
-	}
-	return res, nil
-}
-
-// Return the elements of an array or values of a map.
-func jsonGetChildren(w *jsonw.Wrapper) ([]*jsonw.Wrapper, error) {
-	dict, err := w.ToDictionary()
-	isDict := err == nil
-	array, err := w.ToArray()
-	isArray := err == nil
-
-	switch {
-	case isDict:
-		keys, err := dict.Keys()
-		if err != nil {
-			return nil, err
-		}
-		var res = make([]*jsonw.Wrapper, len(keys))
-		for i, key := range keys {
-			res[i] = dict.AtKey(key)
-		}
-		return res, nil
-	case isArray:
-		return jsonUnpackArray(array)
-	default:
-		return nil, errors.New("got children of non-container")
-	}
-}
-
-// jsonStringSimple converts a simple json object into a string.
-// Simple objects are those that are not arrays or objects.
-// Non-simple objects result in an error.
-func jsonStringSimple(object *jsonw.Wrapper) (string, error) {
-	x, err := object.GetInt()
-	if err == nil {
-		return fmt.Sprintf("%d", x), nil
-	}
-	y, err := object.GetString()
-	if err == nil {
-		return y, nil
-	}
-	z, err := object.GetBool()
-	if err == nil {
-		if z {
-			return "true", nil
-		}
-		return "false", nil
-	}
-
-	return "", fmt.Errorf("Non-simple object: %v", object)
 }
 
 // selectionText gets the Text of all elements in a selection, concatenated by a space.
@@ -166,22 +99,6 @@ func selectionData(selection *goquery.Selection) string {
 	return strings.Join(results, " ")
 }
 
-// pyindex converts an index into a real index like python.
-// Returns an index to use and whether the index is safe to use.
-func pyindex(index, len int) (int, bool) {
-	if len <= 0 {
-		return 0, false
-	}
-	// wrap from the end
-	if index < 0 {
-		index = len + index
-	}
-	if index < 0 || index >= len {
-		return 0, false
-	}
-	return index, true
-}
-
 func stringsContains(xs []string, x string) bool {
 	for _, y := range xs {
 		if x == y {
@@ -190,6 +107,8 @@ func stringsContains(xs []string, x string) bool {
 	}
 	return false
 }
+
+var hasalpha = regexp.MustCompile(`\D`)
 
 // Check that a url is valid and has only a domain and is not an ip.
 // No port, path, protocol, user, query, or any other junk is allowed.
@@ -205,7 +124,6 @@ func validateDomain(s string) bool {
 	// To disallow the likes of "8.8.8.8."
 	dotsplit := strings.Split(strings.TrimSuffix(u.Host, "."), ".")
 	if len(dotsplit) > 0 {
-		hasalpha := regexp.MustCompile(`\D`)
 		group := dotsplit[len(dotsplit)-1]
 		if !hasalpha.MatchString(group) {
 			return false
@@ -247,12 +165,18 @@ func validateProtocol(s string, allowed []string) (string, bool) {
 	return canon, false
 }
 
-func rooterRewriteURL(ctx libkb.ProofContext, s string) (string, error) {
+func rooterRewriteURL(m metaContext, s string) (string, error) {
 	u1, err := url.Parse(s)
 	if err != nil {
 		return "", err
 	}
-	u2, err := url.Parse(ctx.GetServerURI())
+
+	serverURI, err := m.G().GetServerURI()
+	if err != nil {
+		return "", nil
+	}
+
+	u2, err := url.Parse(serverURI)
 	if err != nil {
 		return "", err
 	}

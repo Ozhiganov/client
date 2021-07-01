@@ -15,18 +15,19 @@ func TestPGPPurgeLksec(t *testing.T) {
 	tc := SetupEngineTest(t, "purge")
 	defer tc.Cleanup()
 
-	createFakeUserWithPGPSibkey(tc)
+	createFakeUserWithPGPSibkeyPaper(tc)
 
 	idUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI:   &libkb.TestSecretUI{}, // empty on purpose...shouldn't be necessary
 		SaltpackUI: &fakeSaltpackUI{},
 		IdentifyUI: idUI,
 	}
 	eng := NewPGPPurge(tc.G, keybase1.PGPPurgeArg{})
-	if err := RunEngine(eng, ctx); err != nil {
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -45,13 +46,14 @@ func TestPGPPurgeRemove(t *testing.T) {
 	idUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI:   &libkb.TestSecretUI{}, // empty on purpose...shouldn't be necessary
 		SaltpackUI: &fakeSaltpackUI{},
 		IdentifyUI: idUI,
 	}
 	eng := NewPGPPurge(tc.G, keybase1.PGPPurgeArg{DoPurge: true})
-	if err := RunEngine(eng, ctx); err != nil {
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,8 +61,8 @@ func TestPGPPurgeRemove(t *testing.T) {
 		t.Fatalf("number of exported key files: %d, expected 1", len(eng.KeyFiles()))
 	}
 
-	kr := libkb.NewSKBKeyringFile(tc.G, tc.G.SKBFilenameForUser(libkb.NewNormalizedUsername(u.Username)))
-	if err := kr.LoadAndIndex(); err != nil {
+	kr := libkb.NewSKBKeyringFile(tc.G, libkb.NewNormalizedUsername(u.Username))
+	if err := kr.LoadAndIndex(m.Ctx()); err != nil {
 		t.Fatal(err)
 	}
 	if kr.HasPGPKeys() {
@@ -70,7 +72,7 @@ func TestPGPPurgeRemove(t *testing.T) {
 	// redo, should purge 0 files
 
 	eng = NewPGPPurge(tc.G, keybase1.PGPPurgeArg{DoPurge: true})
-	if err := RunEngine(eng, ctx); err != nil {
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,15 +92,16 @@ func TestPGPPurgeSync(t *testing.T) {
 	tc = SetupEngineTest(t, "purge")
 	defer tc.Cleanup()
 
-	lctx := &Context{
+	uis := libkb.UIs{
 		ProvisionUI: newTestProvisionUIPassphrase(),
 		LoginUI:     &libkb.TestLoginUI{Username: u1.Username},
 		LogUI:       tc.G.UI.GetLogUI(),
 		SecretUI:    u1.NewSecretUI(),
 		GPGUI:       &gpgtestui{},
 	}
-	leng := NewLogin(tc.G, libkb.DeviceTypeDesktop, "", keybase1.ClientType_CLI)
-	if err := RunEngine(leng, lctx); err != nil {
+	leng := NewLogin(tc.G, keybase1.DeviceTypeV2_DESKTOP, "", keybase1.ClientType_CLI)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, leng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,13 +110,14 @@ func TestPGPPurgeSync(t *testing.T) {
 	idUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{
+	uis = libkb.UIs{
 		SecretUI:   &libkb.TestSecretUI{}, // empty on purpose...shouldn't be necessary
 		SaltpackUI: &fakeSaltpackUI{},
 		IdentifyUI: idUI,
 	}
 	eng := NewPGPPurge(tc.G, keybase1.PGPPurgeArg{})
-	if err := RunEngine(eng, ctx); err != nil {
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 

@@ -19,7 +19,11 @@ func TestPGPEncrypt(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -29,8 +33,9 @@ func TestPGPEncrypt(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,7 +55,11 @@ func TestPGPEncryptNoPGPNaClOnly(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u2.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u2.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -60,12 +69,13 @@ func TestPGPEncryptNoPGPNaClOnly(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
 	if perr, ok := err.(libkb.NoPGPEncryptionKeyError); !ok {
 		t.Fatalf("Got wrong error type: %T %v", err, err)
-	} else if !perr.HasDeviceKey {
-		t.Fatalf("Should have a PGP key")
+	} else if !perr.HasKeybaseEncryptionKey {
+		t.Fatalf("Should have a keybase encryption key")
 	} else if perr.User != u1.Username {
 		t.Fatalf("Wrong username")
 	}
@@ -79,7 +89,11 @@ func TestPGPEncryptSelfNoKey(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -89,8 +103,9 @@ func TestPGPEncryptSelfNoKey(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
 	if err == nil {
 		t.Fatal("no error encrypting for self without pgp key")
 	}
@@ -107,7 +122,11 @@ func TestPGPEncryptNoTrack(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -117,8 +136,9 @@ func TestPGPEncryptNoTrack(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,7 +161,11 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	msg := "encrypt for self only once"
 	sink := libkb.NewBufferCloser()
@@ -152,8 +176,9 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,13 +190,12 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 		Source: bytes.NewReader(out),
 		Sink:   decoded,
 	}
-	dec := NewPGPDecrypt(decarg, tc.G)
-	ctx.LogUI = tc.G.UI.GetLogUI()
-	ctx.PgpUI = &TestPgpUI{}
-	if err := RunEngine(dec, ctx); err != nil {
+	dec := NewPGPDecrypt(tc.G, decarg)
+	m = m.WithLogUI(tc.G.UI.GetLogUI()).WithPgpUI(&TestPgpUI{})
+	if err := RunEngine2(m, dec); err != nil {
 		t.Fatal(err)
 	}
-	decmsg := string(decoded.Bytes())
+	decmsg := decoded.String()
 	if decmsg != msg {
 		t.Errorf("decoded: %q, expected: %q", decmsg, msg)
 	}

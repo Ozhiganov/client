@@ -1,24 +1,35 @@
 package libkb
 
 import (
-	"golang.org/x/net/context"
 	"net/url"
 	"time"
 )
+
+type APISessionType int
+
+const (
+	APISessionTypeNONE     APISessionType = 0
+	APISessionTypeOPTIONAL APISessionType = 1
+	APISessionTypeREQUIRED APISessionType = 2
+)
+
+type APIHeader struct {
+	Key   string
+	Value string
+}
 
 type APIArg struct {
 	Endpoint        string
 	uArgs           url.Values
 	Args            HTTPArgs
 	JSONPayload     JSONPayload
-	NeedSession     bool
-	SessionR        SessionReader
+	SessionType     APISessionType
 	HTTPStatus      []int
 	AppStatusCodes  []int
 	InitialTimeout  time.Duration // optional
 	RetryMultiplier float64       // optional
 	RetryCount      int           // optional
-	NetContext      context.Context
+	UseText         bool
 }
 
 // NewAPIArg creates a standard APIArg that will result
@@ -26,13 +37,6 @@ type APIArg struct {
 func NewAPIArg(endpoint string) APIArg {
 	return APIArg{
 		Endpoint: endpoint,
-	}
-}
-
-func NewAPIArgWithNetContext(ctx context.Context, endpoint string) APIArg {
-	return APIArg{
-		NetContext: ctx,
-		Endpoint:   endpoint,
 	}
 }
 

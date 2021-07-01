@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/keybase/client/go/kbcrypto"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"golang.org/x/net/context"
 )
@@ -40,22 +41,26 @@ func (g *GPGKey) GetFingerprintP() *PGPFingerprint {
 	return g.fp
 }
 
-func (g *GPGKey) GetAlgoType() AlgoType {
-	return KIDPGPBase
+func (g *GPGKey) GetAlgoType() kbcrypto.AlgoType {
+	return kbcrypto.KIDPGPBase
 }
 
-func (g *GPGKey) SignToString(msg []byte) (sig string, id keybase1.SigID, err error) {
-	g.G().Log.Debug("+ GPGKey Signing %s", string(msg))
+func (g *GPGKey) SignToString(msg []byte) (sig string, id keybase1.SigIDBase, err error) {
+	return g.SignToStringMctx(NewMetaContext(context.TODO(), g.G()), msg)
+}
+
+func (g *GPGKey) SignToStringMctx(mctx MetaContext, msg []byte) (sig string, id keybase1.SigIDBase, err error) {
+	mctx.Debug("+ GPGKey Signing %s", string(msg))
 	defer func() {
-		g.G().Log.Debug("- GPGKey Signing -> %s", err)
+		mctx.Debug("- GPGKey Signing -> %s", err)
 	}()
 
 	if g.ct == keybase1.ClientType_CLI {
-		g.G().Log.Debug("| GPGKey reverse delegate to CLI")
-		sig, err = g.ui.Sign(context.TODO(), keybase1.SignArg{Fingerprint: (*g.fp)[:], Msg: msg})
+		mctx.Debug("| GPGKey reverse delegate to CLI")
+		sig, err = g.ui.Sign(mctx.Ctx(), keybase1.SignArg{Fingerprint: (*g.fp)[:], Msg: msg})
 	} else {
-		g.G().Log.Debug("| GPGKey sign in-process; let's hope for the best!")
-		sig, err = g.G().GetGpgClient().Sign(*g.fp, msg)
+		mctx.Debug("| GPGKey sign in-process; let's hope for the best!")
+		sig, err = g.G().GetGpgClient().Sign(mctx, *g.fp, msg)
 	}
 
 	if err != nil {
@@ -64,20 +69,22 @@ func (g *GPGKey) SignToString(msg []byte) (sig string, id keybase1.SigID, err er
 
 	// compute sig id:
 	h := sha256.New()
-	h.Write(msg)
-	id, err = keybase1.SigIDFromSlice(h.Sum(nil))
+	_, err = h.Write(msg)
 	if err != nil {
 		return sig, id, err
 	}
-
+	var hsh [32]byte
+	var tmp = h.Sum(nil)
+	copy(hsh[:], tmp)
+	id = keybase1.SigIDBaseFromBytes(hsh)
 	return sig, id, nil
 }
 
-func (g *GPGKey) VerifyStringAndExtract(ctx VerifyContext, sig string) (msg []byte, id keybase1.SigID, err error) {
+func (g *GPGKey) VerifyStringAndExtract(ctx VerifyContext, sig string) (msg []byte, id keybase1.SigIDBase, err error) {
 	return msg, id, errors.New("VerifyStringAndExtract not implemented")
 }
 
-func (g *GPGKey) VerifyString(ctx VerifyContext, sig string, msg []byte) (id keybase1.SigID, err error) {
+func (g *GPGKey) VerifyString(ctx VerifyContext, sig string, msg []byte) (id keybase1.SigIDBase, err error) {
 	return id, errors.New("VerifyString not implemented")
 }
 
@@ -121,6 +128,6 @@ func (g *GPGKey) Encode() (string, error) {
 	return "", errors.New("Encode not implemented")
 }
 
-func (g *GPGKey) SecretSymmetricKey(reason EncryptionReason) ([]byte, error) {
-	return nil, KeyCannotEncryptError{}
+func (g *GPGKey) SecretSymmetricKey(reason EncryptionReason) (NaclSecretBoxKey, error) {
+	return NaclSecretBoxKey{}, KeyCannotEncryptError{}
 }

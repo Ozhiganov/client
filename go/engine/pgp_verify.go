@@ -34,7 +34,7 @@ type PGPVerify struct {
 }
 
 // NewPGPVerify creates a PGPVerify engine.
-func NewPGPVerify(arg *PGPVerifyArg, g *libkb.GlobalContext) *PGPVerify {
+func NewPGPVerify(g *libkb.GlobalContext, arg *PGPVerifyArg) *PGPVerify {
 	return &PGPVerify{
 		arg:          arg,
 		Contextified: libkb.NewContextified(g),
@@ -66,9 +66,9 @@ func (e *PGPVerify) SubConsumers() []libkb.UIConsumer {
 }
 
 // Run starts the engine.
-func (e *PGPVerify) Run(ctx *Context) error {
+func (e *PGPVerify) Run(m libkb.MetaContext) error {
 	var err error
-	defer e.G().Trace("PGPVerify::Run", func() error { return err })()
+	defer m.Trace("PGPVerify#Run", &err)()
 	var sc libkb.StreamClassification
 	sc, e.source, err = libkb.ClassifyStream(e.arg.Source)
 
@@ -80,14 +80,14 @@ func (e *PGPVerify) Run(ctx *Context) error {
 	}
 
 	if sc.Format == libkb.CryptoMessageFormatPGP && sc.Type == libkb.CryptoMessageTypeClearSignature {
-		err = e.runClearsign(ctx)
+		err = e.runClearsign(m)
 		return err
 	}
 	if len(e.arg.Signature) == 0 {
-		err = e.runAttached(ctx)
+		err = e.runAttached(m)
 		return err
 	}
-	err = e.runDetached(ctx)
+	err = e.runDetached(m)
 	return err
 }
 
@@ -100,15 +100,15 @@ func (e *PGPVerify) Signer() *libkb.User {
 }
 
 // runAttached verifies an attached signature
-func (e *PGPVerify) runAttached(ctx *Context) error {
+func (e *PGPVerify) runAttached(m libkb.MetaContext) error {
 	arg := &PGPDecryptArg{
 		Source:       e.source,
 		Sink:         libkb.NopWriteCloser{W: ioutil.Discard},
 		AssertSigned: true,
 		SignedBy:     e.arg.SignedBy,
 	}
-	eng := NewPGPDecrypt(arg, e.G())
-	if err := RunEngine(eng, ctx); err != nil {
+	eng := NewPGPDecrypt(m.G(), arg)
+	if err := RunEngine2(m, eng); err != nil {
 		return err
 	}
 	e.signStatus = eng.SignatureStatus()
@@ -118,8 +118,8 @@ func (e *PGPVerify) runAttached(ctx *Context) error {
 }
 
 // runDetached verifies a detached signature
-func (e *PGPVerify) runDetached(ctx *Context) error {
-	sk, err := NewScanKeys(ctx.SecretUI, e.G())
+func (e *PGPVerify) runDetached(m libkb.MetaContext) error {
+	sk, err := NewScanKeys(m)
 	if err != nil {
 		return err
 	}
@@ -131,14 +131,35 @@ func (e *PGPVerify) runDetached(ctx *Context) error {
 	if err != nil {
 		return err
 	}
+	hashMethod, _, err := libkb.ExtractPGPSignatureHashMethod(sk, e.arg.Signature)
+	if err != nil {
+		return err
+	}
 
 	e.signer = sk.KeyOwnerByEntity(signer)
 	e.signStatus = &libkb.SignatureStatus{IsSigned: true}
 
+	if !libkb.IsHashSecure(hashMethod) {
+		e.signStatus.Warnings = append(
+			e.signStatus.Warnings,
+			libkb.NewHashSecurityWarning(
+				libkb.HashSecurityWarningSignatureHash,
+				hashMethod,
+				nil,
+			),
+		)
+	}
+
 	if signer != nil {
+		if len(signer.UnverifiedRevocations) > 0 {
+			return libkb.BadSigError{
+				E: fmt.Sprintf("Key %x belonging to %q has been revoked by its designated revoker.", signer.PrimaryKey.KeyId, e.signer.GetName()),
+			}
+		}
+
 		e.signStatus.Verified = true
 		e.signStatus.Entity = signer
-		if err := e.checkSignedBy(ctx); err != nil {
+		if err := e.checkSignedBy(m); err != nil {
 			return err
 		}
 
@@ -158,17 +179,31 @@ func (e *PGPVerify) runDetached(ctx *Context) error {
 
 		if val, ok := p.(*packet.Signature); ok {
 			e.signStatus.SignatureTime = val.CreationTime
+		} else if val, ok := p.(*packet.SignatureV3); ok {
+			e.signStatus.SignatureTime = val.CreationTime
+		}
+
+		if warnings := libkb.NewPGPKeyBundle(signer).SecurityWarnings(
+			libkb.HashSecurityWarningSignersIdentityHash,
+		); len(warnings) > 0 {
+			e.signStatus.Warnings = append(
+				e.signStatus.Warnings,
+				warnings...,
+			)
 		}
 
 		fingerprint := libkb.PGPFingerprint(signer.PrimaryKey.Fingerprint)
-		OutputSignatureSuccess(ctx, fingerprint, e.signer, e.signStatus.SignatureTime)
+		err = OutputSignatureSuccess(m, fingerprint, e.signer, e.signStatus.SignatureTime, e.signStatus.Warnings)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 // runClearsign verifies a clearsign signature
-func (e *PGPVerify) runClearsign(ctx *Context) error {
+func (e *PGPVerify) runClearsign(m libkb.MetaContext) error {
 	// clearsign decode only works with the whole data slice, not a reader
 	// so have to read it all here:
 	msg, err := ioutil.ReadAll(e.source)
@@ -185,7 +220,7 @@ func (e *PGPVerify) runClearsign(ctx *Context) error {
 		return err
 	}
 
-	sk, err := NewScanKeys(ctx.SecretUI, e.G())
+	sk, err := NewScanKeys(m)
 	if err != nil {
 		return err
 	}
@@ -194,14 +229,35 @@ func (e *PGPVerify) runClearsign(ctx *Context) error {
 	if err != nil {
 		return fmt.Errorf("Check sig error: %s", err)
 	}
+	hashMethod, _, err := libkb.ExtractPGPSignatureHashMethod(sk, sigBody)
+	if err != nil {
+		return err
+	}
 
 	e.signer = sk.KeyOwnerByEntity(signer)
 	e.signStatus = &libkb.SignatureStatus{IsSigned: true}
 
+	if !libkb.IsHashSecure(hashMethod) {
+		e.signStatus.Warnings = append(
+			e.signStatus.Warnings,
+			libkb.NewHashSecurityWarning(
+				libkb.HashSecurityWarningSignatureHash,
+				hashMethod,
+				nil,
+			),
+		)
+	}
+
 	if signer != nil {
+		if len(signer.UnverifiedRevocations) > 0 {
+			return libkb.BadSigError{
+				E: fmt.Sprintf("Key %x belonging to %q has been revoked by its designated revoker.", signer.PrimaryKey.KeyId, e.signer.GetName()),
+			}
+		}
+
 		e.signStatus.Verified = true
 		e.signStatus.Entity = signer
-		if err := e.checkSignedBy(ctx); err != nil {
+		if err := e.checkSignedBy(m); err != nil {
 			return err
 		}
 
@@ -212,16 +268,30 @@ func (e *PGPVerify) runClearsign(ctx *Context) error {
 
 		if val, ok := p.(*packet.Signature); ok {
 			e.signStatus.SignatureTime = val.CreationTime
+		} else if val, ok := p.(*packet.SignatureV3); ok {
+			e.signStatus.SignatureTime = val.CreationTime
+		}
+
+		if warnings := libkb.NewPGPKeyBundle(signer).SecurityWarnings(
+			libkb.HashSecurityWarningSignersIdentityHash,
+		); len(warnings) > 0 {
+			e.signStatus.Warnings = append(
+				e.signStatus.Warnings,
+				warnings...,
+			)
 		}
 
 		fingerprint := libkb.PGPFingerprint(signer.PrimaryKey.Fingerprint)
-		OutputSignatureSuccess(ctx, fingerprint, e.signer, e.signStatus.SignatureTime)
+		err = OutputSignatureSuccess(m, fingerprint, e.signer, e.signStatus.SignatureTime, e.signStatus.Warnings)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (e *PGPVerify) checkSignedBy(ctx *Context) error {
+func (e *PGPVerify) checkSignedBy(m libkb.MetaContext) error {
 	if len(e.arg.SignedBy) == 0 {
 		// no assertion necessary
 		return nil
@@ -233,7 +303,7 @@ func (e *PGPVerify) checkSignedBy(ctx *Context) error {
 
 	// have: a valid signature, the signature's owner, and a user assertion to
 	// match against
-	e.G().Log.Debug("checking signed by assertion: %q", e.arg.SignedBy)
+	m.Debug("checking signed by assertion: %q", e.arg.SignedBy)
 
 	// load the user in SignedBy
 	arg := keybase1.Identify2Arg{
@@ -243,17 +313,20 @@ func (e *PGPVerify) checkSignedBy(ctx *Context) error {
 		NoSkipSelf:    true,
 	}
 	eng := NewResolveThenIdentify2(e.G(), &arg)
-	if err := RunEngine(eng, ctx); err != nil {
+	if err := RunEngine2(m, eng); err != nil {
 		return err
 	}
-	signByUser := eng.Result().Upk
+	res, err := eng.Result(m)
+	if err != nil {
+		return err
+	}
+	signByUser := res.Upk
 
 	// check if it is equal to signature owner
-	if !e.signer.GetUID().Equal(signByUser.Uid) {
+	if !e.signer.GetUID().Equal(signByUser.GetUID()) {
 		return libkb.BadSigError{
 			E: fmt.Sprintf("Signer %q did not match signed by assertion %q", e.signer.GetName(), e.arg.SignedBy),
 		}
 	}
-
 	return nil
 }

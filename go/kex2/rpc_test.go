@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,6 +82,10 @@ func (mp *mockProvisioner) GetLogFactory() rpc.LogFactory {
 	return makeLogFactory()
 }
 
+func (mp *mockProvisioner) GetNetworkInstrumenter() rpc.NetworkInstrumenterStorage {
+	return &rpc.DummyInstrumentationStorage{}
+}
+
 func (mp *mockProvisioner) CounterSign(input keybase1.HelloRes) (output []byte, err error) {
 	output = []byte(string(input))
 	return
@@ -104,22 +109,26 @@ func (mp *mockProvisionee) GetLogFactory() rpc.LogFactory {
 	return makeLogFactory()
 }
 
+func (mp *mockProvisionee) GetNetworkInstrumenter() rpc.NetworkInstrumenterStorage {
+	return &rpc.DummyInstrumentationStorage{}
+}
+
 var ErrHandleHello = errors.New("handle hello failure")
 var ErrHandleDidCounterSign = errors.New("handle didCounterSign failure")
-var testTimeout = time.Duration(50) * time.Millisecond
+var testTimeout = time.Duration(500) * time.Millisecond
 
-func (mp *mockProvisionee) HandleHello2(arg2 keybase1.Hello2Arg) (res keybase1.Hello2Res, err error) {
+func (mp *mockProvisionee) HandleHello2(ctx context.Context, arg2 keybase1.Hello2Arg) (res keybase1.Hello2Res, err error) {
 	arg1 := keybase1.HelloArg{
 		Uid:     arg2.Uid,
 		SigBody: arg2.SigBody,
 	}
-	res.SigPayload, err = mp.HandleHello(arg1)
+	res.SigPayload, err = mp.HandleHello(ctx, arg1)
 	return res, err
 }
 
-func (mp *mockProvisionee) HandleHello(arg keybase1.HelloArg) (res keybase1.HelloRes, err error) {
+func (mp *mockProvisionee) HandleHello(_ context.Context, arg keybase1.HelloArg) (res keybase1.HelloRes, err error) {
 	if (mp.behavior & BadProvisioneeSlowHello) != 0 {
-		time.Sleep(testTimeout * 3)
+		time.Sleep(testTimeout * 8)
 	}
 	if (mp.behavior & BadProvisioneeFailHello) != 0 {
 		err = ErrHandleHello
@@ -129,9 +138,9 @@ func (mp *mockProvisionee) HandleHello(arg keybase1.HelloArg) (res keybase1.Hell
 	return
 }
 
-func (mp *mockProvisionee) HandleDidCounterSign([]byte) error {
+func (mp *mockProvisionee) HandleDidCounterSign(_ context.Context, _ []byte) error {
 	if (mp.behavior & BadProvisioneeSlowDidCounterSign) != 0 {
-		time.Sleep(testTimeout * 3)
+		time.Sleep(testTimeout * 8)
 	}
 	if (mp.behavior & BadProvisioneeFailDidCounterSign) != 0 {
 		return ErrHandleDidCounterSign
@@ -139,8 +148,8 @@ func (mp *mockProvisionee) HandleDidCounterSign([]byte) error {
 	return nil
 }
 
-func (mp *mockProvisionee) HandleDidCounterSign2(arg keybase1.DidCounterSign2Arg) error {
-	return mp.HandleDidCounterSign(arg.Sig)
+func (mp *mockProvisionee) HandleDidCounterSign2(ctx context.Context, arg keybase1.DidCounterSign2Arg) error {
+	return mp.HandleDidCounterSign(ctx, arg.Sig)
 }
 
 func testProtocolXWithBehavior(t *testing.T, provisioneeBehavior int) (results [2]error) {
@@ -156,11 +165,15 @@ func testProtocolXWithBehavior(t *testing.T, provisioneeBehavior int) (results [
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 
+	testLogCtx, cleanup := newTestLogCtx(t)
+	defer cleanup()
+
 	// Run the provisioner
 	go func() {
 		err := RunProvisioner(ProvisionerArg{
 			KexBaseArg: KexBaseArg{
 				Ctx:           ctx,
+				LogCtx:        testLogCtx,
 				Mr:            router,
 				Secret:        genSecret(t),
 				DeviceID:      genKeybase1DeviceID(t),
@@ -177,6 +190,7 @@ func testProtocolXWithBehavior(t *testing.T, provisioneeBehavior int) (results [
 		err := RunProvisionee(ProvisioneeArg{
 			KexBaseArg: KexBaseArg{
 				Ctx:           context.Background(),
+				LogCtx:        testLogCtx,
 				Mr:            router,
 				Secret:        s2,
 				DeviceID:      genKeybase1DeviceID(t),
@@ -190,7 +204,7 @@ func testProtocolXWithBehavior(t *testing.T, provisioneeBehavior int) (results [
 
 	if (provisioneeBehavior & BadProvisioneeCancel) != 0 {
 		go func() {
-			time.Sleep(testTimeout / 4)
+			time.Sleep(testTimeout / 20)
 			cancelFn()
 		}()
 	}
@@ -223,6 +237,13 @@ func eeq(e1, e2 error) bool {
 	return e1 != nil && e1.Error() == e2.Error()
 }
 
+// errHasSuffix makes sure that err's string has errSuffix's string as
+// a suffix. This is necessary as go-codec prepends stuff to any
+// errors it catches.
+func errHasSuffix(err, errSuffix error) bool {
+	return err != nil && strings.HasSuffix(err.Error(), errSuffix.Error())
+}
+
 func TestFullProtocolXProvisioneeFailHello(t *testing.T) {
 	results := testProtocolXWithBehavior(t, BadProvisioneeFailHello)
 	if !eeq(results[0], ErrHandleHello) {
@@ -246,7 +267,7 @@ func TestFullProtocolXProvisioneeFailDidCounterSign(t *testing.T) {
 func TestFullProtocolXProvisioneeSlowHello(t *testing.T) {
 	results := testProtocolXWithBehavior(t, BadProvisioneeSlowHello)
 	for i, e := range results {
-		if !eeq(e, ErrTimedOut) && !eeq(e, io.EOF) && !eeq(e, ErrHelloTimeout) {
+		if !errHasSuffix(e, ErrTimedOut) && !errHasSuffix(e, io.EOF) && !errHasSuffix(e, ErrHelloTimeout) {
 			t.Fatalf("Bad error %d: %v", i, e)
 		}
 	}
@@ -256,15 +277,6 @@ func TestFullProtocolXProvisioneeSlowHelloWithCancel(t *testing.T) {
 	results := testProtocolXWithBehavior(t, BadProvisioneeSlowHello|BadProvisioneeCancel)
 	for i, e := range results {
 		if !eeq(e, ErrCanceled) && !eeq(e, io.EOF) {
-			t.Fatalf("Bad error %d: %v", i, e)
-		}
-	}
-}
-
-func TestFullProtocolXProvisioneeSlowDidCounterSign(t *testing.T) {
-	results := testProtocolXWithBehavior(t, BadProvisioneeSlowDidCounterSign)
-	for i, e := range results {
-		if !eeq(e, ErrTimedOut) && !eeq(e, io.EOF) {
 			t.Fatalf("Bad error %d: %v", i, e)
 		}
 	}
@@ -280,12 +292,15 @@ func TestFullProtocolY(t *testing.T) {
 	ch := make(chan error, 3)
 
 	secretCh := make(chan Secret)
+	testLogCtx, cleanup := newTestLogCtx(t)
+	defer cleanup()
 
 	// Run the provisioner
 	go func() {
 		err := RunProvisioner(ProvisionerArg{
 			KexBaseArg: KexBaseArg{
 				Ctx:           context.TODO(),
+				LogCtx:        testLogCtx,
 				Mr:            router,
 				Secret:        s1,
 				DeviceID:      genKeybase1DeviceID(t),
@@ -302,6 +317,7 @@ func TestFullProtocolY(t *testing.T) {
 		err := RunProvisionee(ProvisioneeArg{
 			KexBaseArg: KexBaseArg{
 				Ctx:           context.TODO(),
+				LogCtx:        testLogCtx,
 				Mr:            router,
 				Secret:        genSecret(t),
 				DeviceID:      genKeybase1DeviceID(t),

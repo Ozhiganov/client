@@ -13,6 +13,7 @@ const (
 	PromptDescriptorReregister
 	PromptDescriptorInviteOK
 	PromptDescriptorPGPGenPushSecret
+	PromptDescriptorPGPGenEncryptSecret
 	PromptDescriptorDoctorWhichAccount
 	PromptDescriptorDoctorSignOK
 	PromptDescriptorGPGOKToAdd
@@ -54,10 +55,32 @@ const (
 	PromptDescriptorEnterChatTLFName
 	PromptDescriptorEnterChatMessage
 	PromptDescriptorDeviceRevoke
+	PromptDescriptorFSOverwrite
+	PromptDescriptorRemoveMember
+	PromptDescriptorDeleteRootTeam
+	PromptDescriptorDeleteSubteam
+	PromptDescriptorChatDeleteHistory
+	PromptDescriptorChatSetRetention
+	PromptDescriptorImportStellarSecretKey
+	PromptDescriptorConfirmStellarImport
+	PromptDescriptorChatSetConvMinWriterRole
+	PromptDescriptorChangeLockdownMode
+	PromptDescriptorImportStellarAccountName
+	PromptDescriptorStellarDisclaimer
+	PromptDescriptorPaperKey
+	PromptDescriptorStellarConfirm
+	PromptDescriptorResetAccount
+	PromptDescriptorPassphraseRecovery
+	PromptDescriptorStellarURIAmount
+	PromptDescriptorAccountDeleteConfirmation
+	PromptDescriptorChatEmojiRemove
 )
 
 const (
 	OutputDescriptorGeneric libkb.OutputDescriptor = iota
 	OutputDescriptorPrimaryPaperKey
 	OutputDescriptorEndageredTLFs
+	OutputDescriptorHomeDump
+	OutputDescriptorBadgeDump
+	OutputDescriptorTeamList
 )

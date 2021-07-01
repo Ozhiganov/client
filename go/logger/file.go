@@ -1,6 +1,10 @@
+// Copyright 2017 Keybase, Inc. All rights reserved. Use of
+// this source code is governed by the included BSD license.
+
 package logger
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,10 +27,13 @@ type LogFileConfig struct {
 	// MaxKeepFiles is maximum number of log files for this service, older
 	// files are deleted.
 	MaxKeepFiles int
+	// RedirectStdErr indicates if the current stderr redirected to the given
+	// Path.
+	SkipRedirectStdErr bool
 }
 
 // SetLogFileConfig sets the log file config to be used globally.
-func SetLogFileConfig(lfc *LogFileConfig) error {
+func SetLogFileConfig(lfc *LogFileConfig, blc *BufferedLoggerConfig) error {
 	globalLock.Lock()
 	defer globalLock.Unlock()
 
@@ -37,18 +44,25 @@ func SetLogFileConfig(lfc *LogFileConfig) error {
 		w.lock.Lock()
 		defer w.lock.Unlock()
 		w.Close()
+		w.config = *lfc
 	} else {
-		w = &logFileWriter{}
-	}
-	w.config = *lfc
+		w = NewLogFileWriter(*lfc)
 
-	err := w.Open(time.Now())
-	if err != nil {
+		// Clean up the default logger, if it is in use
+		select {
+		case stdErrLoggingShutdown <- struct{}{}:
+		default:
+		}
+	}
+
+	if err := w.Open(time.Now()); err != nil {
 		return err
 	}
 
 	if first {
-		fileBackend := logging.NewLogBackend(w, "", 0)
+		buf, shutdown, _ := NewAutoFlushingBufferedWriter(w, blc)
+		w.stopFlushing = shutdown
+		fileBackend := logging.NewLogBackend(buf, "", 0)
 		logging.SetBackend(fileBackend)
 
 		stderrIsTerminal = false
@@ -57,15 +71,22 @@ func SetLogFileConfig(lfc *LogFileConfig) error {
 	return nil
 }
 
-type logFileWriter struct {
+type LogFileWriter struct {
 	lock         sync.Mutex
 	config       LogFileConfig
 	file         *os.File
 	currentSize  int64
 	currentStart time.Time
+	stopFlushing chan<- struct{}
 }
 
-func (lfw *logFileWriter) Open(at time.Time) error {
+func NewLogFileWriter(config LogFileConfig) *LogFileWriter {
+	return &LogFileWriter{
+		config: config,
+	}
+}
+
+func (lfw *LogFileWriter) Open(at time.Time) error {
 	var err error
 	_, lfw.file, err = OpenLogFile(lfw.config.Path)
 	if err != nil {
@@ -78,11 +99,13 @@ func (lfw *logFileWriter) Open(at time.Time) error {
 		return err
 	}
 	lfw.currentSize = fi.Size()
-	tryRedirectStderrTo(lfw.file)
+	if !lfw.config.SkipRedirectStdErr {
+		_ = tryRedirectStderrTo(lfw.file)
+	}
 	return nil
 }
 
-func (lfw *logFileWriter) Close() error {
+func (lfw *LogFileWriter) Close() error {
 	if lfw == nil {
 		return nil
 	}
@@ -91,12 +114,18 @@ func (lfw *logFileWriter) Close() error {
 	if lfw.file == nil {
 		return nil
 	}
+	if lfw.stopFlushing != nil {
+		lfw.stopFlushing <- struct{}{}
+	}
+
 	return lfw.file.Close()
 }
 
 const zeroDuration time.Duration = 0
+const oldLogFileTimeRangeTimeLayout = "20060102T150405Z0700"
+const oldLogFileTimeRangeTimeLayoutLegacy = "20060102T150405"
 
-func (lfw *logFileWriter) Write(bs []byte) (int, error) {
+func (lfw *LogFileWriter) Write(bs []byte) (int, error) {
 	lfw.lock.Lock()
 	defer lfw.lock.Unlock()
 	n, err := lfw.file.Write(bs)
@@ -119,8 +148,8 @@ func (lfw *logFileWriter) Write(bs []byte) (int, error) {
 	lfw.file.Close()
 	lfw.file = nil
 	now := time.Now()
-	start := lfw.currentStart.Format("20060102T150405Z0700")
-	end := now.Format("20060102T150405Z0700")
+	start := lfw.currentStart.Format(oldLogFileTimeRangeTimeLayout)
+	end := now.Format(oldLogFileTimeRangeTimeLayout)
 	tgt := fmt.Sprintf("%s-%s-%s", lfw.config.Path, start, end)
 	// Handle the error further down
 	err = os.Rename(lfw.config.Path, tgt)
@@ -169,6 +198,63 @@ func deleteOldLogFilesIfNeededWorker(config LogFileConfig) error {
 	return err
 }
 
+type logFilename struct {
+	fName string
+	start time.Time
+}
+
+type logFilenamesByTime []logFilename
+
+func (a logFilenamesByTime) Len() int      { return len(a) }
+func (a logFilenamesByTime) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a logFilenamesByTime) Less(i, j int) bool {
+	return a[i].start.Before(a[j].start)
+}
+
+// getLogFilenamesOrderByTime filters fNames to return only old log files
+// starting with baseName, followed by a timestamp-range suffix. It also sorts
+// them by start time, in increasing order.
+//
+// Both baseName and fNames are base names not including dir names.
+//
+// This function supports both old (no timezone) and current (with timezone)
+// format of log file names. TODO: simplify this when we don't care about old
+// format any more.
+func getLogFilenamesOrderByTime(
+	baseName string, fNames []string) (names []string, err error) {
+	re, err := regexp.Compile(`^` + regexp.QuoteMeta(baseName) +
+		`-(\d{8}T\d{6}(?:(?:[Z\+-]\d{4})|(?:Z))?)-\d{8}T\d{6}(?:(?:[Z\+-]\d{4})|(?:Z))?$`)
+	if err != nil {
+		return nil, err
+	}
+
+	var logFilenames []logFilename
+	for _, fName := range fNames {
+		match := re.FindStringSubmatch(fName)
+		if len(match) != 2 {
+			continue
+		}
+		t, err1 := time.ParseInLocation(oldLogFileTimeRangeTimeLayout, match[1], time.Local)
+		if err1 != nil {
+			var err2 error
+			t, err2 = time.ParseInLocation(oldLogFileTimeRangeTimeLayoutLegacy, match[1], time.Local)
+			if err2 != nil {
+				return nil, errors.New(err1.Error() + " | " + err2.Error())
+			}
+		}
+		logFilenames = append(logFilenames, logFilename{fName: fName, start: t})
+	}
+
+	sort.Sort(logFilenamesByTime(logFilenames))
+
+	names = make([]string, 0, len(logFilenames))
+	for _, f := range logFilenames {
+		names = append(names, f.fName)
+	}
+
+	return names, nil
+}
+
 // scanOldLogFiles finds old archived log files corresponding to the log file path.
 // Returns the list of such log files sorted with the eldest one first.
 func scanOldLogFiles(path string) ([]string, error) {
@@ -185,16 +271,13 @@ func scanOldLogFiles(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var res []string
-	re, err := regexp.Compile(`^` + regexp.QuoteMeta(fname) + `-\d{8}T\d{6}(?:[Z-]\d{4})?-\d{8}T\d{6}(?:[Z-]\d{4})?$`)
+	names, err := getLogFilenamesOrderByTime(fname, ns)
 	if err != nil {
 		return nil, err
 	}
-	for _, name := range ns {
-		if re.MatchString(name) {
-			res = append(res, filepath.Join(dname, name))
-		}
+	var res []string
+	for _, name := range names {
+		res = append(res, filepath.Join(dname, name))
 	}
-	sort.Strings(res)
 	return res, nil
 }

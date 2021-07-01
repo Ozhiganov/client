@@ -89,7 +89,7 @@ func (emptyCell) full() string      { return "" }
 // SingleCell defines cell content with a single string. If being truncated,
 // the truncated part is replaced with "..."
 type SingleCell struct {
-	// Item is, well, the contnet.
+	// Item is, well, the content.
 	Item string
 }
 
@@ -114,7 +114,7 @@ func (c SingleCell) minWidth() int {
 // MultiCell defines cell content with multiple strings. If being truncated, it
 // looks like this: "item1,item2,+4..."
 type MultiCell struct {
-	// Sep is the separater between different items
+	// Sep is the separator between different items
 	Sep string
 	// Items are the content
 	Items []string

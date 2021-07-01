@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
 )
 
@@ -17,9 +19,10 @@ type Socket interface {
 }
 
 type SocketInfo struct {
-	Contextified
+	log       logger.Logger
 	bindFile  string
 	dialFiles []string
+	testOwner bool //nolint
 }
 
 func (s SocketInfo) GetBindFile() string {
@@ -31,47 +34,49 @@ func (s SocketInfo) GetDialFiles() []string {
 }
 
 type SocketWrapper struct {
-	conn net.Conn
-	xp   rpc.Transporter
-	err  error
+	Conn        net.Conn
+	Transporter rpc.Transporter
+	Err         error
 }
 
 func (g *GlobalContext) MakeLoopbackServer() (l net.Listener, err error) {
 	g.socketWrapperMu.Lock()
-	g.LoopbackListener = NewLoopbackListener()
+	defer g.socketWrapperMu.Unlock()
+	g.LoopbackListener = NewLoopbackListener(g)
 	l = g.LoopbackListener
-	g.socketWrapperMu.Unlock()
-	return
+	return l, err
 }
 
 func (g *GlobalContext) BindToSocket() (net.Listener, error) {
 	return g.SocketInfo.BindToSocket()
 }
 
-func NewTransportFromSocket(g *GlobalContext, s net.Conn) rpc.Transporter {
-	return rpc.NewTransport(s, NewRPCLogFactory(g), WrapError)
+func NewTransportFromSocket(g *GlobalContext, s net.Conn, src keybase1.NetworkSource) rpc.Transporter {
+	return rpc.NewTransport(s, NewRPCLogFactory(g), NetworkInstrumenterStorageFromSrc(g, src), MakeWrapError(g), rpc.DefaultMaxFrameLength)
 }
 
 // ResetSocket clears and returns a new socket
 func (g *GlobalContext) ResetSocket(clearError bool) (net.Conn, rpc.Transporter, bool, error) {
-	g.SocketWrapper = nil
-	return g.GetSocket(clearError)
-}
-
-func (g *GlobalContext) GetSocket(clearError bool) (conn net.Conn, xp rpc.Transporter, isNew bool, err error) {
-
-	g.Trace("GetSocket", func() error { return err })()
-
-	// Protect all global socket wrapper manipulation with a
-	// lock to prevent race conditions.
 	g.socketWrapperMu.Lock()
 	defer g.socketWrapperMu.Unlock()
 
+	g.SocketWrapper = nil
+	return g.getSocketLocked(clearError)
+}
+
+func (g *GlobalContext) GetSocket(clearError bool) (conn net.Conn, xp rpc.Transporter, isNew bool, err error) {
+	g.Trace("GetSocket", &err)()
+	g.socketWrapperMu.Lock()
+	defer g.socketWrapperMu.Unlock()
+	return g.getSocketLocked(clearError)
+}
+
+func (g *GlobalContext) getSocketLocked(clearError bool) (conn net.Conn, xp rpc.Transporter, isNew bool, err error) {
 	needWrapper := false
 	if g.SocketWrapper == nil {
 		needWrapper = true
 		g.Log.Debug("| empty socket wrapper; need a new one")
-	} else if g.SocketWrapper.xp != nil && !g.SocketWrapper.xp.IsConnected() {
+	} else if g.SocketWrapper.Transporter != nil && !g.SocketWrapper.Transporter.IsConnected() {
 		// need reconnect
 		g.Log.Debug("| rpc transport isn't connected, reconnecting...")
 		needWrapper = true
@@ -80,25 +85,25 @@ func (g *GlobalContext) GetSocket(clearError bool) (conn net.Conn, xp rpc.Transp
 	if needWrapper {
 		sw := SocketWrapper{}
 		if g.LoopbackListener != nil {
-			sw.conn, sw.err = g.LoopbackListener.Dial()
+			sw.Conn, sw.Err = g.LoopbackListener.Dial()
 		} else if g.SocketInfo == nil {
-			sw.err = fmt.Errorf("Cannot get socket in standalone mode")
+			sw.Err = fmt.Errorf("Cannot get socket in standalone mode")
 		} else {
-			sw.conn, sw.err = g.SocketInfo.DialSocket()
-			g.Log.Debug("| DialSocket -> %s", ErrToOk(sw.err))
+			sw.Conn, sw.Err = g.SocketInfo.DialSocket()
+			g.Log.Debug("| DialSocket -> %s", ErrToOk(sw.Err))
 			isNew = true
 		}
-		if sw.err == nil {
-			sw.xp = NewTransportFromSocket(g, sw.conn)
+		if sw.Err == nil {
+			sw.Transporter = NewTransportFromSocket(g, sw.Conn, keybase1.NetworkSource_LOCAL)
 		}
 		g.SocketWrapper = &sw
 	}
 
 	sw := g.SocketWrapper
-	if sw.err != nil && clearError {
+	if sw.Err != nil && clearError {
 		g.SocketWrapper = nil
 	}
-	err = sw.err
+	err = sw.Err
 
-	return sw.conn, sw.xp, isNew, err
+	return sw.Conn, sw.Transporter, isNew, err
 }

@@ -4,10 +4,7 @@
 package service
 
 import (
-	"net"
-	"net/url"
 	"sync"
-	"time"
 
 	"golang.org/x/net/context"
 
@@ -24,90 +21,82 @@ type reachabilityHandler struct {
 
 func newReachabilityHandler(xp rpc.Transporter, g *libkb.GlobalContext, reachability *reachability) *reachabilityHandler {
 	return &reachabilityHandler{
-		BaseHandler:  NewBaseHandler(xp),
+		BaseHandler:  NewBaseHandler(g, xp),
 		Contextified: libkb.NewContextified(g),
 		reachability: reachability,
 	}
 }
 
-func (h *reachabilityHandler) ReachabilityChanged(_ context.Context, _ keybase1.Reachability) error {
+func (h *reachabilityHandler) ReachabilityChanged(_ context.Context, _ keybase1.Reachability) (err error) {
+	h.G().Trace("ReachabilityChanged", &err)()
 	return nil
 }
 
-func (h *reachabilityHandler) StartReachability(_ context.Context) (keybase1.Reachability, error) {
-	return h.reachability.start(), nil
+func (h *reachabilityHandler) StartReachability(_ context.Context) (res keybase1.Reachability, err error) {
+	h.G().Trace("StartReachability", &err)()
+	return keybase1.Reachability{
+		Reachable: keybase1.Reachable_UNKNOWN,
+	}, nil
 }
 
-func (h *reachabilityHandler) CheckReachability(_ context.Context) (keybase1.Reachability, error) {
+func (h *reachabilityHandler) CheckReachability(_ context.Context) (res keybase1.Reachability, err error) {
+	h.G().Trace("CheckReachability", &err)()
 	return h.reachability.check(), nil
 }
 
 type reachability struct {
 	libkb.Contextified
 	lastReachability keybase1.Reachability
-	started          bool
-	startMutex       sync.Mutex
 	setMutex         sync.Mutex
+
+	gh *gregorHandler
 }
 
-func newReachability(g *libkb.GlobalContext) *reachability {
+func newReachability(g *libkb.GlobalContext, gh *gregorHandler) *reachability {
 	return &reachability{
 		Contextified: libkb.NewContextified(g),
+		gh:           gh,
 	}
 }
 
 func (h *reachability) setReachability(r keybase1.Reachability) {
 	h.setMutex.Lock()
-	defer h.setMutex.Unlock()
+	changed := h.lastReachability.Reachable != r.Reachable
+	h.lastReachability = r
+	h.setMutex.Unlock()
 
-	if h.lastReachability.Reachable != r.Reachable {
+	if changed {
 		h.G().Log.Debug("Reachability changed: %#v", r)
 		h.G().NotifyRouter.HandleReachability(r)
 	}
-	h.lastReachability = r
-}
-
-func (h *reachability) start() keybase1.Reachability {
-	h.startMutex.Lock()
-	defer h.startMutex.Unlock()
-
-	if !h.started {
-		h.started = true
-		go func() {
-			// Do check right away
-			h.check()
-			for {
-				select {
-				case <-h.G().Clock().After(time.Second * 30):
-					h.check()
-				}
-			}
-		}()
-	}
-	return h.lastReachability
 }
 
 func (h *reachability) check() (k keybase1.Reachability) {
-	// When gregor connection issues are resolved, we might want to use the
-	// status of the gregorHandler connection to determine reachability, since
-	// it would be a more accurate indicator or the ability of the app to receive
-	// notifications.
-	u, err := url.Parse(h.G().Env.GetGregorURI())
-	if err != nil {
-		h.G().Log.Errorf("Invalid URI for reachability check: %s", err)
-		return
-	}
-
-	conn, err := net.DialTimeout("tcp", u.Host, 10*time.Second)
-	if conn != nil {
-		conn.Close()
-	}
-
-	if err != nil {
-		k.Reachable = keybase1.Reachable_NO
-	} else {
+	reachable := h.gh.isReachable()
+	if reachable {
 		k.Reachable = keybase1.Reachable_YES
+	} else {
+		k.Reachable = keybase1.Reachable_NO
 	}
 	h.setReachability(k)
 	return k
+}
+
+func (h *reachability) IsConnected(ctx context.Context) libkb.ConnectivityMonitorResult {
+	h.setMutex.Lock()
+	defer h.setMutex.Unlock()
+
+	switch h.lastReachability.Reachable {
+	case keybase1.Reachable_YES:
+		return libkb.ConnectivityMonitorYes
+	case keybase1.Reachable_NO:
+		return libkb.ConnectivityMonitorNo
+	default:
+		return libkb.ConnectivityMonitorUnknown
+	}
+}
+
+func (h *reachability) CheckReachability(ctx context.Context) error {
+	h.check()
+	return nil
 }

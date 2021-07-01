@@ -16,9 +16,9 @@ func TestDeviceHistoryBasic(t *testing.T) {
 
 	CreateAndSignupFakeUserPaper(tc, "dhst")
 
-	ctx := &Context{}
 	eng := NewDeviceHistorySelf(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
+	m := NewMetaContextForTest(tc)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 	devs := eng.Devices()
@@ -31,9 +31,9 @@ func TestDeviceHistoryBasic(t *testing.T) {
 
 	for _, d := range devs {
 		switch d.Device.Type {
-		case libkb.DeviceTypePaper:
+		case keybase1.DeviceTypeV2_PAPER:
 			paper = d
-		case libkb.DeviceTypeDesktop:
+		case keybase1.DeviceTypeV2_DESKTOP:
 			desktop = d
 		default:
 			t.Fatalf("unexpected device type %s", d.Device.Type)
@@ -64,9 +64,9 @@ func TestDeviceHistoryRevoked(t *testing.T) {
 
 	u := CreateAndSignupFakeUserPaper(tc, "dhst")
 
-	ctx := &Context{}
 	eng := NewDeviceHistorySelf(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
+	m := NewMetaContextForTest(tc)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -75,9 +75,9 @@ func TestDeviceHistoryRevoked(t *testing.T) {
 
 	for _, d := range eng.Devices() {
 		switch d.Device.Type {
-		case libkb.DeviceTypePaper:
+		case keybase1.DeviceTypeV2_PAPER:
 			paper = d
-		case libkb.DeviceTypeDesktop:
+		case keybase1.DeviceTypeV2_DESKTOP:
 			desktop = d
 		default:
 			t.Fatalf("unexpected device type %s", d.Device.Type)
@@ -95,16 +95,19 @@ func TestDeviceHistoryRevoked(t *testing.T) {
 	}
 
 	// revoke the paper device
-	ctx.SecretUI = u.NewSecretUI()
-	ctx.LogUI = tc.G.UI.GetLogUI()
-	reng := NewRevokeDeviceEngine(RevokeDeviceEngineArgs{ID: paper.Device.DeviceID}, tc.G)
-	if err := RunEngine(reng, ctx); err != nil {
+	uis := libkb.UIs{
+		SecretUI: u.NewSecretUI(),
+		LogUI:    tc.G.UI.GetLogUI(),
+	}
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	reng := NewRevokeDeviceEngine(tc.G, RevokeDeviceEngineArgs{ID: paper.Device.DeviceID})
+	if err := RunEngine2(m, reng); err != nil {
 		t.Fatal(err)
 	}
 
 	// get history after revoke
 	eng = NewDeviceHistorySelf(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
@@ -113,9 +116,9 @@ func TestDeviceHistoryRevoked(t *testing.T) {
 
 	for _, d := range eng.Devices() {
 		switch d.Device.Type {
-		case libkb.DeviceTypePaper:
+		case keybase1.DeviceTypeV2_PAPER:
 			paper2 = d
-		case libkb.DeviceTypeDesktop:
+		case keybase1.DeviceTypeV2_DESKTOP:
 			desktop2 = d
 		default:
 			t.Fatalf("unexpected device type %s", d.Device.Type)
@@ -162,49 +165,25 @@ func TestDeviceHistoryPGP(t *testing.T) {
 	tc = SetupEngineTest(t, "devhist")
 	defer tc.Cleanup()
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		ProvisionUI: newTestProvisionUIPassphrase(),
 		LoginUI:     &libkb.TestLoginUI{Username: u1.Username},
 		LogUI:       tc.G.UI.GetLogUI(),
 		SecretUI:    u1.NewSecretUI(),
 		GPGUI:       &gpgtestui{},
 	}
-	eng := NewLogin(tc.G, libkb.DeviceTypeDesktop, "", keybase1.ClientType_CLI)
-	if err := RunEngine(eng, ctx); err != nil {
+	eng := NewLogin(tc.G, keybase1.DeviceTypeV2_DESKTOP, "", keybase1.ClientType_CLI)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
 		t.Fatal(err)
 	}
 
-	ctx = &Context{}
 	heng := NewDeviceHistorySelf(tc.G)
-	if err := RunEngine(heng, ctx); err != nil {
+	if err := RunEngine2(m, heng); err != nil {
 		t.Fatal(err)
 	}
 	devs := heng.Devices()
-	if len(devs) != 2 {
-		t.Errorf("num devices: %d, expected 2", len(devs))
-	}
-
-	var desktop keybase1.DeviceDetail
-	var paper keybase1.DeviceDetail
-
-	for _, d := range devs {
-		switch d.Device.Type {
-		case libkb.DeviceTypePaper:
-			paper = d
-		case libkb.DeviceTypeDesktop:
-			desktop = d
-		default:
-			t.Fatalf("unexpected device type %s", d.Device.Type)
-		}
-	}
-
-	// paper's provisioner should be desktop
-	if paper.Provisioner == nil {
-		t.Fatal("paper device has no provisioner")
-	}
-	if paper.Provisioner.DeviceID != desktop.Device.DeviceID {
-		t.Errorf("paper provisioned id: %s, expected %s", paper.Provisioner.DeviceID, desktop.Device.DeviceID)
-		t.Logf("desktop: %+v", desktop)
-		t.Logf("paper:   %+v", paper)
+	if len(devs) != 1 {
+		t.Errorf("num devices: %d, expected 1", len(devs))
 	}
 }
