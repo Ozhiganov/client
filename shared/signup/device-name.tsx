@@ -1,0 +1,212 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import {SignupScreen, errorBanner, desktopInputWidth} from './common'
+import * as Provision from '@/constants/provision'
+import {usePushState} from '@/stores/push'
+import * as T from '@/constants/types'
+import {isQuietCancel, RPCError} from '@/util/errors'
+import {ignorePromise} from '@/constants/utils'
+import logger from '@/logger'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import type {StaticScreenProps} from '@react-navigation/core'
+import {
+  clearSignupDeviceNameDraft,
+  getSignupDeviceNameDraft,
+  setSignupDeviceNameDraft,
+} from './device-name-draft'
+
+type Props = StaticScreenProps<{inviteCode?: string; username?: string}>
+
+export const checkDeviceNameAndSignup = async (
+  devicename: string,
+  username: string,
+  inviteCode: string,
+  setError: (error: string) => void,
+  showPermissionsPrompt: (p: {justSignedUp: boolean}) => void,
+  navigateAppend: typeof C.Router2.navigateAppend
+) => {
+  try {
+    await T.RPCGen.deviceCheckDeviceNameFormatRpcPromise({name: devicename}, C.waitingKeySignup)
+  } catch (error_) {
+    if (error_ instanceof RPCError) {
+      setError(error_.desc)
+    }
+    return
+  }
+
+  if (!username || !devicename) {
+    logger.warn('Missing data during signup phase', username, devicename)
+    return
+  }
+
+  try {
+    showPermissionsPrompt({justSignedUp: true})
+    await T.RPCGen.signupSignupRpcListener({
+      customResponseIncomingCallMap: {
+        'keybase.1.gpgUi.wantToAddGPGKey': (_, response) => {
+          response.result(false)
+        },
+      },
+      incomingCallMap: {
+        'keybase.1.loginUi.displayPrimaryPaperKey': () => {},
+      },
+      params: {
+        botToken: '',
+        deviceName: devicename,
+        deviceType: isMobile ? T.RPCGen.DeviceType.mobile : T.RPCGen.DeviceType.desktop,
+        email: '',
+        genPGPBatch: false,
+        genPaper: false,
+        inviteCode,
+        passphrase: '',
+        randomPw: true,
+        skipGPG: true,
+        skipMail: true,
+        storeSecret: true,
+        username,
+        verifyEmail: true,
+      },
+      waitingKey: C.waitingKeySignup,
+    })
+    clearSignupDeviceNameDraft()
+  } catch (error_) {
+    if (error_ instanceof RPCError) {
+      showPermissionsPrompt({justSignedUp: false})
+      // A cancel (an account switch, the service's own) is no failure to show; a lost link is
+      if (isQuietCancel(error_)) {
+        return
+      }
+      navigateAppend({
+        name: 'signupError',
+        params: {errorCode: error_.code, errorMessage: error_.desc},
+      })
+    }
+  }
+}
+
+const ConnectedEnterDevicename = (p: Props) => {
+  const showPermissionsPrompt = usePushState(s => s.dispatch.showPermissionsPrompt)
+  const initialDevicename = getSignupDeviceNameDraft()
+  const inviteCode = p.route.params.inviteCode ?? ''
+  const username = p.route.params.username ?? ''
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeySignup)
+  const {navigateAppend} = C.Router2
+  const [error, setError] = React.useState('')
+  const onContinue = (devicename: string) => {
+    setError('')
+    setSignupDeviceNameDraft(devicename)
+    ignorePromise(
+      checkDeviceNameAndSignup(devicename, username, inviteCode, setError, showPermissionsPrompt, navigateAppend)
+    )
+  }
+
+  return <EnterDevicename error={error} initialDevicename={initialDevicename} onContinue={onContinue} waiting={waiting} />
+}
+
+export default ConnectedEnterDevicename
+
+type EnterDevicenameProps = {
+  error: string
+  initialDevicename?: string
+  onContinue: (devicename: string) => void
+  waiting: boolean
+}
+
+export const makeCleanDeviceName = (d: string) => {
+  // map smart apostrophes to ASCII first, else badDeviceChars strips them outright
+  let good = Provision.cleanDeviceName(d)
+  good = good.replace(Provision.badDeviceChars, '')
+  // stripping a disallowed character can leave two separators touching, which
+  // badDeviceRE rejects; collapse runs so cleaning always produces a name the
+  // validator accepts
+  good = good.replace(Provision.repeatedSpacesRE, ' ')
+  good = good.replace(Provision.repeatedDeviceSeparatorsRE, '$1')
+  return good
+}
+
+export const isDeviceNameDisabled = (cleanDeviceName: string) => {
+  const normalized = cleanDeviceName.replace(Provision.normalizeDeviceRE, '')
+  return (
+    normalized.length < 3 ||
+    normalized.length > 64 ||
+    !Provision.goodDeviceRE.test(cleanDeviceName) ||
+    Provision.badDeviceRE.test(cleanDeviceName)
+  )
+}
+
+const EnterDevicename = (props: EnterDevicenameProps) => {
+  const styles = useStyles()
+  const {error, initialDevicename, onContinue: _onContinue, waiting} = props
+
+  const [deviceName, setDeviceName] = React.useState(() => makeCleanDeviceName(initialDevicename || ''))
+  const [readyToShowError, setReadyToShowError] = React.useState(false)
+  const _setReadyToShowError = C.useDebouncedCallback((ready: boolean) => {
+    setReadyToShowError(ready)
+  }, 200)
+  const cleanDeviceName = makeCleanDeviceName(deviceName)
+  const disabled = isDeviceNameDisabled(cleanDeviceName)
+  const showDisabled = disabled && !!cleanDeviceName && readyToShowError
+  const _setDeviceName = (deviceName: string) => {
+    setDeviceName(makeCleanDeviceName(deviceName))
+    setReadyToShowError(false)
+    _setReadyToShowError(true)
+  }
+  const onContinue = () => (disabled || waiting ? {} : _onContinue(cleanDeviceName))
+
+  return (
+    <SignupScreen
+      banners={errorBanner(error)}
+      buttons={[{disabled, label: 'Continue', onClick: onContinue, type: 'Success', waiting}]}
+    >
+      <Kb.Box2
+        alignItems="center"
+        direction="vertical"
+        gap={isMobile ? 'small' : 'medium'}
+        fullWidth={true}
+        flex={1}
+      >
+        <Kb.ImageIcon
+          type={
+            isMobile
+              ? C.isLargeScreen
+                ? 'icon-phone-background-1-96'
+                : 'icon-phone-background-1-64'
+              : 'icon-computer-background-1-96'
+          }
+        />
+        <Kb.Box2 direction="vertical" fullWidth={Kb.Styles.isPhone} gap="tiny">
+          <Kb.Input3
+            textType="BodySemibold"
+            autoFocus={true}
+            selectTextOnFocus={true}
+            containerStyle={styles.input}
+            error={showDisabled}
+            maxLength={64}
+            placeholder="Name"
+            testID={TestIDs.SIGNUP_DEVICE_NAME_INPUT}
+            onChangeText={_setDeviceName}
+            onEnterKeyDown={onContinue}
+            value={deviceName}
+          />
+          {showDisabled ? (
+            <Kb.Text type="BodySmall" style={styles.deviceNameError}>
+              {Provision.deviceNameInstructions}
+            </Kb.Text>
+          ) : (
+            <Kb.Text type="BodySmall">
+              Your device name will be public and can not be changed in the future.
+            </Kb.Text>
+          )}
+        </Kb.Box2>
+      </Kb.Box2>
+    </SignupScreen>
+  )
+}
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  deviceNameError: {
+    color: theme.redDark,
+    marginLeft: 2,
+  },
+  input: desktopInputWidth,
+}))

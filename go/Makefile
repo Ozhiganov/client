@@ -1,4 +1,3 @@
-GO15VENDOREXPERIMENT=1
 COVERWEB=go tool cover -html=/tmp/count.out
 
 fmt:
@@ -6,13 +5,6 @@ fmt:
 
 vet:
 	go vet ./...
-
-lint:
-	golint ./... | grep -v ^vendor | grep -v ^protocol | grep -v comment | grep -v KeysById | grep -v "error should be the last type" | grep -v stutters | grep -v "error strings should not be capitalized" || echo "Lint-free!"
-
-# to run splint, first do this:  go get stathat.com/c/splint
-splint:
-	splint -s 100 `find . -name "*.go"`
 
 cover:
 	go test -covermode=count ./...
@@ -48,4 +40,18 @@ coverlibkb:
 coverclean:
 	rm /tmp/count.out
 
-.PHONY: test splint fmt lint vet cover testclean coverclient coverdaemon coverengine coverlibcmdline coverlibkb coverclean
+gen-deps:
+	./gen_deps.pl
+
+linux-clear-devel-secrets:
+	secret-tool clear service-base keybase-devel
+
+linux-clear-test-secrets:
+	secret-tool clear service-base keybase-devel-test
+
+GOLANGCI_RUN_OPT = --color auto
+
+golangci-lint:
+	golangci-lint run $(GOLANGCI_RUN_OPT) --timeout 30m0s ./...
+
+.PHONY: test fmt lint vet cover testclean coverclient coverdaemon coverengine coverlibcmdline coverlibkb coverclean gen-deps golangci-lint

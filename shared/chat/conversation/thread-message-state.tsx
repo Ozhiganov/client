@@ -1,0 +1,771 @@
+import * as Message from '@/constants/chat/message'
+import * as T from '@/constants/types'
+import HiddenString from '@/util/hidden-string'
+import type {WritableDraft} from '@/util/zustand'
+
+type MessageLookup = Pick<T.Chat.Message, 'id' | 'ordinal'>
+
+// How a thread load reconciles the window against what the service returned.
+//
+// A load answers in passes - a cached one off the local database, then a full one the service has
+// filtered down to what changed - and only the passes together are a whole window. So each pass
+// adds what it delivered to `carried`, and the last one prunes: rows inside the span of `carried`
+// that no pass delivered are stale, and go.
+//
+// The set is filled in here rather than by the caller, and that is the point of it: it holds the
+// ordinals the messages actually occupy, after the outbox and message-ID remaps below. A message
+// you sent keeps the fractional ordinal it had in the outbox, so the ordinal it arrives under is
+// not the one it lives at, and a set built from the response would leave that row unprotected.
+export type ThreadLoadReconcile = {
+  carried: Set<T.Chat.Ordinal>
+  prune: boolean
+}
+
+type WritableConversationThreadMessageState = {
+  messageIDToOrdinal: Map<T.Chat.MessageID, T.Chat.Ordinal>
+  messageMap: Map<T.Chat.Ordinal, WritableDraft<T.Chat.Message>>
+  messageOrdinals?: ReadonlyArray<T.Chat.Ordinal>
+  // Set by messagesClear, cleared once the reload that refills the window settles. While it is set
+  // there is no window to place an arriving message against. See the drop rules in
+  // addMessagesToThreadState.
+  windowCleared?: boolean
+  messageTypeMap: Map<T.Chat.Ordinal, T.Chat.RenderMessageType>
+  // Set by a thread load, cleared by messagesClear: whether either flag below means anything yet.
+  loaded: boolean
+  // False once the window reaches the oldest message, which is what makes a push older than the
+  // floor a prepend rather than a stranded row.
+  moreToLoadBack: boolean
+  // False once the window reaches the newest message, which is what makes a push newer than the
+  // ceiling an append rather than a stranded row.
+  moreToLoadForward: boolean
+  pendingOutboxToOrdinal: Map<T.Chat.OutboxID, T.Chat.Ordinal>
+}
+
+type ThreadMessagesDeleteParams = {
+  messageIDs?: ReadonlyArray<T.Chat.MessageID>
+  upToMessageID?: T.Chat.MessageID
+  deletableMessageTypes?: ReadonlySet<T.Chat.MessageType>
+  ordinals?: ReadonlyArray<T.Chat.Ordinal>
+}
+
+type ThreadReactionUpdate = {
+  targetMsgID: T.Chat.MessageID
+  reactions?: T.Chat.Reactions
+}
+
+export type OptimisticReaction = T.Immutable<{
+  add: boolean
+  decorated: string
+  emoji: string
+  targetOrdinal: T.Chat.Ordinal
+  timestamp: number
+  username: string
+}>
+
+export type OptimisticReactionMap = ReadonlyMap<T.Chat.OutboxID, OptimisticReaction>
+
+const messageForThreadState = (
+  message: T.Chat.Message,
+  ordinal: T.Chat.Ordinal = message.ordinal
+): WritableDraft<T.Chat.Message> =>
+  T.castDraft(message.ordinal === ordinal ? message : {...message, ordinal})
+
+export const getOrdinalForMessageID = (
+  map: ReadonlyMap<T.Chat.Ordinal, MessageLookup>,
+  pendingOutboxToOrdinal: ReadonlyMap<T.Chat.OutboxID, T.Chat.Ordinal> | undefined,
+  messageID: T.Chat.MessageID,
+  indexed?: ReadonlyMap<T.Chat.MessageID, T.Chat.Ordinal>
+) => {
+  const indexedOrdinal = indexed?.get(messageID)
+  if (indexedOrdinal !== undefined && map.get(indexedOrdinal)?.id === messageID) {
+    return indexedOrdinal
+  }
+
+  let m = map.get(T.Chat.numberToOrdinal(messageID))
+  if (m?.id !== 0 && m?.id === messageID) {
+    return m.ordinal
+  }
+
+  if (pendingOutboxToOrdinal) {
+    for (const ordinal of pendingOutboxToOrdinal.values()) {
+      m = map.get(ordinal)
+      if (m?.id !== 0 && m?.id === messageID) {
+        return ordinal
+      }
+    }
+  }
+
+  return null
+}
+
+export const clearMessageIDIndexForOrdinal = (
+  state: Pick<WritableConversationThreadMessageState, 'messageIDToOrdinal'> & {
+    messageMap: ReadonlyMap<T.Chat.Ordinal, MessageLookup>
+  },
+  ordinal: T.Chat.Ordinal,
+  knownMessage?: MessageLookup
+) => {
+  const message = knownMessage ?? state.messageMap.get(ordinal)
+  if (message?.id) {
+    state.messageIDToOrdinal.delete(message.id)
+  }
+}
+
+export const removeMessageOrdinalFromThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal,
+  knownMessage?: MessageLookup
+) => {
+  clearMessageIDIndexForOrdinal(state, ordinal, knownMessage)
+  state.messageMap.delete(ordinal)
+  state.messageTypeMap.delete(ordinal)
+  if (state.messageOrdinals) {
+    state.messageOrdinals = state.messageOrdinals.filter(o => o !== ordinal)
+  }
+}
+
+const indexMessage = (
+  state: Pick<WritableConversationThreadMessageState, 'messageIDToOrdinal'>,
+  ordinal: T.Chat.Ordinal,
+  message: WritableDraft<T.Chat.Message>
+) => {
+  if (message.id) {
+    state.messageIDToOrdinal.set(message.id, ordinal)
+  }
+}
+
+const maybeGetOrdinalByMessageID = (
+  state: Pick<
+    WritableConversationThreadMessageState,
+    'messageIDToOrdinal' | 'messageMap' | 'pendingOutboxToOrdinal'
+  >,
+  messageID: T.Chat.MessageID
+) =>
+  getOrdinalForMessageID(state.messageMap, state.pendingOutboxToOrdinal, messageID, state.messageIDToOrdinal)
+
+// The service's local http server can be stopped or mid-restart when an update carrying a
+// GetURL-derived value lands: that value can come back as '' or as a base-less URL with only
+// query params appended, never as a garbage http:// value. Keep whatever was already rendering
+// until a real replacement arrives.
+const keepUrl = (next: string | undefined, prev: string | undefined) =>
+  next?.startsWith('http://') ? next : prev ?? next
+
+const mergeMessage = (
+  existing: WritableDraft<T.Chat.Message>,
+  incoming: WritableDraft<T.Chat.Message>
+) => {
+  const existingRecord = existing as Record<string, unknown>
+  const incomingRecord = incoming as Record<string, unknown>
+  const allKeys = new Set([...Object.keys(existingRecord), ...Object.keys(incomingRecord)])
+  for (const key of allKeys) {
+    const val = incomingRecord[key]
+    const cur = existingRecord[key]
+    if (val instanceof HiddenString) {
+      if (!(cur instanceof HiddenString) || !val.equals(cur)) {
+        existingRecord[key] = val
+      }
+    } else if (val instanceof Map) {
+      if (cur instanceof Map) {
+        for (const k of (cur as Map<unknown, unknown>).keys()) {
+          if (!(val as Map<unknown, unknown>).has(k)) {
+            ;(cur as Map<unknown, unknown>).delete(k)
+          }
+        }
+        for (const [k, v] of val as Map<unknown, unknown>) {
+          ;(cur as Map<unknown, unknown>).set(k, v)
+        }
+      } else {
+        existingRecord[key] = val
+      }
+    } else if (key === 'fileURL' || key === 'previewURL') {
+      const next = keepUrl(val as string | undefined, cur as string | undefined)
+      if (cur !== next) {
+        existingRecord[key] = next
+      }
+    } else if (cur !== val) {
+      existingRecord[key] = val
+    }
+  }
+}
+
+export const addMessagesToThreadState = (
+  state: WritableConversationThreadMessageState,
+  messages: ReadonlyArray<T.Chat.Message>,
+  opt: {
+    dropNewBelowWindow?: boolean
+    reconcile?: ThreadLoadReconcile
+  }
+) => {
+  const {dropNewBelowWindow, reconcile} = opt
+  // The bounds of the loaded window before this batch is merged in.
+  const ords = state.messageOrdinals
+  const windowFloor = ords?.[0]
+  const incomingOrdinals = new Set<T.Chat.Ordinal>()
+  for (const m of messages) {
+    if (m.conversationMessage !== false && m.type !== 'deleted') {
+      incomingOrdinals.add(m.ordinal)
+    }
+  }
+
+  const getMapOrdinal = (m: T.Chat.Message, regularMessage: boolean) => {
+    let mapOrdinal = m.ordinal
+    if (regularMessage && m.outboxID) {
+      const existingSent = state.pendingOutboxToOrdinal.get(m.outboxID)
+      if (existingSent) {
+        mapOrdinal = existingSent
+      }
+    }
+    if (regularMessage && mapOrdinal === m.ordinal && m.id) {
+      const existingByMessageID = maybeGetOrdinalByMessageID(state, m.id)
+      if (existingByMessageID) {
+        mapOrdinal = existingByMessageID
+      }
+    }
+    return mapOrdinal
+  }
+
+  const existing = new Set(state.messageOrdinals ?? [])
+
+  // A notification (the post-load ResolveSkippedUnboxeds push, say) can carry a message from far
+  // outside the loaded window - the channel-name message at ID 1 is the usual one. Adding it
+  // strands a row against a hole, and the list then pages against that row instead of the real
+  // edge of the thread, so scrolling that way stops working. Only a thread load may extend the
+  // window; a push may land inside it, or extend an edge that is already the end of the thread.
+  //
+  // Both edges matter. A centered jump - a search result - leaves a contiguous window with more to
+  // load above and below it, and the reader can page either way from there, so a push newer than
+  // the ceiling strands exactly as one older than the floor does. Each edge is only a bound while
+  // there is still more to load past it: once the window reaches the end of the thread on that
+  // side there is no hole to open, and the message must simply join the window. A fully paged-back
+  // thread is the case that matters below - the ResolveSkippedUnboxeds push carrying the real
+  // message 1 has nowhere else to come from, and paging cannot fetch it again.
+  //
+  // Decided before anything is written for the message, so it is skipped whole. Dropping only the
+  // ordinal later would leave messageMap and messageIDToOrdinal holding a message the thread does
+  // not render, and getOrdinalForMessageID would then hand out an ordinal with no row. Nothing is
+  // lost either way: paging to it loads it in the ordinary way.
+  const windowCeiling = ords?.[ords.length - 1]
+  const isOutsideWindow = (o: T.Chat.Ordinal) => {
+    if (!dropNewBelowWindow || existing.has(o)) {
+      return false
+    }
+    // A clear is always followed by a reload that replaces the window wholesale, so until that
+    // lands there is nothing to place an arriving message against: a centered jump reloads an
+    // arbitrary region, and jump-to-recent the newest page, which is disjoint from wherever the
+    // reader was. A message landing in the gap that the reload does not carry waits for the next
+    // load or push; a stranded ordinal, by contrast, breaks paging for the life of the thread.
+    if (state.windowCleared) {
+      return true
+    }
+    // moreToLoadBack starts false and only a thread load ever sets it, so until one has landed a
+    // false reads as "the window reaches the oldest message" when it only means "nothing has said
+    // yet" - and pushes do reach the window before the first load answers. An older push admitted
+    // on that reading lands under a floor the load is about to fill, stranded over the hole.
+    //
+    // Only this edge. The same reasoning would wedge the other one: after a clear whose reload
+    // never applies there is no load coming at all, and bounding the ceiling on a flag that can no
+    // longer change would drop every incoming message for the life of the thread. Below is the
+    // edge with a backstop - the load that fills the hole is what makes the drop temporary, and
+    // paging back reaches those messages again in the ordinary way.
+    const below =
+      windowFloor !== undefined && o < windowFloor && (!state.loaded || state.moreToLoadBack)
+    const above = windowCeiling !== undefined && o > windowCeiling && state.moreToLoadForward
+    return below || above
+  }
+
+  const deletedOrdinals = new Set<T.Chat.Ordinal>()
+  for (const _m of messages) {
+    const regularMessage = _m.conversationMessage !== false
+    const mapOrdinal = getMapOrdinal(_m, regularMessage)
+    // Judged on mapOrdinal, the ordinal the message will actually occupy: an outbox or messageID
+    // match can move it out of the window, or onto a row already inside it. Deletions and
+    // non-conversation messages are not rows, so the window does not bound them.
+    if (regularMessage && _m.type !== 'deleted' && isOutsideWindow(mapOrdinal)) {
+      incomingOrdinals.delete(_m.ordinal)
+      incomingOrdinals.delete(mapOrdinal)
+      continue
+    }
+    const getIncomingMessage = (): WritableDraft<T.Chat.Message> =>
+      messageForThreadState(_m, mapOrdinal)
+
+    if (regularMessage && _m.type === 'deleted') {
+      clearMessageIDIndexForOrdinal(state, mapOrdinal)
+      state.messageMap.delete(mapOrdinal)
+      state.messageTypeMap.delete(mapOrdinal)
+      deletedOrdinals.add(mapOrdinal)
+    } else {
+      if (_m.type === 'placeholder') {
+        const old = state.messageMap.get(mapOrdinal)
+        if (old && old.type !== 'placeholder') {
+          // The real message already sits under mapOrdinal, which is not always _m.ordinal: a sent
+          // message keeps the fractional ordinal it had in the outbox. Bailing out before the remap
+          // below would strand _m.ordinal in the list with nothing stored under it.
+          //
+          // Do the remap anyway rather than just forgetting _m.ordinal. `incomingOrdinals` is what
+          // the prune treats as "still present", so an ordinal missing from it inside the span
+          // gets the real message deleted - including when mapOrdinal and _m.ordinal are the same,
+          // where the delete below would otherwise be a plain loss.
+          incomingOrdinals.delete(_m.ordinal)
+          incomingOrdinals.add(mapOrdinal)
+          continue
+        }
+      }
+
+      if (_m.ordinal !== mapOrdinal) {
+        // Keep the ordinal list aligned when an outbox/messageID match remaps the message.
+        incomingOrdinals.delete(_m.ordinal)
+        incomingOrdinals.add(mapOrdinal)
+      }
+
+      const existingMsg = state.messageMap.get(mapOrdinal)
+      if (existingMsg?.type === _m.type) {
+        const m = getIncomingMessage()
+        if (existingMsg.id && existingMsg.id !== m.id) {
+          state.messageIDToOrdinal.delete(existingMsg.id)
+        }
+        mergeMessage(existingMsg, m)
+        indexMessage(state, mapOrdinal, existingMsg)
+        if (m.type !== 'text') {
+          state.messageTypeMap.set(mapOrdinal, Message.getMessageRenderType(m))
+        }
+        continue
+      }
+
+      if (existingMsg) {
+        clearMessageIDIndexForOrdinal(state, mapOrdinal, existingMsg)
+      }
+      const m = messageForThreadState(_m, mapOrdinal)
+      state.messageMap.set(mapOrdinal, m)
+      indexMessage(state, mapOrdinal, m)
+      if (
+        regularMessage &&
+        m.outboxID &&
+        T.Chat.messageIDToNumber(m.id) !== T.Chat.ordinalToNumber(m.ordinal)
+      ) {
+        state.pendingOutboxToOrdinal.set(m.outboxID, mapOrdinal)
+      }
+      if (m.type === 'text') {
+        state.messageTypeMap.delete(mapOrdinal)
+      } else {
+        state.messageTypeMap.set(mapOrdinal, Message.getMessageRenderType(m))
+      }
+    }
+  }
+
+  let changed = false
+  for (const o of incomingOrdinals) {
+    if (!existing.has(o)) {
+      existing.add(o)
+      changed = true
+    }
+  }
+  for (const ordinal of deletedOrdinals) {
+    if (existing.has(ordinal)) {
+      existing.delete(ordinal)
+      changed = true
+    }
+  }
+  if (reconcile) {
+    for (const o of incomingOrdinals) {
+      reconcile.carried.add(o)
+    }
+    if (reconcile.prune) {
+      // The load is authoritative over the span it covered, so a row inside it that no pass of the
+      // load delivered is stale. Outside the span nothing is known and nothing is touched.
+      let from = Number.MAX_SAFE_INTEGER as T.Chat.Ordinal
+      let to = Number.MIN_SAFE_INTEGER as T.Chat.Ordinal
+      for (const o of reconcile.carried) {
+        from = Math.min(from, o) as T.Chat.Ordinal
+        to = Math.max(to, o) as T.Chat.Ordinal
+      }
+      for (const o of existing) {
+        // A row with no server ID is one of ours, still in the outbox: the service cannot have
+        // failed to return what it has never been told about. It sits on a fractional ordinal just
+        // above the message it was composed after, so the span reaches it as soon as anything
+        // newer arrives - and deleting it takes the row out from under a send in flight.
+        if (o >= from && o <= to && !reconcile.carried.has(o) && state.messageMap.get(o)?.id) {
+          clearMessageIDIndexForOrdinal(state, o)
+          existing.delete(o)
+          state.messageMap.delete(o)
+          state.messageTypeMap.delete(o)
+          changed = true
+        }
+      }
+    }
+  }
+  if (changed || !state.messageOrdinals) {
+    state.messageOrdinals = [...existing].sort((a, b) => a - b)
+  }
+}
+
+export const deleteMessagesFromThreadState = (
+  state: WritableConversationThreadMessageState,
+  p: ThreadMessagesDeleteParams
+) => {
+  const {deletableMessageTypes, messageIDs = [], ordinals = [], upToMessageID} = p
+  const {messageMap} = state
+
+  let upToOrdinals: Array<T.Chat.Ordinal> = []
+  if (upToMessageID && deletableMessageTypes) {
+    upToOrdinals = [...messageMap.entries()].reduce((arr, [ordinal, m]) => {
+      if (m.id < upToMessageID && deletableMessageTypes.has(m.type)) {
+        arr.push(ordinal)
+      }
+      return arr
+    }, new Array<T.Chat.Ordinal>())
+  }
+
+  const allOrdinals = new Set([
+    ...ordinals,
+    ...messageIDs.flatMap(id => {
+      const o = maybeGetOrdinalByMessageID(state, id)
+      return o ? [o] : []
+    }),
+    ...upToOrdinals,
+  ])
+
+  allOrdinals.forEach(ordinal => {
+    removeMessageOrdinalFromThreadState(state, ordinal)
+  })
+}
+
+export const explodeMessagesInThreadState = (
+  state: WritableConversationThreadMessageState,
+  messageIDs: ReadonlyArray<T.Chat.MessageID>,
+  explodedBy?: string
+) => {
+  messageIDs.forEach(mid => {
+    const ordinal = maybeGetOrdinalByMessageID(state, mid)
+    const m = ordinal && state.messageMap.get(ordinal)
+    if (!m) return
+    m.exploded = true
+    m.explodedBy = explodedBy || ''
+    m.reactions = new Map()
+    m.unfurls = new Map()
+    if (m.type === 'text') {
+      m.flipGameID = ''
+      m.mentionsAt = new Set()
+      m.text = new HiddenString('')
+    }
+  })
+}
+
+export const setMessageErroredInThreadState = (
+  state: WritableConversationThreadMessageState,
+  outboxID: T.Chat.OutboxID,
+  reason: string,
+  errorTyp?: number
+) => {
+  const ordinal = state.pendingOutboxToOrdinal.get(outboxID)
+  const m = ordinal ? state.messageMap.get(ordinal) : undefined
+  if (!m) return
+  m.errorReason = reason
+  m.errorTyp = errorTyp || undefined
+  m.submitState = 'failed'
+}
+
+const applyOptimisticReactionToReactions = (
+  reactions: T.Chat.Reactions | undefined,
+  reaction: OptimisticReaction
+): T.Chat.Reactions | undefined => {
+  const next = new Map(reactions ?? [])
+  const existing = next.get(reaction.emoji)
+  if (reaction.add) {
+    if (existing) {
+      const hasUser = existing.users.some(u => u.username === reaction.username)
+      next.set(reaction.emoji, {
+        decorated: reaction.decorated || existing.decorated,
+        users: hasUser
+          ? existing.users
+          : [...existing.users, {timestamp: reaction.timestamp, username: reaction.username}],
+      })
+    } else {
+      next.set(reaction.emoji, {
+        decorated: reaction.decorated,
+        users: [{timestamp: reaction.timestamp, username: reaction.username}],
+      })
+    }
+  } else if (existing) {
+    const users = existing.users.filter(u => u.username !== reaction.username)
+    if (users.length) {
+      next.set(reaction.emoji, {...existing, users})
+    } else {
+      next.delete(reaction.emoji)
+    }
+  }
+  return next.size ? next : undefined
+}
+
+export const applyOptimisticReactionsToMessage = (
+  message: T.Chat.Message | undefined,
+  optimisticReactions: OptimisticReactionMap
+): T.Chat.Message | undefined => {
+  if (!message || !optimisticReactions.size || !Message.isMessageWithReactions(message)) {
+    return message
+  }
+  let changed = false
+  let reactions = message.reactions
+  for (const reaction of optimisticReactions.values()) {
+    if (reaction.targetOrdinal === message.ordinal) {
+      changed = true
+      reactions = applyOptimisticReactionToReactions(reactions, reaction)
+    }
+  }
+  return changed ? {...message, reactions} : message
+}
+
+// Deletes of sent rows this client has asked the service for and not yet seen land, each keyed by
+// the outbox id it was posted under, so one call's revert or failure touches only its own entry. A
+// row is shown deleting while any entry names it. Client-only: it is never merged into a row.
+export type PendingDeleteMap = ReadonlyMap<T.Chat.OutboxID, T.Chat.Ordinal>
+
+export const isPendingDelete = (pendingDeletes: PendingDeleteMap, ordinal: T.Chat.Ordinal) => {
+  for (const o of pendingDeletes.values()) {
+    if (o === ordinal) {
+      return true
+    }
+  }
+  return false
+}
+
+// Drops every entry whose delete has landed: its row is gone, a deleted placeholder, or exploded
+// (deleting an exploding message explodes it).
+export const clearPendingDeletesInThreadState = (state: {
+  messageMap: ReadonlyMap<T.Chat.Ordinal, T.Chat.Message>
+  pendingDeleteMap: Map<T.Chat.OutboxID, T.Chat.Ordinal>
+}) => {
+  const landed = (ordinal: T.Chat.Ordinal) => {
+    const m = state.messageMap.get(ordinal)
+    return !m || m.type === 'deleted' || ('exploded' in m && !!m.exploded)
+  }
+  const settled = [...state.pendingDeleteMap].filter(([, ordinal]) => landed(ordinal))
+  for (const [outboxID] of settled) {
+    state.pendingDeleteMap.delete(outboxID)
+  }
+}
+
+const clearOptimisticReactionsForOrdinal = (
+  state: {optimisticReactionMap: Map<T.Chat.OutboxID, OptimisticReaction>},
+  ordinal: T.Chat.Ordinal
+) => {
+  const outboxIDs = new Array<T.Chat.OutboxID>()
+  for (const [outboxID, reaction] of state.optimisticReactionMap) {
+    if (reaction.targetOrdinal === ordinal) {
+      outboxIDs.push(outboxID)
+    }
+  }
+  outboxIDs.forEach(outboxID => state.optimisticReactionMap.delete(outboxID))
+}
+
+export const clearOptimisticReactionsForUpdatesInThreadState = (
+  state: WritableConversationThreadMessageState & {
+    optimisticReactionMap: Map<T.Chat.OutboxID, OptimisticReaction>
+  },
+  updates: ReadonlyArray<ThreadReactionUpdate>
+) => {
+  for (const update of updates) {
+    const targetOrdinal = maybeGetOrdinalByMessageID(state, update.targetMsgID)
+    if (!targetOrdinal) {
+      continue
+    }
+    clearOptimisticReactionsForOrdinal(state, targetOrdinal)
+  }
+}
+
+export const clearOptimisticReactionsForMessagesInThreadState = (
+  state: {optimisticReactionMap: Map<T.Chat.OutboxID, OptimisticReaction>},
+  messages: ReadonlyArray<T.Chat.Message>
+) => {
+  for (const message of messages) {
+    clearOptimisticReactionsForOrdinal(state, message.ordinal)
+  }
+}
+
+export const updateReactionsInThreadState = (
+  state: WritableConversationThreadMessageState,
+  updates: ReadonlyArray<ThreadReactionUpdate>
+) => {
+  const missingTargetMsgIDs = new Array<T.Chat.MessageID>()
+  for (const u of updates) {
+    const reactions = u.reactions
+    const targetMsgID = u.targetMsgID
+    const targetOrdinal = maybeGetOrdinalByMessageID(state, targetMsgID)
+    if (!targetOrdinal) {
+      missingTargetMsgIDs.push(targetMsgID)
+      continue
+    }
+    const m = state.messageMap.get(targetOrdinal)
+    if (m && m.type !== 'deleted' && m.type !== 'placeholder') {
+      if (!reactions) {
+        m.reactions = undefined
+      } else if (!m.reactions) {
+        m.reactions = T.castDraft(reactions)
+      } else {
+        const existingOrder = [...m.reactions.keys()]
+        const scoreMap = new Map(
+          [...reactions.entries()].map(([key, value]) => {
+            return [
+              key,
+              value.users.reduce(
+                (minTimestamp, reaction) => Math.min(minTimestamp, reaction.timestamp),
+                Infinity
+              ),
+            ]
+          })
+        )
+        const newReactions = new Map<string, T.Chat.ReactionDesc>()
+        for (const emoji of existingOrder) {
+          if (reactions.has(emoji)) {
+            newReactions.set(emoji, reactions.get(emoji)!)
+          }
+        }
+        const remainingEmojis = [...reactions.keys()].filter(emoji => !newReactions.has(emoji))
+        remainingEmojis.sort((a, b) => scoreMap.get(a)! - scoreMap.get(b)!)
+        for (const emoji of remainingEmojis) {
+          newReactions.set(emoji, reactions.get(emoji)!)
+        }
+        m.reactions = T.castDraft(newReactions)
+      }
+    }
+  }
+  return missingTargetMsgIDs
+}
+
+export const updateAttachmentDownloadProgressInThreadState = (
+  state: WritableConversationThreadMessageState,
+  msgID: number,
+  bytesComplete: number,
+  bytesTotal: number
+) => {
+  const ratio = bytesTotal > 0 ? bytesComplete / bytesTotal : 0
+  const ordinal = maybeGetOrdinalByMessageID(state, T.Chat.numberToMessageID(msgID))
+  if (!ordinal) return false
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+
+  if (!m.downloadPath && m.transferProgress !== 1) {
+    m.transferErrMsg = undefined
+    m.transferProgress = ratio
+    m.transferState = 'downloading'
+  }
+  return true
+}
+
+export const retryMessageInThreadState = (
+  state: WritableConversationThreadMessageState,
+  outboxID: T.Chat.OutboxID
+) => {
+  const ordinal = state.pendingOutboxToOrdinal.get(outboxID)
+  if (!ordinal || !state.messageMap.get(ordinal)) {
+    return false
+  }
+  const message = state.messageMap.get(ordinal)
+  if (message) {
+    message.errorReason = undefined
+    message.submitState = 'pending'
+  }
+  return true
+}
+
+export const setMessageSubmitStateInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal,
+  submitState: T.Chat.Message['submitState']
+) => {
+  const message = state.messageMap.get(ordinal)
+  if (message) {
+    message.submitState = submitState
+  }
+}
+
+export const completeAttachmentDownloadInThreadState = (
+  state: WritableConversationThreadMessageState,
+  msgID: number
+) => {
+  const ordinal = maybeGetOrdinalByMessageID(state, T.Chat.numberToMessageID(msgID))
+  if (!ordinal) return false
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.transferProgress = 0
+  m.transferState = undefined
+  return true
+}
+
+export const updateAttachmentUploadProgressInThreadState = (
+  state: WritableConversationThreadMessageState,
+  outboxID: Uint8Array,
+  bytesComplete = 0,
+  bytesTotal?: number
+) => {
+  const ordinal = state.pendingOutboxToOrdinal.get(T.Chat.rpcOutboxIDToOutboxID(outboxID))
+  if (!ordinal) return false
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.transferProgress = bytesTotal ? bytesComplete / bytesTotal : 0.01
+  m.transferState = 'uploading'
+  return true
+}
+
+export const startAttachmentDownloadInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal
+) => {
+  const m = state.messageMap.get(ordinal)
+  if (!m) return false
+  m.transferErrMsg = m.type === 'attachment' ? undefined : 'Trying to download missing / incorrect message?'
+  m.transferState = m.type === 'attachment' ? 'downloading' : undefined
+  return m.type === 'attachment'
+}
+
+export const finishAttachmentDownloadInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal,
+  path: string
+) => {
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.downloadPath = path
+  m.fileURLCached = true
+  m.transferErrMsg = undefined
+  m.transferProgress = 1
+  m.transferState = undefined
+  return true
+}
+
+export const failAttachmentDownloadInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal,
+  errMsg: string
+) => {
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.downloadPath = ''
+  m.fileURLCached = true
+  m.transferErrMsg = errMsg
+  m.transferProgress = 0
+  m.transferState = undefined
+  return true
+}
+
+export const setAttachmentMobileSavingInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal,
+  saving: boolean
+) => {
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.transferErrMsg = undefined
+  m.transferState = saving ? 'mobileSaving' : undefined
+  return true
+}
+
+export const clearAttachmentDownloadPathInThreadState = (
+  state: WritableConversationThreadMessageState,
+  ordinal: T.Chat.Ordinal
+) => {
+  const m = state.messageMap.get(ordinal)
+  if (m?.type !== 'attachment') return false
+  m.downloadPath = ''
+  m.transferProgress = 0
+  return true
+}

@@ -1,0 +1,80 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {useConfigState} from '@/stores/config'
+import {openAppStore} from '@/util/storeless-actions'
+import {GlobalOverlay} from '@/common-adapters/overlay/global-overlay'
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  container: Kb.Styles.platformStyles({
+    common: {
+      ...Kb.Styles.globalStyles.fillAbsolute,
+      backgroundColor: theme.red,
+      bottom: undefined,
+    },
+    isMobile: {zIndex: 9999},
+  }),
+  messageContainer: {
+    backgroundColor: theme.white_90,
+    borderRadius: Kb.Styles.borderRadius,
+  },
+}))
+
+const OutOfDate = () => {
+  const styles = useStyles()
+  const outOfDate = useConfigState(s => s.outOfDate)
+  const [mobileMessage, setMobileMessage] = React.useState('')
+  const [mobileCritical, setMobileCritical] = React.useState(false)
+
+  React.useEffect(() => {
+    if (!isMobile) {
+      return
+    }
+
+    const timeoutID = setTimeout(() => {
+      C.ignorePromise(
+        T.RPCGen.configGetUpdateInfo2RpcPromise({})
+          .then(update => {
+            switch (update.status) {
+              case T.RPCGen.UpdateInfoStatus2.critical:
+                setMobileCritical(true)
+                setMobileMessage(update.critical.message)
+                break
+              default:
+                setMobileCritical(false)
+                setMobileMessage('')
+            }
+            return undefined
+          })
+          .catch(e => {
+            logger.warn("Can't call critical check", e)
+            return undefined
+          })
+      )
+    }, 60_000) // don't bother checking during startup
+
+    return () => {
+      clearTimeout(timeoutID)
+    }
+  }, [])
+
+  const critical = isMobile ? mobileCritical : outOfDate.critical
+  const message = isMobile ? mobileMessage : outOfDate.message
+
+  return !critical ? null : (
+    <GlobalOverlay tier="outOfDate">
+      <Kb.Box2 direction="vertical" fullWidth={true} gap="small" padding="small" style={styles.container}>
+        <Kb.Text center={true} type="Header" negative={true}>
+          Your version of Keybase is critically out of date!
+        </Kb.Text>
+        <Kb.Box2 direction="vertical" padding="medium" fullWidth={true} style={styles.messageContainer}>
+          <Kb.Markdown>{message}</Kb.Markdown>
+        </Kb.Box2>
+        {isMobile && <Kb.Button label="Update" onClick={openAppStore} />}
+      </Kb.Box2>
+    </GlobalOverlay>
+  )
+}
+export default OutOfDate

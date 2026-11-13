@@ -5,6 +5,8 @@ package engine
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestSetPrimaryPictureSource(t *testing.T) {
@@ -14,18 +16,13 @@ func TestSetPrimaryPictureSource(t *testing.T) {
 
 	// TODO Setup pictures with multiple sources
 
-	ctx := &Context{
-		LogUI: tc.G.UI.GetLogUI(),
-	}
-
-	eng := NewUserConfigEngine(&UserConfigEngineArg{
+	m := NewMetaContextForTestWithLogUI(tc)
+	eng := NewUserConfigEngine(tc.G, &UserConfigEngineArg{
 		Key:   "picture.source",
 		Value: "github",
-	}, tc.G)
-	err := RunEngine(eng, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
+	err := RunEngine2(m, eng)
+	require.NoError(t, err)
 
 	// TODO Check that the primary picture source was changed
 }

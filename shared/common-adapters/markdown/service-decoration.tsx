@@ -1,0 +1,265 @@
+import * as T from '@/constants/types'
+import type * as React from 'react'
+import * as C from '@/constants'
+import {emitDeepLink} from '@/router-v2/linking'
+import * as Styles from '@/styles'
+import Channel from './channel'
+import KbfsPath from '@/fs/common/kbfs-path'
+import MaybeMention from './maybe-mention'
+import Mention from '../mention'
+import PaymentStatus from '../../chat/payments/status'
+import Text from '@/common-adapters/text'
+import type {StylesTextCrossPlatform} from '@/common-adapters/text.shared'
+import {useClickURL} from '@/common-adapters/text-url'
+import WithTooltip from '../with-tooltip'
+import type {StyleOverride} from '.'
+import {RPCToEmojiData, default as Emoji} from '@/common-adapters/emoji'
+import {parseServiceDecoration} from './service-decoration-parser'
+
+const prefix = 'keybase://'
+const linkIsKeybaseLink = (link: string) => link.startsWith(prefix)
+
+const linkStyle = Styles.platformStyles({
+  isElectron: {fontWeight: 'inherit'},
+  isMobile: {fontWeight: undefined},
+})
+
+// Shared shell for every link decoration: same text type, hover classes and
+// [wrapStyle, linkStyle, override] style merge; behavior comes from url/onClick
+const LinkText = (p: {
+  children: React.ReactNode
+  className?: string
+  linkStyle?: StylesTextCrossPlatform | undefined
+  onClick?: () => void
+  title: string
+  url?: string
+  wrapStyle?: StylesTextCrossPlatform | undefined
+}) => {
+  const {children, className = 'hover-underline hover_contained_color_blueDark', onClick, title, url} = p
+  const {wrapStyle, linkStyle: linkStyleOverride} = p
+  const urlProps = useClickURL(url)
+  return (
+    <Text
+      className={className}
+      type="BodyPrimaryLink"
+      style={Styles.collapseStyles([wrapStyle, linkStyle, linkStyleOverride])}
+      title={title}
+      onClick={onClick}
+      {...urlProps}
+    >
+      {children}
+    </Text>
+  )
+}
+
+type KeybaseLinkProps = {
+  link: string
+  linkStyle?: StylesTextCrossPlatform | undefined
+  wrapStyle?: StylesTextCrossPlatform | undefined
+}
+
+const KeybaseLink = (props: KeybaseLinkProps) => {
+  const {link, linkStyle: linkStyleOverride, wrapStyle} = props
+  // Route through the linking config for keybase:// and https://keybase.io/ URLs
+  // so React Navigation handles navigation declaratively.
+  // emitDeepLink normalizes URLs and dispatches through the linking config,
+  // falling back to handleAppLink for patterns not yet in the config.
+  return (
+    <LinkText
+      title={link}
+      linkStyle={linkStyleOverride}
+      wrapStyle={wrapStyle}
+      onClick={() => emitDeepLink(link)}
+    >
+      {link}
+    </LinkText>
+  )
+}
+
+type WarningLinkProps = {
+  display: string
+  url: string
+  punycode: string
+  linkStyle?: StylesTextCrossPlatform | undefined
+  wrapStyle?: StylesTextCrossPlatform | undefined
+}
+
+const WarningLink = (props: WarningLinkProps) => {
+  const {display, punycode, url, linkStyle: linkStyleOverride, wrapStyle} = props
+  const navigateAppend = C.Router2.navigateAppend
+  if (isMobile) {
+    return (
+      <LinkText
+        className="hover-underline"
+        title={display}
+        linkStyle={linkStyleOverride}
+        wrapStyle={wrapStyle}
+        onClick={() =>
+          navigateAppend({name: 'chatConfirmNavigateExternal', params: {display, punycode, url}})
+        }
+      >
+        {display}
+      </LinkText>
+    )
+  }
+  return (
+    <LinkText
+      className="hover-underline"
+      title={display}
+      linkStyle={linkStyleOverride}
+      wrapStyle={wrapStyle}
+      url={url}
+    >
+      <WithTooltip
+        tooltip={punycode}
+        containerStyle={Styles.platformStyles({
+          isElectron: {display: 'inline-block'},
+        })}
+      >
+        {display}
+      </WithTooltip>
+    </LinkText>
+  )
+}
+
+export type Props = {
+  json: string
+  allowFontScaling?: boolean
+  styleOverride?: StyleOverride
+  styles: {[K in string]: StylesTextCrossPlatform}
+  disableBigEmojis: boolean
+  disableEmojiAnimation: boolean
+  messageType?: T.Chat.MessageType
+}
+
+const ServiceDecoration = (p: Props) => {
+  const {json, allowFontScaling, styles, styleOverride} = p
+  const {disableBigEmojis, disableEmojiAnimation, messageType} = p
+  const parsed = parseServiceDecoration(json)
+  if (!parsed) {
+    return null
+  }
+  if (parsed.typ === T.RPCChat.UITextDecorationTyp.payment && messageType === 'text') {
+    let paymentID: T.Wallets.PaymentID | undefined
+    let error: string | undefined
+    if (
+      parsed.payment.result.resultTyp === T.RPCChat.TextPaymentResultTyp.sent &&
+      parsed.payment.result.sent
+    ) {
+      paymentID = parsed.payment.result.sent
+    } else if (
+      parsed.payment.result.resultTyp === T.RPCChat.TextPaymentResultTyp.error &&
+      parsed.payment.result.error
+    ) {
+      error = parsed.payment.result.error
+    } else {
+      error = 'unknown text decoration'
+    }
+    return (
+      <PaymentStatus
+        paymentID={paymentID}
+        error={error}
+        text={parsed.payment.paymentText}
+        allowFontScaling={allowFontScaling}
+      />
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.atmention && parsed.atmention) {
+    return (
+      <Mention
+        allowFontScaling={allowFontScaling || false}
+        style={styles['wrapStyle']}
+        username={parsed.atmention}
+      />
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.maybemention) {
+    return (
+      <MaybeMention
+        allowFontScaling={allowFontScaling || false}
+        style={styles['wrapStyle']}
+        name={parsed.maybemention.name}
+        channel={parsed.maybemention.channel}
+      />
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.link) {
+    const link = parsed.link.url
+    const openUrl =
+      link.toLowerCase().startsWith('http://') || link.toLowerCase().startsWith('https://')
+        ? link
+        : 'http://' + link
+    return linkIsKeybaseLink(link) ? (
+      <KeybaseLink link={link} linkStyle={styleOverride?.link} wrapStyle={styles['wrapStyle']} />
+    ) : parsed.link.punycode ? (
+      <WarningLink
+        url={openUrl}
+        display={parsed.link.url}
+        punycode={parsed.link.punycode}
+        linkStyle={styleOverride?.link}
+        wrapStyle={styles['wrapStyle']}
+      />
+    ) : (
+      <LinkText
+        title={parsed.link.url}
+        linkStyle={styleOverride?.link}
+        wrapStyle={styles['wrapStyle']}
+        url={openUrl}
+      >
+        {parsed.link.url}
+      </LinkText>
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.mailto) {
+    const openUrl = parsed.mailto.url.toLowerCase().startsWith('mailto:')
+      ? parsed.mailto.url
+      : 'mailto:' + parsed.mailto.url
+    return (
+      <LinkText
+        title={parsed.mailto.url}
+        linkStyle={styleOverride?.mailto}
+        wrapStyle={styles['wrapStyle']}
+        url={openUrl}
+      >
+        {parsed.mailto.url}
+      </LinkText>
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.channelnamemention) {
+    return (
+      <Channel
+        allowFontScaling={allowFontScaling || false}
+        convID={parsed.channelnamemention.convID}
+        name={parsed.channelnamemention.name}
+        style={
+          Styles.collapseStyles([
+            styles['linkStyle'],
+            linkStyle,
+            styleOverride?.link,
+          ]) as StylesTextCrossPlatform
+        }
+      />
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.kbfspath) {
+    return (
+      <KbfsPath
+        knownPathInfo={{
+          deeplinkPath: parsed.kbfspath.pathInfo.deeplinkPath,
+          platformAfterMountPath: parsed.kbfspath.pathInfo.platformAfterMountPath,
+        }}
+        rawPath={parsed.kbfspath.rawPath}
+        standardPath={parsed.kbfspath.standardPath}
+      />
+    )
+  } else if (parsed.typ === T.RPCChat.UITextDecorationTyp.emoji) {
+    return (
+      <Emoji
+        customStyle={styleOverride?.customEmoji}
+        emojiData={RPCToEmojiData(parsed.emoji, disableEmojiAnimation)}
+        showTooltip={!parsed.emoji.isReacji}
+        size={
+          parsed.emoji.isBig && !disableBigEmojis ? 32 : parsed.emoji.isReacji && !isMobile ? 18 : 16
+        }
+        style={styleOverride?.emoji}
+      />
+    )
+  }
+  return null
+}
+
+export default ServiceDecoration

@@ -4,12 +4,13 @@
 package client
 
 import (
+	"context"
+
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"golang.org/x/net/context"
 )
 
 func NewCmdPGPDecrypt(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Command {
@@ -91,7 +92,7 @@ func (c *CmdPGPDecrypt) ParseArgv(ctx *cli.Context) error {
 	msg := ctx.String("message")
 	outfile := ctx.String("outfile")
 	infile := ctx.String("infile")
-	if err := c.FilterInit(msg, infile, outfile); err != nil {
+	if err := c.FilterInit(c.G(), msg, infile, outfile); err != nil {
 		return err
 	}
 	c.signed = ctx.Bool("signed")

@@ -1,0 +1,1032 @@
+import * as C from '@/constants'
+import {zoomImage} from '@/constants/chat/helpers'
+import * as Message from '@/constants/chat/message'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import type {StylesTextCrossPlatform} from '@/common-adapters/text.shared'
+import * as T from '@/constants/types'
+import * as React from 'react'
+import chunk from 'lodash/chunk'
+import {formatAudioRecordDuration, formatTimeForMessages} from '@/util/timestamp'
+import {infoPanelWidth} from './common'
+import {useMessagePopup} from '../messages/message-popup'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+import {ensureError} from '@/util/errors'
+import {useCurrentUserState} from '@/stores/current-user'
+import logger from '@/logger'
+import {getChatRpc} from '../chat-rpc'
+import {
+  attachmentDownloadMessage,
+  messageAttachmentNativeShareMessage,
+  showAttachmentPreview,
+} from '../attachment-actions'
+
+type Props = {
+  commonSections: ReadonlyArray<Section>
+  conversationIDKey: T.Chat.ConversationIDKey
+}
+
+const monthNames = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+]
+
+enum ThumbTyp {
+  IMAGE = 0,
+  VIDEO = 1,
+  AUDIO = 2,
+}
+
+type Thumb = {
+  key: string
+  ctime: number
+  height: number
+  typ: ThumbTyp
+  onClick: () => void
+  previewURL: string
+  width: number
+  audioDuration?: number
+}
+
+type Doc = {
+  author: string
+  ctime: number
+  downloading: boolean
+  fileName: string
+  message?: T.Chat.Message
+  name: string
+  progress: number
+  onDownload?: () => void
+  onShowInFinder?: () => void
+  onClick: () => void
+  type: 'doc'
+}
+
+type Link = {
+  author: string
+  ctime: number
+  snippet: string
+  title?: string
+  url?: string
+  key: string
+  id: T.Chat.MessageID
+  type: 'link'
+}
+
+type ThumbData = {
+  images: {
+    debug: {
+      height: number
+      maxMediaThumbSize: number
+      width: number
+    }
+    sizing: {
+      dims: {
+        height: number
+        width: number
+      }
+      margins: {
+        marginBottom: number
+        marginLeft: number
+        marginRight: number
+        marginTop: number
+      }
+    }
+    thumb: Thumb
+  }[]
+  key: number
+  type: 'thumb'
+}
+
+export type Item =
+  | {type: 'header-item'}
+  | {type: 'tabs'}
+  | Doc
+  | Link
+  | ThumbData
+  | {type: 'avselector'}
+  | {type: 'no-attachments'}
+  | {type: 'load-more'}
+  | {type: 'header-section'}
+
+type Section = Kb.SectionType<Item>
+
+// page loads append messages but keep prior message identities; reuse each
+// message's cell so already-mounted MediaThumbs bail instead of re-rendering
+// the whole grid per page
+const mediaCellCache = new WeakMap<
+  T.Chat.MessageAttachment,
+  {cell: ThumbData['images'][number]; size: number}
+>()
+
+function getDateInfo<I extends {ctime: number}>(thumb: I) {
+  const date = new Date(thumb.ctime)
+  return {
+    month: monthNames[date.getMonth()],
+    year: date.getFullYear(),
+  }
+}
+
+function formMonths<I extends {ctime: number; key: string}>(
+  items: Array<I>
+): Array<{
+  key: string
+  data: Array<I>
+  month?: string
+  year: number
+}> {
+  if (items.length === 0) {
+    return []
+  }
+  const dateInfo = getDateInfo(items[0]!)
+  let curMonth = {
+    ...dateInfo,
+    data: new Array<I>(),
+    key: `month-${dateInfo.year}-${dateInfo.month}`,
+  }
+  const months = items.reduce<Array<typeof curMonth>>((l, item, index) => {
+    const dateInfo = getDateInfo(item)
+    if (dateInfo.month !== curMonth.month || dateInfo.year !== curMonth.year) {
+      if (curMonth.data.length > 0) {
+        l.push(curMonth)
+      }
+      curMonth = {
+        ...dateInfo,
+        data: [item],
+        key: `month-${dateInfo.year}-${dateInfo.month}`,
+      }
+    } else {
+      curMonth.data.push(item)
+    }
+    if (index === items.length - 1 && curMonth.data.length > 0) {
+      l.push(curMonth)
+    }
+    return l
+  }, [])
+  return months
+}
+
+type Sizing = {
+  dims: {
+    height: number
+    width: number
+  }
+  margins: {
+    marginBottom: number
+    marginLeft: number
+    marginRight: number
+    marginTop: number
+  }
+}
+
+type MediaThumbProps = {
+  thumb: Thumb
+  sizing: Sizing
+}
+
+// React.memo (not just compiler memo): the grid's renderItem closures run outside
+// the compiler's memo graph, so elements are recreated per row render; the shallow
+// prop bail here is what lets unchanged thumbs skip when new pages arrive
+const MediaThumb = React.memo(function MediaThumb(props: MediaThumbProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {sizing, thumb} = props
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" relative={true} overflow="hidden">
+      <Kb.ClickableBox alignSelf="center" direction="vertical" onClick={thumb.onClick} style={{...sizing.margins}}>
+        {thumb.typ === ThumbTyp.AUDIO ? (
+          <Kb.Box2 alignSelf="center" direction="vertical" style={{...sizing.dims}} centerChildren={true} gap="xtiny">
+            <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} padding="tiny" style={styles.audioBackground}>
+              <Kb.Icon
+                type="iconfont-mic"
+                style={{marginLeft: 2}}
+                color={theme.whiteOrWhite}
+                sizeType="Big"
+              />
+            </Kb.Box2>
+            {!!thumb.audioDuration && (
+              <Kb.Text type="BodyTiny">{formatAudioRecordDuration(thumb.audioDuration)}</Kb.Text>
+            )}
+          </Kb.Box2>
+        ) : (
+          <Kb.Image src={thumb.previewURL} style={{...sizing.dims}} />
+        )}
+      </Kb.ClickableBox>
+      {thumb.typ === ThumbTyp.VIDEO && (
+        <Kb.Box2 direction="vertical" alignSelf="flex-start" style={styles.durationContainer}>
+          <Kb.ImageIcon type="icon-film-64" style={styles.filmIcon} />
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+})
+
+type DocViewRowProps = {item: Doc}
+
+const DocViewRow = (props: DocViewRowProps) => {
+  const styles = useStyles()
+  const {item} = props
+  const hasMessageID = !!item.message && !!T.Chat.messageIDToNumber(item.message.id)
+  const shouldShow = () => {
+    return hasMessageID
+  }
+  const {showPopup, popup} = useMessagePopup({
+    conversationIDKey: item.message?.conversationIDKey,
+    message: item.message,
+    shouldShow,
+  })
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true}>
+      <Kb.ClickableBox
+        direction="horizontal"
+        fullWidth={true}
+        style={styles.docRowContainer}
+        gap="xtiny"
+        onClick={item.onClick}
+        onLongPress={hasMessageID ? showPopup : undefined}
+      >
+        <Kb.ImageIcon type="icon-file-32" style={styles.docIcon} />
+        <Kb.Box2 direction="vertical" fullWidth={true} style={styles.docRowTitle}>
+          <Kb.Text type="BodySemibold">{item.name}</Kb.Text>
+          {item.name !== item.fileName && <Kb.Text type="BodyTiny">{item.fileName}</Kb.Text>}
+          <Kb.Text type="BodySmall">
+            Sent by {item.author} • {formatTimeForMessages(item.ctime)}
+          </Kb.Text>
+        </Kb.Box2>
+      </Kb.ClickableBox>
+      {item.downloading && (
+        <Kb.Box2 direction="horizontal" padding="tiny" fullWidth={true} gap="tiny">
+          <Kb.Text type="BodySmall">Downloading...</Kb.Text>
+          <Kb.ProgressBar ratio={item.progress} style={styles.docProgress} />
+        </Kb.Box2>
+      )}
+      {item.onShowInFinder && (
+        <Kb.Box2 direction="horizontal" padding="tiny" fullWidth={true}>
+          <Kb.Text type="BodySmallPrimaryLink" onClick={item.onShowInFinder}>
+            Show in {Kb.Styles.fileUIName}
+          </Kb.Text>
+        </Kb.Box2>
+      )}
+      {isMobile && item.message && popup}
+    </Kb.Box2>
+  )
+}
+
+type SelectorProps = {
+  selectedView: T.RPCChat.GalleryItemTyp
+  onSelectView: (typ: T.RPCChat.GalleryItemTyp) => void
+}
+
+const getBkgColor = (selected: boolean, theme: Kb.Styles.Theme) =>
+  selected ? {backgroundColor: theme.blue} : {backgroundColor: undefined}
+const getColor = (selected: boolean, theme: Kb.Styles.Theme) =>
+  selected ? {color: theme.white} : {color: theme.blueDark}
+
+const AttachmentTypeSelector = (props: SelectorProps) => {
+  const theme = Kb.Styles.useTheme()
+  const styles = useStyles()
+  const {onSelectView} = props
+  return (
+    <Kb.Box2
+      direction="horizontal"
+      padding="small"
+      style={styles.selectorContainer}
+      fullWidth={true}
+    >
+      <Kb.ClickableBox
+        direction="vertical"
+        centerChildren={true}
+        flex={1}
+        onClick={() => onSelectView(T.RPCChat.GalleryItemTyp.media)}
+        testID={TestIDs.CHAT_INFO_PANEL_MEDIA}
+        style={Kb.Styles.collapseStyles([
+          styles.selectorItemContainer,
+          styles.selectorMediaContainer,
+          getBkgColor(props.selectedView === T.RPCChat.GalleryItemTyp.media, theme),
+        ])}
+      >
+        <Kb.Text type="BodySemibold" style={getColor(props.selectedView === T.RPCChat.GalleryItemTyp.media, theme)}>
+          Media
+        </Kb.Text>
+      </Kb.ClickableBox>
+      <Kb.ClickableBox
+        direction="vertical"
+        centerChildren={true}
+        flex={1}
+        onClick={() => onSelectView(T.RPCChat.GalleryItemTyp.doc)}
+        testID={TestIDs.CHAT_INFO_PANEL_DOCS}
+        style={Kb.Styles.collapseStyles([
+          styles.selectorDocContainer,
+          styles.selectorItemContainer,
+          getBkgColor(props.selectedView === T.RPCChat.GalleryItemTyp.doc, theme),
+        ])}
+      >
+        <Kb.Text type="BodySemibold" style={getColor(props.selectedView === T.RPCChat.GalleryItemTyp.doc, theme)}>
+          Docs
+        </Kb.Text>
+      </Kb.ClickableBox>
+      <Kb.ClickableBox
+        direction="vertical"
+        centerChildren={true}
+        flex={1}
+        onClick={() => onSelectView(T.RPCChat.GalleryItemTyp.link)}
+        testID={TestIDs.CHAT_INFO_PANEL_LINKS}
+        style={Kb.Styles.collapseStyles([
+          styles.selectorItemContainer,
+          styles.selectorLinkContainer,
+          getBkgColor(props.selectedView === T.RPCChat.GalleryItemTyp.link, theme),
+        ])}
+      >
+        <Kb.Text type="BodySemibold" style={getColor(props.selectedView === T.RPCChat.GalleryItemTyp.link, theme)}>
+          Links
+        </Kb.Text>
+      </Kb.ClickableBox>
+    </Kb.Box2>
+  )
+}
+
+const LinkTitle = (p: {title: string; url?: string}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const urlProps = Kb.useClickURL(p.url ?? '')
+  return (
+    <Kb.Text
+      type="BodySmallPrimaryLink"
+      {...urlProps}
+      style={Kb.Styles.collapseStyles([styles.linkStyle, {color: theme.blueDark}])}
+    >
+      {p.title}
+    </Kb.Text>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      audioBackground: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.blue,
+        },
+        isElectron: {
+          borderRadius: '50%',
+        },
+        isMobile: {
+          borderRadius: 32,
+        },
+      }),
+      avatar: {marginRight: Kb.Styles.globalMargins.tiny},
+      docIcon: {height: 32},
+      docProgress: {alignSelf: 'center'},
+      docRowContainer: {padding: Kb.Styles.globalMargins.tiny},
+      docRowTitle: Kb.Styles.platformStyles({
+        common: {flex: 1},
+        isElectron: {
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        } as const,
+      }),
+      durationContainer: {
+        bottom: Kb.Styles.globalMargins.xtiny,
+        position: 'absolute',
+        right: Kb.Styles.globalMargins.xtiny,
+      },
+      filmIcon: Kb.Styles.size(16),
+      flexWrap: {flexWrap: 'wrap'},
+      linkContainer: {padding: Kb.Styles.globalMargins.tiny},
+      linkStyle: Kb.Styles.platformStyles({
+        common: {color: theme.black_50},
+        isElectron: {
+          fontSize: 13,
+          lineHeight: 17,
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        } as const,
+        isMobile: {fontSize: 15},
+      }),
+      linkTime: {alignSelf: 'center'},
+      loadMore: {margin: Kb.Styles.globalMargins.tiny},
+      loadMoreProgress: {
+        alignSelf: 'center',
+        marginTop: Kb.Styles.globalMargins.tiny,
+      },
+      selectorContainer: {
+        maxWidth: 460,
+      },
+      selectorDocContainer: {
+        borderColor: theme.blue,
+        borderLeftWidth: 1,
+        borderRadius: 0,
+        borderRightWidth: 1,
+      },
+      selectorItemContainer: Kb.Styles.platformStyles({
+        common: {
+          borderBottomWidth: 1,
+          borderColor: theme.blue,
+          borderStyle: 'solid',
+          borderTopWidth: 1,
+          height: 32,
+        },
+        isMobile: {paddingTop: Kb.Styles.globalMargins.xxtiny},
+      }),
+      selectorLinkContainer: {
+        borderBottomLeftRadius: 0,
+        borderBottomRightRadius: Kb.Styles.borderRadius,
+        borderRightWidth: 1,
+        borderTopLeftRadius: 0,
+        borderTopRightRadius: Kb.Styles.borderRadius,
+      },
+      selectorMediaContainer: {
+        borderBottomLeftRadius: Kb.Styles.borderRadius,
+        borderBottomRightRadius: 0,
+        borderLeftWidth: 1,
+        borderTopLeftRadius: Kb.Styles.borderRadius,
+        borderTopRightRadius: 0,
+      },
+    }) as const
+)
+
+const getFromMsgID = (info: T.Chat.AttachmentViewInfo): T.Chat.MessageID | undefined => {
+  if (info.last || info.status !== 'success') {
+    return undefined
+  }
+  const lastMessage = info.messages.length > 0 ? info.messages.at(-1) : undefined
+  return lastMessage?.id
+}
+
+type AttachmentViewMap = Map<T.RPCChat.GalleryItemTyp, T.Chat.AttachmentViewInfo>
+type AttachmentViewState = {
+  attachmentViewMap: AttachmentViewMap
+  conversationIDKey: T.Chat.ConversationIDKey
+}
+type AttachmentLoadReason = 'initial-effect' | 'load-more' | 'retry' | 'tab-change'
+
+const emptyAttachmentViewMap: AttachmentViewMap = new Map()
+
+const makeAttachmentViewInfo = (): T.Chat.AttachmentViewInfo => ({
+  last: false,
+  messages: [],
+  status: 'loading',
+})
+
+const updateAttachmentViewMap = (
+  attachmentViewMap: AttachmentViewMap,
+  viewType: T.RPCChat.GalleryItemTyp,
+  updateInfo: (info: T.Chat.AttachmentViewInfo) => void
+) => {
+  const info = attachmentViewMap.get(viewType) ?? makeAttachmentViewInfo()
+  const nextInfo = {...info, messages: [...info.messages]}
+  updateInfo(nextInfo)
+  const nextMap = new Map(attachmentViewMap)
+  nextMap.set(viewType, nextInfo)
+  return nextMap
+}
+
+const runAttachmentViewLoad = async (p: {
+  conversationIDKey: T.Chat.ConversationIDKey
+  viewType: T.RPCChat.GalleryItemTyp
+  fromMsgID: T.Chat.MessageID | undefined
+  reason: AttachmentLoadReason
+  generation: number
+  isCurrentLoad: () => boolean
+  lastOrdinalRef: {current: T.Chat.Ordinal}
+  updateCurrentAttachmentViewMap: (
+    viewType: T.RPCChat.GalleryItemTyp,
+    updateInfo: (info: T.Chat.AttachmentViewInfo) => void
+  ) => void
+}) => {
+  const {conversationIDKey, viewType, fromMsgID, reason, generation} = p
+  const {isCurrentLoad, lastOrdinalRef, updateCurrentAttachmentViewMap} = p
+  const pendingMessages: Array<T.Chat.Message> = []
+  let flushTimeout: ReturnType<typeof setTimeout> | undefined
+  const flushPendingMessages = () => {
+    if (flushTimeout) {
+      clearTimeout(flushTimeout)
+      flushTimeout = undefined
+    }
+    if (!pendingMessages.length) {
+      return
+    }
+    const messages = pendingMessages.splice(0)
+    if (!isCurrentLoad()) {
+      return
+    }
+    const dedupedMessages = new Array<T.Chat.Message>()
+    const seenMessageIDs = new Set<T.Chat.MessageID>()
+    for (const message of messages) {
+      if (!seenMessageIDs.has(message.id)) {
+        seenMessageIDs.add(message.id)
+        dedupedMessages.push(message)
+      }
+    }
+    updateCurrentAttachmentViewMap(viewType, info => {
+      const existingMessageIDs = new Set(info.messages.map(item => item.id))
+      const nextMessages = [...info.messages]
+      let changed = false
+      for (const message of dedupedMessages) {
+        if (!existingMessageIDs.has(message.id)) {
+          existingMessageIDs.add(message.id)
+          nextMessages.push(message)
+          changed = true
+        }
+      }
+      if (changed) {
+        info.messages = nextMessages.sort((l, r) => r.id - l.id)
+      }
+    })
+  }
+  const scheduleFlushPendingMessages = () => {
+    if (flushTimeout) {
+      return
+    }
+    flushTimeout = setTimeout(() => {
+      flushPendingMessages()
+    }, 16)
+  }
+  try {
+    const {deviceName, username} = useCurrentUserState.getState()
+    const getLastOrdinal = () => lastOrdinalRef.current
+    const res = await getChatRpc().loadGallery({
+      conversationIDKey,
+      fromMessageID: fromMsgID,
+      num: 50,
+      onHit: hit => {
+        const message = Message.uiMessageToMessage(conversationIDKey, hit, username, getLastOrdinal, deviceName)
+        if (message) {
+          if (T.Chat.ordinalToNumber(message.ordinal) > T.Chat.ordinalToNumber(lastOrdinalRef.current)) {
+            lastOrdinalRef.current = message.ordinal
+          }
+          pendingMessages.push({
+            ...message,
+            conversationMessage: false,
+          })
+          scheduleFlushPendingMessages()
+        }
+      },
+      viewType,
+    })
+    flushPendingMessages()
+    if (!isCurrentLoad()) {
+      logger.info('attachment gallery load stale success ignored', {
+        conversationIDKey,
+        fromMsgID,
+        generation,
+        reason,
+        viewType,
+      })
+      return
+    }
+    logger.info('attachment gallery load success', {
+      conversationIDKey,
+      fromMsgID,
+      generation,
+      last: res.last,
+      reason,
+      viewType,
+    })
+    updateCurrentAttachmentViewMap(viewType, info => {
+      info.last = res.last
+      info.status = 'success'
+    })
+  } catch (error) {
+    flushPendingMessages()
+    const {message} = ensureError(error)
+    if (isCurrentLoad()) {
+      logger.error('failed to load attachment view: ' + message, {
+        conversationIDKey,
+        fromMsgID,
+        generation,
+        reason,
+        viewType,
+      })
+      updateCurrentAttachmentViewMap(viewType, info => {
+        info.last = false
+        info.status = 'error'
+      })
+    } else {
+      logger.info('attachment gallery load stale error ignored', {
+        conversationIDKey,
+        error: message,
+        fromMsgID,
+        generation,
+        reason,
+        viewType,
+      })
+    }
+  } finally {
+    if (flushTimeout) {
+      clearTimeout(flushTimeout)
+    }
+  }
+}
+
+const useAttachmentViewState = (conversationIDKey: T.Chat.ConversationIDKey) => {
+  const lastOrdinalRef = React.useRef(T.Chat.numberToOrdinal(0))
+  const [attachmentViewState, setAttachmentViewState] = React.useState<AttachmentViewState>(() => ({
+    attachmentViewMap: new Map(),
+    conversationIDKey,
+  }))
+  const loadGenerationRef = React.useRef(0)
+
+  React.useEffect(() => {
+    loadGenerationRef.current += 1
+    return () => {
+      loadGenerationRef.current += 1
+    }
+  }, [conversationIDKey])
+
+  const updateCurrentAttachmentViewMap = (
+    viewType: T.RPCChat.GalleryItemTyp,
+    updateInfo: (info: T.Chat.AttachmentViewInfo) => void
+  ) => {
+    setAttachmentViewState(({attachmentViewMap, conversationIDKey: stateConversationIDKey}) => ({
+      attachmentViewMap: updateAttachmentViewMap(
+        stateConversationIDKey === conversationIDKey ? attachmentViewMap : new Map(),
+        viewType,
+        updateInfo
+      ),
+      conversationIDKey,
+    }))
+  }
+
+  const loadAttachmentView = React.useEffectEvent(
+    (
+      viewType: T.RPCChat.GalleryItemTyp,
+      fromMsgID: T.Chat.MessageID | undefined,
+      reason: AttachmentLoadReason
+    ) => {
+      updateCurrentAttachmentViewMap(viewType, info => {
+        info.status = 'loading'
+      })
+
+      const generation = ++loadGenerationRef.current
+      logger.info('attachment gallery load start', {
+        conversationIDKey,
+        fromMsgID,
+        generation,
+        reason,
+        viewType,
+      })
+      const isCurrentLoad = () => loadGenerationRef.current === generation
+      C.ignorePromise(
+        runAttachmentViewLoad({
+          conversationIDKey,
+          fromMsgID,
+          generation,
+          isCurrentLoad,
+          lastOrdinalRef,
+          reason,
+          updateCurrentAttachmentViewMap,
+          viewType,
+        })
+      )
+    }
+  )
+
+  const attachmentViewMap =
+    attachmentViewState.conversationIDKey === conversationIDKey
+      ? attachmentViewState.attachmentViewMap
+      : emptyAttachmentViewMap
+
+  return {attachmentViewMap, loadAttachmentView}
+}
+
+export const useAttachmentSections = (
+  p: Props,
+  loadImmediately: boolean,
+  useFlexWrap: boolean
+): {sections: Array<Section>} => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const linkStyleOverride = React.useMemo(
+    () => ({
+      link: Kb.Styles.collapseStyles([styles.linkStyle, {color: theme.blueDark}]) as StylesTextCrossPlatform,
+    }),
+    [styles.linkStyle, theme]
+  )
+  const [selectedAttachmentView, onSelectAttachmentView] = React.useState(T.RPCChat.GalleryItemTyp.media)
+  const {conversationIDKey} = p
+  const {attachmentViewMap, loadAttachmentView} = useAttachmentViewState(conversationIDKey)
+  const clearModals = C.Router2.clearModals
+
+  const jumpToAttachment = (messageID: T.Chat.MessageID) => {
+    if (isMobile) {
+      clearModals()
+    }
+    C.Router2.navigateToThread(conversationIDKey, 'misc', {intent: {messageID, type: 'highlight'}})
+  }
+
+  const loadSelectedAttachmentView = React.useEffectEvent(() => {
+    loadAttachmentView(selectedAttachmentView, undefined, 'initial-effect')
+  })
+  React.useEffect(() => {
+    if (!loadImmediately) {
+      return
+    }
+    const timeout = setTimeout(() => {
+      loadSelectedAttachmentView()
+    }, 1)
+    return () => {
+      clearTimeout(timeout)
+    }
+  }, [conversationIDKey, loadImmediately])
+
+  const attachmentInfo = attachmentViewMap.get(selectedAttachmentView)
+  const fromMsgID = attachmentInfo ? getFromMsgID(attachmentInfo) : undefined
+
+  const onLoadMore = fromMsgID
+    ? () => loadAttachmentView(selectedAttachmentView, fromMsgID, 'load-more')
+    : undefined
+
+  const onAttachmentViewChange = (viewType: T.RPCChat.GalleryItemTyp) => {
+    if (viewType === selectedAttachmentView) {
+      return
+    }
+    onSelectAttachmentView(viewType)
+    if (loadImmediately) {
+      setTimeout(() => {
+        loadAttachmentView(viewType, undefined, 'tab-change')
+      }, 1)
+    }
+  }
+
+  const loadAttachments = () => {
+    loadAttachmentView(selectedAttachmentView, undefined, 'retry')
+  }
+
+  const onMediaClick = (message: T.Chat.MessageAttachment) =>
+    showAttachmentPreview(conversationIDKey, message)
+
+  const onDocDownload = (message: T.Chat.MessageAttachment) => {
+    if (isMobile) {
+      messageAttachmentNativeShareMessage(conversationIDKey, message)
+    } else if (!message.downloadPath) {
+      attachmentDownloadMessage(conversationIDKey, message)
+    }
+  }
+
+  const onShowInFinder = (message: T.Chat.MessageAttachment) =>
+    message.downloadPath && openLocalPathInSystemFileManagerDesktop(message.downloadPath)
+
+  const avSection = {
+    data: [{type: 'avselector'}] as const,
+    renderItem: () => (
+      <AttachmentTypeSelector selectedView={selectedAttachmentView} onSelectView={onAttachmentViewChange} />
+    ),
+  } satisfies Section
+
+  const commonSections: Array<Section> = [...(p.commonSections as Array<Section>), avSection]
+
+  const loadMoreSection = {
+    data: [{type: 'load-more'}] as const,
+    renderItem: () => {
+      const status = attachmentInfo?.status
+      if (onLoadMore && status !== 'loading') {
+        return (
+          <Kb.Button
+            type="Default"
+            mode="Secondary"
+            label="Load more"
+            onClick={onLoadMore}
+            style={styles.loadMore}
+          />
+        )
+      } else if (status === 'loading') {
+        return <Kb.ProgressIndicator type="Small" style={styles.loadMoreProgress} />
+      } else if (status === 'error') {
+        return (
+          <Kb.Button
+            type="Danger"
+            mode="Secondary"
+            label="Error loading, try again"
+            onClick={loadAttachments}
+            style={styles.loadMore}
+          />
+        )
+      }
+      return null
+    },
+  } satisfies Section
+
+  let sections: Array<Section>
+  if (!attachmentInfo?.messages.length && attachmentInfo?.status !== 'loading') {
+    const noAttachmentsSection = {
+      data: [{type: 'no-attachments'}] as const,
+      renderItem: () => (
+        <Kb.Box2 centerChildren={true} direction="horizontal" fullWidth={true}>
+          <Kb.Text type="BodySmall">No attachments</Kb.Text>
+        </Kb.Box2>
+      ),
+    } satisfies Section
+    sections = [...commonSections, noAttachmentsSection, loadMoreSection]
+  } else {
+    switch (selectedAttachmentView) {
+      case T.RPCChat.GalleryItemTyp.media:
+        {
+          const rowSize = 4 // count of images in each row
+          const maxMediaThumbSize = infoPanelWidth() / rowSize
+          const getMediaCell = (m: T.Chat.MessageAttachment) => {
+            const cached = mediaCellCache.get(m)
+            if (cached?.size === maxMediaThumbSize) {
+              return cached.cell
+            }
+            const thumb = {
+              audioDuration: m.audioDuration,
+              ctime: m.timestamp,
+              height: m.previewHeight,
+              id: m.id,
+              key: `media-${m.ordinal}-${m.timestamp}-${m.previewURL}`,
+              onClick: () => onMediaClick(m),
+              previewURL: m.previewURL,
+              typ:
+                (m.audioAmps?.length ?? 0) > 0
+                  ? ThumbTyp.AUDIO
+                  : m.videoDuration
+                    ? ThumbTyp.VIDEO
+                    : ThumbTyp.IMAGE,
+              width: m.previewWidth,
+            } as Thumb
+            const cell = {
+              debug: {
+                height: thumb.height,
+                maxMediaThumbSize,
+                width: thumb.width,
+              },
+              sizing: zoomImage(thumb.width, thumb.height, maxMediaThumbSize),
+              thumb,
+            }
+            mediaCellCache.set(m, {cell, size: maxMediaThumbSize})
+            return cell
+          }
+          const cells = (attachmentInfo.messages as Array<T.Chat.MessageAttachment>).map(getMediaCell)
+          const cellByThumb = new Map(cells.map(cell => [cell.thumb, cell] as const))
+          const s: Array<Section> = formMonths(cells.map(cell => cell.thumb)).map(month => {
+            const dataUnchunked = month.data.map(thumb => cellByThumb.get(thumb)!)
+            const dataChunked = useFlexWrap ? [dataUnchunked] : chunk(dataUnchunked, rowSize)
+            const data: ReadonlyArray<ThumbData> = dataChunked.map((images, i) => ({
+              images,
+              key: i,
+              type: 'thumb',
+            }))
+            return {
+              data,
+              key: month.key,
+              renderItem: ({item}: {item: Item; index: number}) =>
+                item.type === 'thumb' ? (
+                  <Kb.Box2
+                    direction="horizontal"
+                    fullWidth={true}
+                    style={useFlexWrap ? styles.flexWrap : undefined}
+                  >
+                    {item.images.map(cell => {
+                      return <MediaThumb key={cell.thumb.key} sizing={cell.sizing} thumb={cell.thumb} />
+                    })}
+                  </Kb.Box2>
+                ) : null,
+              renderSectionHeader: () => <Kb.SectionDivider label={`${month.month} ${month.year}`} />,
+            } as const
+          })
+          sections = [...commonSections, ...s, loadMoreSection]
+        }
+        break
+      case T.RPCChat.GalleryItemTyp.doc:
+        {
+          const docs: Array<Doc & {ctime: number; key: string}> = (
+            attachmentInfo.messages as Array<T.Chat.MessageAttachment>
+          ).map(m => ({
+            author: m.author,
+            ctime: m.timestamp,
+            downloading: m.transferState === 'downloading',
+            fileName: m.fileName,
+            key: `doc-${m.ordinal}-${m.author}-${m.timestamp}-${m.fileName}`,
+            message: m,
+            name: m.title || m.fileName,
+            onClick: () => {
+              jumpToAttachment(m.id)
+            },
+            onDownload: () => onDocDownload(m),
+            onShowInFinder: !isMobile && m.downloadPath ? () => onShowInFinder(m) : undefined,
+            progress: m.transferProgress,
+            type: 'doc',
+          }))
+
+          const s: Array<Section> = formMonths(docs).map(
+            month =>
+              ({
+                data: month.data,
+                key: month.key,
+                renderItem: ({item}: {item: Item}) =>
+                  item.type === 'doc' ? <DocViewRow item={item} /> : null,
+                renderSectionHeader: () => <Kb.SectionDivider label={`${month.month} ${month.year}`} />,
+              }) as const
+          )
+          sections = [...commonSections, ...s, loadMoreSection]
+        }
+        break
+      case T.RPCChat.GalleryItemTyp.link:
+        {
+          const links = attachmentInfo.messages.reduce<Array<Link>>((l, m) => {
+            if (m.type !== 'text') {
+              return l
+            }
+            if (!m.unfurls?.size) {
+              l.push({
+                author: m.author,
+                ctime: m.timestamp,
+                id: m.id,
+                key: `unfurl-empty-${m.ordinal}-${m.author}-${m.timestamp}`,
+                snippet: m.decoratedText?.stringValue() ?? '',
+                type: 'link',
+              })
+            } else {
+              ;[...m.unfurls.values()].forEach((u, i) => {
+                if (u.unfurl.unfurlType === T.RPCChat.UnfurlType.generic) {
+                  l.push({
+                    author: m.author,
+                    ctime: m.timestamp,
+                    id: m.id,
+                    key: `unfurl-${m.ordinal}-${i}-${m.author}-${m.timestamp}-${u.unfurl.generic.url}`,
+                    snippet: m.decoratedText?.stringValue() ?? '',
+                    title: u.unfurl.generic.title,
+                    type: 'link',
+                    url: u.unfurl.generic.url,
+                  })
+                }
+              })
+            }
+            return l
+          }, [])
+
+          const s = formMonths(links).map(month => ({
+            data: month.data,
+            key: month.key,
+            renderItem: ({item}: {item: Item}) => {
+              return item.type === 'link' ? (
+                <Kb.ClickableBox
+                  direction="vertical"
+                  fullWidth={true}
+                  style={styles.linkContainer}
+                  gap="tiny"
+                  onClick={() => {
+                    jumpToAttachment(item.id)
+                  }}
+                >
+                  <Kb.Box2 direction="vertical" fullWidth={true} gap="xxtiny">
+                    <Kb.Box2 direction="horizontal" fullWidth={true} gap="tiny">
+                      <Kb.NameWithIcon
+                        avatarSize={32}
+                        avatarStyle={styles.avatar}
+                        colorFollowing={true}
+                        username={item.author}
+                        horizontal={true}
+                      />
+                      <Kb.Text type="BodyTiny" style={styles.linkTime}>
+                        {formatTimeForMessages(item.ctime)}
+                      </Kb.Text>
+                    </Kb.Box2>
+                    <Kb.Markdown
+                      serviceOnly={true}
+                      smallStandaloneEmoji={true}
+                      selectable={true}
+                      styleOverride={linkStyleOverride}
+                      style={styles.linkStyle}
+                    >
+                      {item.snippet}
+                    </Kb.Markdown>
+                  </Kb.Box2>
+                  {!!item.title && <LinkTitle title={item.title} url={item.url} />}
+                  <Kb.Divider />
+                </Kb.ClickableBox>
+              ) : null
+            },
+            renderSectionHeader: () => <Kb.SectionDivider label={`${month.month} ${month.year}`} />,
+          }))
+          sections = [...commonSections, ...s, loadMoreSection]
+        }
+        break
+    }
+  }
+
+  return {sections}
+}
+
+const Attachments = (p: Props) => {
+  const {sections} = useAttachmentSections(p, true /* loadImmediately */, false /* flexWrap */)
+  return (
+    <Kb.SectionList
+      stickySectionHeadersEnabled={true}
+      keyboardShouldPersistTaps="handled"
+      sections={sections}
+    />
+  )
+}
+export default Attachments

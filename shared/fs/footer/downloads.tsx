@@ -1,0 +1,98 @@
+import * as Kb from '@/common-adapters'
+import * as C from '@/constants'
+import * as Kbfs from '../common'
+import Download from './download'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+
+const Mobile = () => {
+  const styles = useStyles()
+  const downloadIDs = Kbfs.useFsDownloadStatus().regularDownloads
+  return downloadIDs.length ? (
+    <>
+      <Kb.Divider />
+      <Kb.ScrollView horizontal={true} snapToInterval={160 + Kb.Styles.globalMargins.xtiny}>
+        <Kb.Box2 alignSelf="center"
+          direction="horizontal"
+          overflow="hidden"
+          style={styles.box}
+          centerChildren={true}
+          gap="xtiny"
+          gapStart={true}
+          gapEnd={true}
+        >
+          {downloadIDs.map((downloadID, index) => (
+            <Download downloadID={downloadID} key={downloadID} isFirst={index === 0} />
+          ))}
+        </Kb.Box2>
+      </Kb.ScrollView>
+    </>
+  ) : null
+}
+
+const Desktop = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const downloadIDs = Kbfs.useFsDownloadStatus().regularDownloads
+  const openDownloadFolder = () => openLocalPathInSystemFileManagerDesktop(C.downloadFolder)
+  return downloadIDs.length ? (
+    <>
+      <Kb.Divider />
+      <Kb.Box2
+        direction="horizontal"
+        fullWidth={true}
+        overflow="hidden"
+        style={styles.box}
+        gap="xtiny"
+        gapStart={true}
+        gapEnd={true}
+        centerChildren={true}
+      >
+        {downloadIDs.slice(0, 3).map((downloadID, index) => (
+          <Download downloadID={downloadID} key={downloadID} isFirst={index === 0} />
+        ))}
+        {downloadIDs.length > 3 && (
+          <Kb.WithTooltip tooltip="Open Downloads folder">
+            <Kb.Icon
+              style={styles.iconBoxEllipsis}
+              type="iconfont-ellipsis"
+              hint="Open downloads folder"
+              color={theme.black_50}
+              padding="tiny"
+              onClick={openDownloadFolder}
+            />
+          </Kb.WithTooltip>
+        )}
+        <Kb.Box2 direction="horizontal" flex={1} />
+        <Kb.WithTooltip tooltip="Open Downloads folder">
+          <Kb.Icon
+            type="iconfont-folder-downloads"
+            hint="Open downloads folder"
+            color={theme.black_50}
+            padding="tiny"
+            onClick={openDownloadFolder}
+          />
+        </Kb.WithTooltip>
+      </Kb.Box2>
+    </>
+  ) : null
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      box: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.blueLighter3,
+        },
+        isElectron: {height: 40},
+        isMobile: {height: 48},
+      }),
+      iconBoxEllipsis: {
+        backgroundColor: theme.black_10,
+        borderRadius: Kb.Styles.borderRadius,
+        marginLeft: Kb.Styles.globalMargins.xtiny,
+      },
+    }) as const
+)
+
+export default isMobile ? Mobile : Desktop

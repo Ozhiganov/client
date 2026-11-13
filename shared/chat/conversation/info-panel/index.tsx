@@ -1,0 +1,219 @@
+import * as Chat from '@/constants/chat'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import * as Teams from '@/constants/teams'
+import * as React from 'react'
+import type * as T from '@/constants/types'
+import {navigateToInbox} from '@/constants/router'
+import {AdhocHeader, TeamHeader} from './header'
+import SettingsList from './settings'
+import MembersList from './members'
+import BotsList from './bot'
+import AttachmentsList from './attachments'
+import {infoPanelWidthElectron, infoPanelWidthTablet} from './common'
+import type {Tab as TabType} from '@/common-adapters/tabs'
+import {useChatTeam} from '../team-hooks'
+import {showConversationInfoPanel} from '../thread-navigation'
+import {useConversationMeta} from '../data-hooks'
+
+type Props = {
+  conversationIDKey?: T.Chat.ConversationIDKey
+  tab?: 'settings' | 'members' | 'attachments' | 'bots'
+}
+
+const InfoPanelConnector = ({conversationIDKey: _conversationIDKey, tab}: Props) => {
+  const styles = useStyles()
+  const conversationIDKey = _conversationIDKey ?? Chat.noConversationIDKey
+  const meta = useConversationMeta(conversationIDKey)
+  const shouldNavigateOut = meta.conversationIDKey === Chat.noConversationIDKey
+  const isPreview = meta.membershipType === 'youArePreviewing'
+  const channelname = meta.channelname
+  const teamname = meta.teamname
+  const {role: yourRole} = useChatTeam(meta.teamID, teamname)
+
+  const [uncontrolledSelectedTab, onSelectTab] = React.useState<Panel>(() => tab ?? 'members')
+  const selectedTab = tab ?? uncontrolledSelectedTab
+  const insets = Kb.useSafeAreaInsets()
+
+  const hideInfoPanel = React.useEffectEvent(() => {
+    showConversationInfoPanel(conversationIDKey, false, undefined)
+  })
+  React.useEffect(() => {
+    return () => {
+      // Only call showInfoPanel(false) on mobile where the panel is a separate route.
+      // On desktop the panel is inline and this cleanup fires during StrictMode
+      // double-effect, which immediately hides the panel.
+      if (isMobile) {
+        hideInfoPanel()
+      }
+    }
+  }, [])
+
+  const lastShouldNavigateOutRef = React.useRef(shouldNavigateOut)
+  React.useEffect(() => {
+    const lastShouldNavigateOut = lastShouldNavigateOutRef.current
+    lastShouldNavigateOutRef.current = shouldNavigateOut
+    if (!lastShouldNavigateOut && shouldNavigateOut) {
+      navigateToInbox()
+    }
+  }, [shouldNavigateOut])
+
+  const getTabs = (): Array<TabType<Panel>> => {
+    const showSettings = !isPreview || Teams.isAdmin(yourRole) || Teams.isOwner(yourRole)
+
+    return [
+      {testID: TestIDs.CHAT_INFO_PANEL_MEMBERS_TAB, title: 'members' as const},
+      {testID: TestIDs.CHAT_INFO_PANEL_ATTACHMENTS_TAB, title: 'attachments' as const},
+      {testID: TestIDs.CHAT_INFO_PANEL_BOTS_TAB, title: 'bots' as const},
+      // e2e: text taps on the tab label no-op on iOS, so the tab needs a testID
+      ...(showSettings ? [{testID: TestIDs.CHAT_INFO_PANEL_SETTINGS_TAB, title: 'settings' as const}] : []),
+    ]
+  }
+
+  const commonSections = [
+    {
+      data: [{type: 'header-item'}],
+      renderItem: () => (
+        <Kb.Box2 direction="vertical" gap="tiny" gapStart={true} fullWidth={true}>
+          {teamname && channelname ? (
+            <TeamHeader conversationIDKey={conversationIDKey} />
+          ) : (
+            <AdhocHeader conversationIDKey={conversationIDKey} />
+          )}
+        </Kb.Box2>
+      ),
+    },
+    {
+      data: [{type: 'tabs'}],
+      renderItem: () => null,
+      renderSectionHeader: () => {
+        const tabs = getTabs()
+        return (
+          <Kb.Box2 direction="horizontal" fullWidth={true}>
+            <Kb.Tabs
+              tabs={tabs}
+              selectedTab={selectedTab}
+              onSelect={onSelectTab}
+              style={styles.tabContainer}
+              tabStyle={styles.tab}
+              clickableTabStyle={styles.clickableTabStyle}
+            />
+          </Kb.Box2>
+        )
+      },
+    },
+  ] as const
+
+  if (!conversationIDKey) {
+    // if we dont have a valid conversation ID, just render a spinner
+    return (
+      <Kb.Box2
+        direction="vertical"
+        style={styles.container}
+        fullWidth={true}
+        centerChildren={true}
+      >
+        <Kb.ProgressIndicator type="Large" />
+      </Kb.Box2>
+    )
+  }
+
+  // modal drops its bottom safe-area edge (see routes.tsx) so these lists run
+  // edge-to-edge. iOS contentInsetAdjustmentBehavior="automatic" clears the
+  // home indicator; Android pads the container manually.
+  const containerStyle = isAndroid
+    ? Kb.Styles.collapseStyles([styles.container, {paddingBottom: insets.bottom}])
+    : styles.container
+
+  let sectionList: React.ReactNode
+  switch (selectedTab) {
+    case 'settings':
+      sectionList = (
+        <SettingsList
+          conversationIDKey={conversationIDKey}
+          isPreview={isPreview}
+          commonSections={commonSections}
+        />
+      )
+      break
+    case 'members':
+      sectionList = <MembersList conversationIDKey={conversationIDKey} commonSections={commonSections} />
+      break
+    case 'attachments':
+      sectionList = <AttachmentsList conversationIDKey={conversationIDKey} commonSections={commonSections} />
+      break
+    case 'bots':
+      sectionList = <BotsList conversationIDKey={conversationIDKey} commonSections={commonSections} />
+      break
+    default:
+      sectionList = null
+  }
+  if (Kb.Styles.isTablet) {
+    // Use a View to make the left border.
+    return (
+      <Kb.Box2 direction="horizontal" fullWidth={true} fullHeight={true} style={styles.containerOuterTablet}>
+        <Kb.Box2 direction="vertical" fullHeight={true} style={styles.containerBorder}></Kb.Box2>
+        <Kb.Box2 alignSelf="center" direction="vertical" style={styles.container}>
+          {sectionList}
+        </Kb.Box2>
+      </Kb.Box2>
+    )
+  } else {
+    return (
+      <Kb.Box2
+        direction="vertical"
+        style={containerStyle}
+        fullWidth={true}
+        fullHeight={true}
+        testID={TestIDs.CHAT_INFO_PANEL}
+      >
+        {sectionList}
+      </Kb.Box2>
+    )
+  }
+}
+
+export type Panel = 'settings' | 'members' | 'attachments' | 'bots'
+
+const tabletContainerBorderSize = 1
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      clickableTabStyle: Kb.Styles.platformStyles({
+        isElectron: {width: 'auto'},
+        isMobile: {width: undefined},
+      }),
+      container: Kb.Styles.platformStyles({
+        common: {alignItems: 'stretch', paddingBottom: Kb.Styles.globalMargins.tiny},
+        isElectron: {
+          backgroundColor: theme.white,
+          borderLeft: `1px solid ${theme.black_10}`,
+          width: infoPanelWidthElectron,
+        },
+        isTablet: {
+          paddingTop: Kb.Styles.globalMargins.small,
+          width: infoPanelWidthTablet,
+        },
+      }),
+      containerBorder: {
+        backgroundColor: theme.black_10,
+        width: tabletContainerBorderSize,
+      },
+      containerOuterTablet: {width: infoPanelWidthTablet + tabletContainerBorderSize},
+      tab: {
+        justifyContent: 'center',
+        paddingLeft: Kb.Styles.globalMargins.xsmall,
+        paddingRight: Kb.Styles.globalMargins.xsmall,
+      },
+      tabContainer: Kb.Styles.platformStyles({
+        common: {backgroundColor: theme.white},
+        isElectron: {
+          overflowX: 'hidden',
+          overflowY: 'hidden',
+        },
+        isMobile: {marginTop: 0},
+      }),
+    }) as const
+)
+
+export default InfoPanelConnector

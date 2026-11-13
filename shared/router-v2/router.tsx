@@ -1,0 +1,768 @@
+import * as C from '@/constants'
+import * as CChat from '@/constants/chat'
+import {registerDebugClear} from '@/util/debug-registry'
+import {createLeftTabNavigator} from './left-tab-navigator'
+import DesktopHeader from './header'
+import * as Common from './common'
+import {useConfigState} from '@/stores/config'
+import {useDarkModeState} from '@/stores/darkmode'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as Tabs from '@/constants/tabs'
+import logger from '@/logger'
+import {Splash} from '../login/loading'
+import type {Theme} from '@react-navigation/native'
+import {HeaderLeftButton} from '@/common-adapters/header-buttons'
+import {NavigationContainer} from '@react-navigation/native'
+import {createLinkingConfig, subscribeNavigationIntents} from './linking'
+import {handleAppLink} from '@/constants/deeplinks'
+import {modalRoutes, routes, loggedOutRoutes, tabRoots, routeMapToStaticScreens} from './routes'
+import {useDaemonState} from '@/stores/daemon'
+import {LoadedTeamsListProvider} from '@/teams/use-teams-list'
+import {makeLayout} from './screen-layout'
+import {createNativeStackNavigator} from '@react-navigation/native-stack'
+import type {NativeStackNavigationOptions} from '@react-navigation/native-stack'
+import type {SFSymbol} from 'sf-symbols-typescript'
+import type {NavigationProp} from '@react-navigation/native'
+import type {RootParamList} from './route-params'
+import {useNotifState} from '@/stores/notifications'
+import {usePushState} from '@/stores/push'
+import {colors, darkColors} from '@/styles/colors'
+import {createBottomTabNavigator} from '@react-navigation/bottom-tabs'
+import {Linking, Platform, View} from 'react-native'
+import {StatusBar} from 'expo-status-bar'
+import AccountSwitchHeaderAvatar from './account-switch-header-avatar'
+import {clearPendingAccountSwitch, consumePendingAccountSwitchTab} from './account-switch'
+import {useLoggedInScreens} from './logged-in-screens'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useNavigationIntentsState} from '@/stores/navigation-intents'
+import {takeLaunchURL} from './launch-url'
+import {holdLoggedOutLink, releaseLoggedOutLink} from './logged-out-share'
+// `bubble`/`bubble.fill` SF Symbols only exist on iOS 17+; older sims render blank.
+const isIOS17Plus = isIOS && parseInt(Platform.Version as string, 10) >= 17
+
+// Tell the router constants which root-stack routes are modals (vs genuinely-visible
+// pushed screens like chatConversation). modalRoutes is the single source of truth.
+C.Router2.setModalRouteNames(Object.keys(modalRoutes))
+
+function SimpleLoading() {
+  const theme = Kb.Styles.useTheme()
+  return (
+    <Kb.Box2
+      direction="vertical"
+      fullHeight={true}
+      fullWidth={true}
+      style={{backgroundColor: theme.white}}
+    >
+      <Splash allowFeedback={false} failed="" status="" />
+    </Kb.Box2>
+  )
+}
+
+const makeTheme = (palette: {white: string; black: string; black_10: string}, dark: boolean): Theme => ({
+  colors: {
+    // DEBUGCOLORS: blue = theme background (screen bg), magenta = theme card (native bar bg)
+    background: Common.DEBUGCOLORS ? 'blue' : palette.white,
+    border: palette.black_10,
+    card: Common.DEBUGCOLORS ? 'magenta' : palette.white,
+    notification: palette.black,
+    primary: palette.black,
+    text: palette.black,
+  },
+  dark,
+  fonts: {
+    bold: Kb.Styles.globalStyles.fontBold,
+    heavy: Kb.Styles.globalStyles.fontExtrabold,
+    medium: Kb.Styles.globalStyles.fontSemibold,
+    regular: Kb.Styles.globalStyles.fontRegular,
+  },
+})
+const darkTheme = makeTheme(darkColors, true)
+const lightTheme = makeTheme(colors, false)
+
+// Shared NavigationContainer plumbing (identical on both platforms)
+const onUnhandledAction = (a: Readonly<{type: string}>) => {
+  // error, not info: an action nothing handled is a user-visible no-op (a menu item that does
+  // nothing). Error is the only level retained at full depth in both dev and release and dumped
+  // periodically in both, so it is the one that survives to a remote log send.
+  logger.error(`[NAV] Unhandled action: ${a.type}`, a, C.Router2.logState())
+}
+const onStateChange = () => {
+  C.useRouterState.getState().dispatch.setNavState(C.Router2.getRootState())
+}
+const setNavRef = (ref: typeof C.Router2.navigationRef.current) => {
+  if (ref) {
+    C.Router2.navigationRef.current = ref
+  }
+}
+
+// ─── Desktop ──────────────────────────────────────────────────────────────────
+
+// Sticky: once the handshake finishes we never go back to the splash, even if it
+// restarts later (engine reconnect); the disconnected overlay covers that case.
+// Module-level so it survives the navigator remount on user switch (a ref would
+// reset and flash the splash).
+let handshakeEverDone = false
+const useHandshakeEverDone = () => {
+  return useDaemonState(s => {
+    handshakeEverDone = handshakeEverDone || s.handshakeState === 'done'
+    return handshakeEverDone
+  })
+}
+
+let DesktopRootComponent: React.ComponentType
+
+if (!isMobile) {
+  const desktopTab = createLeftTabNavigator()
+  const desktopTabComponents: Record<string, React.ComponentType> = {}
+
+  const desktopTabScreensConfig = routeMapToStaticScreens(routes, makeLayout, false, false, true)
+
+  const appTabsInnerOptions = {
+    ...Common.defaultNavigationOptions,
+    header: undefined,
+    headerShown: false,
+    get tabBarActiveBackgroundColor() {
+      return Kb.Styles.getTheme().blueDarkOrGreyDarkest
+    },
+    tabBarHideOnKeyboard: true,
+    get tabBarInactiveBackgroundColor() {
+      return Kb.Styles.getTheme().blueDarkOrGreyDarkest
+    },
+    tabBarShowLabel: Kb.Styles.isTablet,
+    tabBarStyle: Common.tabBarStyle,
+  }
+
+  for (const tab of Tabs.desktopTabs) {
+    const nav = createNativeStackNavigator({
+      initialRouteName: tabRoots[tab],
+      screenOptions: Common.defaultNavigationOptions as NativeStackNavigationOptions,
+      screens: desktopTabScreensConfig,
+    })
+    desktopTabComponents[tab] = nav.getComponent()
+  }
+
+  function AppTabsDesktop() {
+    return (
+      <desktopTab.Navigator backBehavior="none" screenOptions={appTabsInnerOptions}>
+        {Tabs.desktopTabs.map(tab => (
+          <desktopTab.Screen key={tab} name={tab} component={desktopTabComponents[tab]!} />
+        ))}
+      </desktopTab.Navigator>
+    )
+  }
+
+  type DesktopHeaderProps = Record<string, unknown> & {options: Record<string, unknown>}
+  const DesktopHeaderComponent = DesktopHeader as React.ComponentType<DesktopHeaderProps>
+
+  const desktopLoggedOutScreensConfig = routeMapToStaticScreens(
+    loggedOutRoutes,
+    makeLayout,
+    false,
+    true,
+    false
+  )
+  const desktopLoggedOutOptions = {
+    header: (p: Record<string, unknown>) => {
+      const options = {
+        ...((p['options'] as Record<string, unknown> | undefined) ?? {}),
+        headerBottomStyle: {height: 0},
+        headerShadowVisible: false,
+      }
+      return <DesktopHeaderComponent {...p} options={options} />
+    },
+  } satisfies NativeStackNavigationOptions
+
+  const loggedOutNav = createNativeStackNavigator({
+    initialRouteName: 'login',
+    screenOptions: desktopLoggedOutOptions,
+    screens: desktopLoggedOutScreensConfig,
+  })
+  const LoggedOutDesktop = loggedOutNav.getComponent()
+
+  // ModalWrapper draws a modal's header from its live options, so React Navigation's own header
+  // renders nothing here; headerShown stays the route's, for ModalWrapper to read.
+  const desktopRootScreenOptions = {
+    header: () => null,
+    presentation: 'transparentModal' as const,
+    title: '',
+  } satisfies NativeStackNavigationOptions
+  const noHeader = {headerShown: false} satisfies NativeStackNavigationOptions
+
+  const useIsLoadingDesktop = () => !useHandshakeEverDone()
+
+  const useIsLoggedInDesktop = () => {
+    const loaded = useHandshakeEverDone()
+    const loggedIn = useLoggedInScreens()
+    return loaded && loggedIn
+  }
+
+  const useIsLoggedOutDesktop = () => {
+    const loaded = useHandshakeEverDone()
+    const loggedIn = useLoggedInScreens()
+    return loaded && !loggedIn
+  }
+
+  const desktopModalScreensConfig = routeMapToStaticScreens(modalRoutes, makeLayout, true, false, false)
+
+  const desktopRootNav = createNativeStackNavigator({
+    groups: {
+      loggedIn: {
+        if: useIsLoggedInDesktop,
+        screens: {
+          loggedIn: {options: noHeader, screen: AppTabsDesktop},
+          ...desktopModalScreensConfig,
+        },
+      },
+      loggedOut: {
+        if: useIsLoggedOutDesktop,
+        screens: {
+          loggedOut: {options: noHeader, screen: LoggedOutDesktop},
+        },
+      },
+    },
+    screenOptions: desktopRootScreenOptions,
+    screens: {
+      loading: {
+        if: useIsLoadingDesktop,
+        options: noHeader,
+        screen: SimpleLoading,
+      },
+    },
+  })
+  DesktopRootComponent = desktopRootNav.getComponent()
+}
+
+const useConnectNavToState = () => {
+  const setNavOnce = React.useRef(false)
+  React.useEffect(() => {
+    if (!setNavOnce.current) {
+      if (C.Router2.navigationRef.isReady()) {
+        setNavOnce.current = true
+
+        if (__DEV__) {
+          const w = window as unknown as Record<string, unknown> | undefined
+          if (w) {
+            w['DEBUGNavigator'] = C.Router2.navigationRef.current
+            w['DEBUGRouter2'] = C.Router2
+            w['KBCONSTANTS'] = C
+            w['KBINBOX'] = CChat
+            registerDebugClear(() => {
+              w['DEBUGNavigator'] = undefined
+              w['DEBUGRouter2'] = undefined
+              w['KBCONSTANTS'] = undefined
+              w['KBINBOX'] = undefined
+            })
+          }
+        }
+      }
+    }
+  }, [setNavOnce])
+}
+
+function DesktopRouter() {
+  useConnectNavToState()
+
+  const isDarkMode = useDarkModeState(s => s.isDarkMode())
+  const navKey = Common.useUserSwitchNavKey()
+  const {currentUid, username} = useCurrentUserState(
+    C.useShallow(s => ({
+      currentUid: s.uid,
+      username: s.username,
+    }))
+  )
+  const endUserSwitchLandedOn = useConfigState(s => s.dispatch.endUserSwitchLandedOn)
+  const setNavigationReady = useNavigationIntentsState(s => s.dispatch.setNavigationReady)
+
+  React.useEffect(
+    () => subscribeNavigationIntents(handleAppLink, handleAppLink),
+    []
+  )
+  const setDesktopNavRef = (ref: typeof C.Router2.navigationRef.current) => {
+    setNavRef(ref)
+    // React 19 Strict Mode detaches and reattaches callback refs without calling
+    // NavigationContainer.onReady again. Restore readiness from the live ref.
+    setNavigationReady(ref?.isReady() ?? false)
+  }
+
+  const documentTitle = {
+    formatter: () => {
+      const t = C.Router2.getTab()
+      const m = t ? C.Tabs.desktopTabMeta[t] : undefined
+      const tabLabel: string = m?.label ?? ''
+      return `Keybase: ${tabLabel}`
+    },
+  }
+
+  return (
+    <NavigationContainer
+      key={navKey}
+      documentTitle={documentTitle}
+      onReady={() => {
+        onStateChange()
+        setNavigationReady(true, currentUid)
+        endUserSwitchLandedOn(username)
+      }}
+      onStateChange={onStateChange}
+      onUnhandledAction={onUnhandledAction}
+      ref={setDesktopNavRef}
+      theme={isDarkMode ? darkTheme : lightTheme}
+    >
+      <LoadedTeamsListProvider>
+        <DesktopRootComponent />
+      </LoadedTeamsListProvider>
+    </NavigationContainer>
+  )
+}
+
+// ─── Native ───────────────────────────────────────────────────────────────────
+
+// Self-accept HMR so an edit here doesn't bubble up and reload the whole app
+if (isMobile && module.hot) {
+  module.hot.accept()
+}
+
+const tabToLabel = new Map<string, string>([
+  [Tabs.chatTab, 'Chat'],
+  [Tabs.fsTab, 'Files'],
+  [Tabs.teamsTab, 'Teams'],
+  [Tabs.peopleTab, 'People'],
+  [Tabs.settingsTab, 'More'],
+])
+
+// just to get badge rollups
+const nativeTabs = C.isTablet ? Tabs.tabletTabs : Tabs.phoneTabs
+const settingsTabChildren = [Tabs.gitTab, Tabs.devicesTab, Tabs.settingsTab] as const
+
+const tabStackOptions = ({
+  navigation,
+  route,
+}: {
+  navigation: {getState: () => {routes: ReadonlyArray<{key: string}>}}
+  route: {key: string}
+}): NativeStackNavigationOptions => {
+  // Ask THIS stack, not canGoBack(): canGoBack bubbles up to the parent navigators, so it
+  // answers "can anything go back" rather than "is this the tab root". Options are only
+  // recomputed when the tab stack re-renders, so a wrong answer stranded the avatar
+  // until some unrelated re-render (badge, theme) happened to land at depth 1.
+  const isRoot = navigation.getState().routes[0]?.key === route.key
+  return {
+    ...Common.defaultNavigationOptions,
+    // Root screens show the account switcher avatar. Pushed screens use the
+    // native back button (liquid glass pill on iOS 26).
+    headerBackVisible: !isRoot,
+    headerLeft: isAndroid && isRoot ? () => <AccountSwitchHeaderAvatar /> : undefined,
+    ...(isIOS && isRoot
+      ? {
+          unstable_headerLeftItems: () => [
+            {
+              element: <AccountSwitchHeaderAvatar />,
+              hidesSharedBackground: true,
+              type: 'custom' as const,
+            },
+          ],
+        }
+      : {}),
+  }
+}
+
+// On phones, each tab stack only contains its root screen. All other routes live in
+// the root stack (alongside chatConversation) so they render above the tab bar.
+const tabRootNameSet = new Set<string>(Object.values(tabRoots).filter(Boolean))
+const phoneRootRoutes = Object.fromEntries(
+  Object.entries(routes).filter(([name]) => !tabRootNameSet.has(name))
+) as typeof routes
+
+const nativeTabComponents: Record<string, React.ComponentType> = {}
+
+if (isMobile) {
+  // Tablet tab stacks hold every route; phone tab stacks hold only their root screen
+  // (everything else lives in the root stack so it renders above the tab bar).
+  const tabletScreensConfig = C.isTablet
+    ? routeMapToStaticScreens(routes, makeLayout, false, false, true)
+    : undefined
+
+  for (const tab of nativeTabs) {
+    const rootName = tabRoots[tab]
+    const screens =
+      tabletScreensConfig ??
+      routeMapToStaticScreens(
+        {[rootName]: routes[rootName as keyof typeof routes]} as typeof routes,
+        makeLayout,
+        false,
+        false,
+        true
+      )
+    const nav = createNativeStackNavigator({
+      initialRouteName: rootName,
+      screenOptions: tabStackOptions,
+      screens,
+    })
+    nativeTabComponents[tab] = nav.getComponent()
+  }
+}
+
+const androidTabIcons = new Map<Tabs.Tab, number>(
+  isMobile
+    ? [
+        [Tabs.chatTab, require('../images/icons/icon-nav-chat-32.png')],
+        [Tabs.fsTab, require('../images/icons/icon-nav-folders-32.png')],
+        [Tabs.peopleTab, require('../images/icons/icon-nav-people-32.png')],
+        [Tabs.settingsTab, require('../images/icons/icon-nav-settings-32.png')],
+        [Tabs.teamsTab, require('../images/icons/icon-nav-teams-32.png')],
+      ]
+    : []
+)
+
+const iosTabIcons = new Map<Tabs.Tab, {active: SFSymbol; inactive: SFSymbol}>(
+  isMobile
+    ? [
+        [
+          Tabs.chatTab,
+          isIOS17Plus
+            ? {active: 'bubble.fill', inactive: 'bubble'}
+            : {active: 'message.fill', inactive: 'message'},
+        ],
+        [Tabs.fsTab, {active: 'folder.fill', inactive: 'folder'}],
+        [Tabs.peopleTab, {active: 'person.crop.rectangle.fill', inactive: 'person.crop.rectangle'}],
+        [Tabs.settingsTab, {active: 'line.3.horizontal.circle.fill', inactive: 'line.3.horizontal'}],
+        [Tabs.teamsTab, {active: 'person.2.fill', inactive: 'person.2'}],
+      ]
+    : []
+)
+
+const getNativeTabIcon = (tab: Tabs.Tab) => {
+  if (isIOS) {
+    const icon = iosTabIcons.get(tab)
+    return icon
+      ? ({focused}: {focused: boolean}) => ({
+          name: focused ? icon.active : icon.inactive,
+          type: 'sfSymbol' as const,
+        })
+      : undefined
+  }
+  const source = androidTabIcons.get(tab)
+  return source ? {source, type: 'image' as const} : undefined
+}
+
+const getBadgeNumber = (
+  routeName: Tabs.Tab,
+  navBadges: ReadonlyMap<Tabs.Tab, number>,
+  hasPermissions: boolean
+) => {
+  const onSettings = routeName === Tabs.settingsTab
+  const tabsToCount: ReadonlyArray<Tabs.Tab> = onSettings ? settingsTabChildren : [routeName]
+  const count = tabsToCount.reduce(
+    (res, tab) => res + (navBadges.get(tab) || 0),
+    onSettings && !hasPermissions ? 1 : 0
+  )
+  return count || undefined
+}
+
+const appTabsScreenOptions = (
+  routeName: Tabs.Tab,
+  badge: number | undefined,
+  isDarkMode: boolean,
+  theme: Kb.Styles.Theme
+) => {
+  return {
+    headerShown: false,
+    // native bottom-tabs defaults lazy to false and background-mounts every
+    // hidden tab shortly after startup; only mount tabs on first focus
+    lazy: true,
+    overrideScrollViewContentInsetAdjustmentBehavior: true,
+    tabBarBadge: badge,
+    tabBarBadgeStyle: {
+      backgroundColor: theme.orange,
+    },
+    ...(isIOS
+      ? {
+          tabBarActiveIndicatorEnabled: false,
+          tabBarMinimizeBehavior: Common.tabBarMinimizeBehavior,
+          ...(C.isLiquidGlassSupported
+            ? {
+                tabBarBlurEffect: Common.tabBarBlurEffect,
+              }
+            : {
+                tabBarActiveTintColor: theme.whiteOrWhite,
+                tabBarInactiveTintColor: isDarkMode ? colors.black : colors.blueDarker,
+              }),
+        }
+      : {
+          tabBarActiveIndicatorColor: 'rgba(255,255,255,0.15)',
+          tabBarActiveIndicatorEnabled: true,
+          // The bar is dark in both themes (greyDarkest/blueDark below), so the tints
+          // must not flip with the theme or the labels invert onto a dark background.
+          tabBarActiveTintColor: theme.whiteOrWhite,
+          tabBarInactiveTintColor: colors.blueLighter,
+        }),
+    tabBarIcon: getNativeTabIcon(routeName),
+    tabBarLabel: tabToLabel.get(routeName) ?? routeName,
+    tabBarTestID: Common.tabToTestID.get(routeName),
+    tabBarLabelVisibilityMode: 'labeled' as const,
+    tabBarStyle: {backgroundColor: isDarkMode ? colors.greyDarkest : colors.blueDark},
+    title: tabToLabel.get(routeName) ?? routeName,
+  }
+}
+
+let NativeRootComponent: React.ComponentType
+
+if (isMobile) {
+  // Created inside the isMobile guard: on desktop @react-navigation/bottom-tabs is
+  // aliased to the null module, so calling it at module scope would crash startup.
+  const NativeTab = createBottomTabNavigator()
+
+  // Options objects are cached per tab and only replaced when that tab's own inputs
+  // change: handing the native tab bar a new options object recreates its UITabBarItem,
+  // and recreating all of them at once makes UIKit re-lay-out the whole bar, which can
+  // leave labels stuck truncated ('Peo...') until something else forces another pass.
+  const tabOptionsCache = new Map<Tabs.Tab, {key: string; options: ReturnType<typeof appTabsScreenOptions>}>()
+  const getCachedTabOptions = (
+    tab: Tabs.Tab,
+    badge: number | undefined,
+    isDarkMode: boolean,
+    theme: Kb.Styles.Theme
+  ) => {
+    const key = `${badge ?? ''}:${isDarkMode ? 1 : 0}:${theme.orange}`
+    const cached = tabOptionsCache.get(tab)
+    if (cached?.key === key) {
+      return cached.options
+    }
+    const options = appTabsScreenOptions(tab, badge, isDarkMode, theme)
+    tabOptionsCache.set(tab, {key, options})
+    return options
+  }
+
+  function AppTabsNative() {
+    const theme = Kb.Styles.useTheme()
+    const navBadges = useNotifState(s => s.navBadges)
+    const hasPermissions = usePushState(s => s.hasPermissions)
+    const isDarkMode = useDarkModeState(s => s.isDarkMode())
+
+    return (
+      <NativeTab.Navigator backBehavior="none">
+        {nativeTabs.map(tab => (
+          <NativeTab.Screen
+            key={tab}
+            name={tab}
+            component={nativeTabComponents[tab]!}
+            options={getCachedTabOptions(
+              tab,
+              getBadgeNumber(tab, navBadges, hasPermissions),
+              isDarkMode,
+              theme
+            )}
+          />
+        ))}
+      </NativeTab.Navigator>
+    )
+  }
+
+  const nativeLoggedOutScreensConfig = routeMapToStaticScreens(
+    loggedOutRoutes,
+    makeLayout,
+    false,
+    true,
+    false
+  )
+
+  const loggedOutNav = createNativeStackNavigator({
+    initialRouteName: 'login',
+    screenOptions: Common.defaultNavigationOptions as NativeStackNavigationOptions,
+    screens: nativeLoggedOutScreensConfig,
+  })
+  const NativeLoggedOut = loggedOutNav.getComponent()
+
+  const rootStackScreenOptions = {
+    headerBackButtonDisplayMode: 'minimal',
+    headerTitleAlign: isAndroid ? 'center' : undefined,
+    // Lock to portrait by default. Only full-screen attachment views (chat/files)
+    // opt back into rotation via orientation: 'all'.
+    orientation: 'portrait',
+  } satisfies NativeStackNavigationOptions
+
+  const modalScreenOptions = ({
+    navigation,
+  }: {
+    navigation: NavigationProp<RootParamList>
+  }): NativeStackNavigationOptions => {
+    const cancelItem: NativeStackNavigationOptions =
+      isIOS
+        ? {
+            unstable_headerLeftItems: () => [
+              {label: 'Cancel', onPress: () => navigation.goBack(), type: 'button' as const},
+            ],
+          }
+        : {headerBackVisible: false, headerLeft: () => <HeaderLeftButton mode="cancel" />}
+    return {
+      ...cancelItem,
+      headerShown: true,
+      presentation: 'modal',
+      title: '',
+    }
+  }
+
+  const useIsLoggedInNative = () => useLoggedInScreens()
+  const useIsLoggedOutNative = () => !useLoggedInScreens()
+
+  const nativeModalScreensConfig = routeMapToStaticScreens(modalRoutes, makeLayout, true, false, false)
+  const nativePhoneRootScreensConfig = routeMapToStaticScreens(
+    C.isTablet ? {} : phoneRootRoutes,
+    makeLayout,
+    false,
+    false,
+    false
+  )
+
+  const nativeRootNav = createNativeStackNavigator({
+    groups: {
+      loggedIn: {
+        if: useIsLoggedInNative,
+        screens: {
+          // iOS: keep the bar visible (empty + transparent) instead of hidden. Unhiding a
+          // hidden bar during a push makes iOS 26 slide the whole UINavigationBar in from the
+          // right as its own animated plane, desynced from the screen slide — the header
+          // judders against the thread (RNS issue #3773). A visible bar stays put and only its
+          // contents transition. headerBackTitle is a marker for our react-native-screens
+          // patch, which cancels this bar's safe-area contribution so tab screens' own
+          // headers don't shift down by the bar height.
+          loggedIn: {
+            options: isIOS
+              ? {
+                  headerBackTitle: 'RNS_EMPTY_BAR',
+                  headerShown: true,
+                  headerTransparent: true,
+                  title: '',
+                }
+              : {headerShown: false},
+            screen: AppTabsNative,
+          },
+          ...nativePhoneRootScreensConfig,
+        },
+      },
+      loggedOut: {
+        if: useIsLoggedOutNative,
+        screens: {
+          loggedOut: {options: {headerShown: false}, screen: NativeLoggedOut},
+        },
+      },
+      modals: {
+        if: useIsLoggedInNative,
+        screenOptions: modalScreenOptions as NativeStackNavigationOptions,
+        screens: nativeModalScreensConfig,
+      },
+    },
+    screenOptions: rootStackScreenOptions,
+  })
+  NativeRootComponent = nativeRootNav.getComponent()
+}
+
+// Create once, stable across renders. handleAppLink is used as fallback for
+// URL patterns not yet handled by the linking config.
+const nativeLinkingConfig = isMobile ? createLinkingConfig(handleAppLink) : undefined
+
+function NativeRouter() {
+  const theme = Kb.Styles.useTheme()
+  const loggedInLoaded = useHandshakeEverDone()
+
+  const {endUserSwitchLandedOn, loggedIn, startupLoaded, userSwitching} = useConfigState(
+    C.useShallow(s => ({
+      endUserSwitchLandedOn: s.dispatch.endUserSwitchLandedOn,
+      loggedIn: s.loggedIn,
+      startupLoaded: s.startup.loaded,
+      userSwitching: s.userSwitching,
+    }))
+  )
+  const {currentUid, username} = useCurrentUserState(
+    C.useShallow(s => ({
+      currentUid: s.uid,
+      username: s.username,
+    }))
+  )
+
+  const {barStyle, isDarkMode} = useDarkModeState(
+    C.useShallow(s => {
+      const isDarkMode = s.isDarkMode()
+      const barStyle =
+        s.darkModePreference === 'system'
+          ? ('default' as const)
+          : isDarkMode
+            ? ('light' as const)
+            : ('dark' as const)
+      return {barStyle, isDarkMode}
+    })
+  )
+
+  const bar = barStyle === 'default' ? null : <StatusBar style={barStyle} />
+  const navKey = Common.useUserSwitchNavKey()
+  const setNavigationReady = useNavigationIntentsState(s => s.dispatch.setNavigationReady)
+  const setNativeNavRef = (ref: typeof C.Router2.navigationRef.current) => {
+    setNavRef(ref)
+    setNavigationReady(ref?.isReady() ?? false)
+  }
+
+  React.useEffect(() => {
+    if (!userSwitching) {
+      clearPendingAccountSwitch(username)
+    }
+  }, [userSwitching, username])
+
+  // Without a linking config (logged out) the launch link, and any link after it (a share from the
+  // iOS share extension among them), would be lost.
+  React.useEffect(() => {
+    if (!isIOS || !loggedInLoaded || loggedIn) return
+    const holdLaunchLink = async () => {
+      holdLoggedOutLink(await takeLaunchURL())
+    }
+    C.ignorePromise(holdLaunchLink())
+    const sub = Linking.addEventListener('url', ({url}: {url: string}) => holdLoggedOutLink(url))
+    return () => sub.remove()
+  }, [loggedInLoaded, loggedIn])
+  React.useEffect(() => {
+    if (loggedIn) {
+      releaseLoggedOutLink()
+    }
+  }, [loggedIn])
+
+  const onNativeReady = () => {
+    onStateChange()
+    const tab = consumePendingAccountSwitchTab(username)
+    if (tab) {
+      C.Router2.switchTab(tab)
+    }
+    setNavigationReady(true, currentUid)
+    endUserSwitchLandedOn(username)
+  }
+
+  if (!loggedInLoaded || (loggedIn && !startupLoaded)) {
+    return (
+      <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.globalStyles.fillAbsolute}>
+        <SimpleLoading />
+      </Kb.Box2>
+    )
+  }
+
+  return (
+    <Kb.Box2 direction="vertical" pointerEvents="box-none" fullWidth={true} fullHeight={true} key={navKey}>
+      {bar}
+      <NavigationContainer
+        fallback={<View style={{backgroundColor: theme.white, flex: 1}} />}
+        linking={loggedIn ? nativeLinkingConfig : undefined}
+        // Sync the initial state from the linking config into the router store.
+        // onStateChange doesn't fire for the initial state, so this ensures
+        // onRouteChanged runs and conversation data gets loaded on startup.
+        onReady={onNativeReady}
+        onStateChange={onStateChange}
+        onUnhandledAction={onUnhandledAction}
+        ref={setNativeNavRef}
+        theme={isDarkMode ? darkTheme : lightTheme}
+      >
+        <LoadedTeamsListProvider>
+          <NativeRootComponent />
+        </LoadedTeamsListProvider>
+      </NavigationContainer>
+    </Kb.Box2>
+  )
+}
+
+export default isMobile ? NativeRouter : DesktopRouter

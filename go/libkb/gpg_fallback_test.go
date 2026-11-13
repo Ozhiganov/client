@@ -4,13 +4,14 @@ import (
 	"testing"
 
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
 )
 
 type TestGenericKey struct {
 	GenericKey
 }
 
-func (k *TestGenericKey) SignToString(msg []byte) (sig string, id keybase1.SigID, err error) {
+func (k *TestGenericKey) SignToString(msg []byte) (sig string, id keybase1.SigIDBase, err error) {
 	sig = "TestSignature"
 	return
 }
@@ -19,6 +20,7 @@ func InitTestKey(k *PGPKeyBundle) {
 	k.GPGFallbackKey = &TestGenericKey{k}
 }
 
+//nolint:gosec // G101: Test PGP key for GPG fallback testing, not real credentials
 var gpgDummyKey = `-----BEGIN PGP PRIVATE KEY BLOCK-----
 Version: GnuPG v2
 
@@ -68,17 +70,16 @@ var msg = []byte("test")
 
 func TestSignWithTestKey(t *testing.T) {
 	k, _, err := ReadOneKeyFromString(gpgDummyKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	if _, _, err := k.SignToString(msg); err == nil {
-		t.Fatal("was able to sign with dummy skey")
+		require.Error(t, err,
+			"was able to sign with dummy skey")
 	}
 
 	// Set a fallback key to use when SimpleSign fails.
 	InitTestKey(k)
 	if _, _, err := k.SignToString(msg); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 }

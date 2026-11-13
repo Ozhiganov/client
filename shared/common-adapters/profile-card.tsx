@@ -1,0 +1,383 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Styles from '@/styles'
+import * as Platforms from '@/util/platforms'
+import * as T from '@/constants/types'
+import capitalize from 'lodash/capitalize'
+import {Box2, ClickableBox} from './box'
+import ConnectedNameWithIcon from './name-with-icon'
+import {_setWithProfileCardPopup} from './usernames'
+import FloatingMenu from './floating-menu'
+import Icon from './icon'
+import Meta from './meta'
+import {useFollowerState} from '@/stores/followers'
+import {useCurrentUserState} from '@/stores/current-user'
+import ProgressIndicator from './progress-indicator'
+import Text from './text'
+import WithTooltip from './with-tooltip'
+import {useTimeout} from './use-timers'
+import FollowButton from '../profile/user/actions/follow-button'
+import ChatButton from '../chat/chat-button'
+import type {MeasureRef} from './measure-ref'
+import {navToProfile} from '@/constants/router'
+import {useTrackerProfile} from '@/tracker/use-profile'
+import {noAssertion} from '@/tracker/model'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const positionFallbacks = ['top center', 'bottom center'] as const
+
+const DelayedMounting = (props: {delay: number; children: React.ReactNode}) => {
+  const [showing, setShowing] = React.useState(false)
+  const setShowingTrue = useTimeout(() => setShowing(true), props.delay)
+  React.useEffect(setShowingTrue, [setShowingTrue])
+  return <>{showing && props.children}</>
+}
+
+const Kb = {
+  Box2,
+  ClickableBox,
+  ConnectedNameWithIcon,
+  FloatingMenu,
+  Icon,
+  Meta,
+  ProgressIndicator,
+  Text,
+  WithTooltip,
+}
+
+type Props = {
+  clickToProfile?: true
+  containerStyle?: Styles.StylesCrossPlatform
+  onHide?: () => void
+  showClose?: true
+  username: string
+}
+
+const maxIcons = 4
+
+type ServiceIconsProps = {
+  userDetailsAssertions?: ReadonlyMap<string, T.Tracker.Assertion>
+}
+
+const assertionTypeToServiceId = (assertionType: string): Platforms.ServiceId | undefined => {
+  switch (assertionType) {
+    case 'facebook':
+    case 'github':
+    case 'hackernews':
+    case 'keybase':
+    case 'reddit':
+    case 'twitter':
+      return assertionType
+    default:
+      return undefined
+  }
+}
+
+const ServiceIcons = ({userDetailsAssertions}: ServiceIconsProps) => {
+  const styles = useStyles()
+  const theme = Styles.useTheme()
+  const services = new Map(
+    userDetailsAssertions
+      ? [...userDetailsAssertions.values()].map(assertion => [assertion.type, assertion])
+      : []
+  )
+  const serviceIds = [...services]
+    .map(([serviceName]) => assertionTypeToServiceId(serviceName))
+    .filter(Boolean) as Array<Platforms.ServiceId>
+  const [expanded, setExpanded] = React.useState(false)
+  const expandLabel =
+    !expanded && serviceIds.length > maxIcons ? `+${serviceIds.length - (maxIcons - 1)}` : ''
+  const serviceIdsShowing = serviceIds.slice(0, expandLabel ? maxIcons - 1 : undefined)
+  return (
+    <Kb.Box2
+      direction="horizontal"
+      gap="tiny"
+      style={styles.serviceIcons}
+      fullWidth={true}
+      centerChildren={true}
+      testID={TestIDs.PROFILE_CARD_SERVICE_ICONS}
+    >
+      {serviceIdsShowing.map(serviceId => {
+        const assertion = services.get(serviceId) || noAssertion
+        return (
+          <Kb.WithTooltip
+            key={serviceId}
+            tooltip={
+              `${assertion.value} on ${capitalize(serviceId)}` +
+              (assertion.state === 'valid' ? '' : ' (unverified)')
+            }
+            backgroundColor={assertion.state === 'valid' ? undefined : theme.red}
+            position="top center"
+            showOnPressMobile={true}
+            containerStyle={styles.iconContainer}
+          >
+            <Kb.Icon
+              type={Platforms.serviceIdToIcon(serviceId)}
+              color={assertion.state === 'valid' ? theme.black : theme.black_20}
+            />
+            {assertion.state !== 'valid' && (
+              <Kb.Icon
+                fontSize={isMobile ? 12 : 10}
+                style={styles.brokenBadge}
+                type="iconfont-proof-broken"
+                color={theme.red}
+              />
+            )}
+          </Kb.WithTooltip>
+        )
+      })}
+      {!!expandLabel && (
+        <Kb.ClickableBox alignSelf="center" onClick={() => setExpanded(true)} direction="vertical" style={styles.expand}>
+          <Kb.Meta title={expandLabel} backgroundColor={theme.greyDark} />
+        </Kb.ClickableBox>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const ProfileCard = ({
+  clickToProfile,
+  onHide,
+  showClose,
+  containerStyle,
+  username,
+}: Props) => {
+  const styles = useStyles()
+  const theme = Styles.useTheme()
+  // a hover card is incidental, not "check this identity now" - the cached proof
+  // results are what it should show, and forcing a check re-fetches every proof
+  // from its third-party host
+  const {details: userDetails, loadProfile} = useTrackerProfile(username, {cachedOnMount: true})
+  const followThem = useFollowerState(s => s.following.has(username))
+  const followsYou = useFollowerState(s => s.followers.has(username))
+  const isSelf = useCurrentUserState(s => s.username === username)
+  const hasBrokenProof = userDetails.assertions
+    ? [...userDetails.assertions.values()].find(assertion => assertion.state !== 'valid')
+    : false
+  const [showFollowButton, setShowFollowButton] = React.useState(false)
+  if (!showFollowButton) {
+    const shouldShowFollowButton = !isSelf && !hasBrokenProof && !followThem && userDetails.state === 'valid'
+    // Don't show follow button for self; additionally if any proof is broken
+    // don't show follow button. If we are aleady following, don't "invite" to
+    // unfollow. But dont' hide the button if user has just followed the user.
+    if (shouldShowFollowButton) {
+      setShowFollowButton(true)
+    }
+  }
+
+  const followUser = C.useRPC(T.RPCGen.identify3Identify3FollowUserRpcPromise)
+  const _changeFollow = (follow: boolean) =>
+    followUser([{follow, guiID: userDetails.guiID}, C.waitingKeyTracker], () => loadProfile(false), () => {})
+
+  const openProfile = () => {
+    navToProfile(username)
+    onHide?.()
+  }
+
+  return (
+    <Kb.Box2 alignSelf="center"
+      direction="vertical"
+      alignItems="center"
+      relative={true}
+      style={Styles.collapseStyles([styles.container, containerStyle])}
+    >
+      {!!showClose && (
+        <Kb.Icon type="iconfont-close" color={theme.black_20} onClick={() => {}} style={styles.close} padding="tiny" />
+      )}
+      <Kb.ConnectedNameWithIcon
+        onClick={clickToProfile && openProfile}
+        colorFollowing={true}
+        username={username}
+        metaStyle={styles.connectedNameWithIconMetaStyle}
+        metaTwo={userDetails.fullname || ''}
+        withProfileCardPopup={false}
+      />
+      {userDetails.state === 'checking' ? (
+        <Kb.ProgressIndicator type="Large" />
+      ) : (
+        <>
+          <ServiceIcons userDetailsAssertions={userDetails.assertions} />
+          {!!userDetails.bio && (
+            <Kb.Text type="Body" center={true} lineClamp={4} ellipsizeMode="tail">
+              {(userDetails.bio || '').replace(/\s/g, ' ')}
+            </Kb.Text>
+          )}
+        </>
+      )}
+      {showFollowButton &&
+        (followThem ? (
+          <FollowButton
+            key="unfollow"
+            following={true}
+            onUnfollow={() => _changeFollow(false)}
+            waitingKey={C.waitingKeyTracker}
+            small={true}
+            style={styles.button}
+          />
+        ) : (
+          <FollowButton
+            key="follow"
+            following={false}
+            followsYou={followsYou}
+            onFollow={() => _changeFollow(true)}
+            waitingKey={C.waitingKeyTracker}
+            small={true}
+            style={styles.button}
+          />
+        ))}
+      <ChatButton small={true} style={styles.button} username={username} afterClick={onHide} />
+    </Kb.Box2>
+  )
+}
+
+type WithProfileCardPopupProps = {
+  username: string
+  children: (onLongPress?: () => void) => React.ReactElement<typeof Text>
+  ellipsisStyle?: Styles.StylesCrossPlatform
+}
+
+export const WithProfileCardPopup = ({username, children, ellipsisStyle}: WithProfileCardPopupProps) => {
+  const styles = useStyles()
+  const popupAnchor = React.useRef<MeasureRef | null>(null)
+  const [showing, setShowing] = React.useState(false)
+  const you = useCurrentUserState(s => s.username)
+  const isSelf = you === username
+  const onShow = C.useDebouncedCallback(() => {
+    setShowing(true)
+  }, 200)
+  const onHide = () => {
+    onShow.cancel()
+    setShowing(false)
+  }
+
+  if (isSelf) {
+    return children()
+  }
+  const popup = showing && (
+    <DelayedMounting delay={isMobile ? 0 : 300}>
+      <Kb.FloatingMenu
+        attachTo={popupAnchor}
+        closeOnSelect={true}
+        mode="bottomsheet"
+        onHidden={onHide}
+        position="top center"
+        offset={isMobile ? 0 : 10}
+        positionFallbacks={positionFallbacks}
+        propagateOutsideClicks={!isMobile}
+        visible={showing}
+        header={
+          <ProfileCard
+            containerStyle={styles.profileCardPopup}
+            username={username}
+            clickToProfile={true}
+            onHide={onHide}
+          />
+        }
+        items={[]}
+      />
+    </DelayedMounting>
+  )
+  return isMobile ? (
+    <>
+      {children(onShow)}
+      {popup}
+    </>
+  ) : (
+    <Kb.Box2
+      direction="vertical"
+      style={Styles.collapseStyles([styles.popupTextContainer, ellipsisStyle])}
+      onMouseOver={onShow}
+      onMouseLeave={onHide}
+      onMouseDown={e => {
+        // clicking the username navigates to the profile; cancel any pending/visible popup.
+        // portal children bubble through the React tree, so only hide when the click is on
+        // the anchor itself and not inside the floating card (follow/chat buttons).
+        // loose typing since tsconfig.native compiles this file without DOM lib
+        const anchor = e.currentTarget as unknown as {contains?: (t: unknown) => boolean}
+        if (anchor.contains?.(e.target)) onHide()
+      }}
+      ref={popupAnchor}
+    >
+      {children()}
+      {popup}
+    </Kb.Box2>
+  )
+}
+
+_setWithProfileCardPopup(WithProfileCardPopup)
+
+export default ProfileCard
+
+const useStyles = Styles.createStyleHook(
+  theme =>
+    ({
+      brokenBadge: Styles.platformStyles({
+        common: {
+          ...Styles.border(theme.white, Styles.globalMargins.xxtiny),
+          bottom: -Styles.globalMargins.xxtiny,
+          position: 'absolute',
+          right: -Styles.globalMargins.xxtiny,
+        },
+        isElectron: {
+          borderRadius: '50%',
+        },
+        isMobile: {
+          borderRadius: 8,
+        },
+      }),
+      button: {
+        marginTop: Styles.globalMargins.xtiny + Styles.globalMargins.xxtiny,
+      },
+      close: {
+        position: 'absolute',
+        right: 0,
+        top: 0,
+      },
+      connectedNameWithIconMetaStyle: Styles.platformStyles({
+        isElectron: {
+          marginTop: Styles.globalMargins.xxtiny + Styles.globalMargins.xtiny,
+        },
+        isMobile: {
+          marginTop: (Styles.globalMargins.xxtiny + Styles.globalMargins.xtiny) / 2,
+        },
+      }),
+      container: Styles.platformStyles({
+        common: {
+          backgroundColor: theme.white,
+          ...Styles.padding(
+            Styles.globalMargins.small,
+            Styles.globalMargins.tiny,
+            Styles.globalMargins.small,
+            Styles.globalMargins.tiny
+          ),
+        },
+        isElectron: {
+          width: 170,
+        },
+      }),
+      expand: {
+        marginTop: -Styles.globalMargins.xxtiny,
+        paddingLeft: Styles.globalMargins.xtiny,
+      },
+      iconContainer: {
+        position: 'relative',
+      },
+      popupTextContainer: Styles.platformStyles({
+        isElectron: {
+          display: 'inline-block',
+        },
+      }),
+      profileCardPopup: Styles.platformStyles({
+        isMobile: Styles.padding(
+          Styles.globalMargins.large,
+          undefined,
+          Styles.globalMargins.small,
+          undefined
+        ),
+      }),
+      serviceIcons: {
+        flexWrap: 'wrap',
+        padding: Styles.globalMargins.xtiny + Styles.globalMargins.xxtiny,
+      },
+    }) as const
+)

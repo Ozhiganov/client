@@ -1,0 +1,99 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+
+type WinGlobal = {
+  innerWidth: number
+  innerHeight: number
+  addEventListener: (type: string, handler: (e: {clientX: number; clientY: number}) => void, opts?: {passive?: boolean}) => void
+  removeEventListener: (type: string, handler: (e: {clientX: number; clientY: number}) => void) => void
+}
+
+const RoverDesktop = () => {
+  const desktopStyles = useDesktopStyles()
+  const win = globalThis as unknown as WinGlobal
+  const widthX = win.innerWidth
+  const heightY = win.innerHeight
+
+  const transBackgroundX = (x: number) => -100 + x * 3
+  const transBackgroundY = (y: number) => y
+  const transForegroundX = (x: number) => -100 + x * 30
+  const transForegroundY = (y: number) => y
+  const transRoverX = (x: number) => 160 + x * 20
+  const transRoverY = (x: number, y: number) => 70 + x * 2 + 3 * y
+
+  const [x, setX] = React.useState(0)
+  const [y, setY] = React.useState(0)
+
+  React.useEffect(() => {
+    const calcx = (cx: number) => (cx - widthX / 2) / widthX
+    const calcy = (cy: number) => (cy - heightY / 2) / heightY
+    const onMouseMove = (e: {clientX: number; clientY: number}) => {
+      setX(calcx(e.clientX))
+      setY(calcy(e.clientY))
+    }
+    win.addEventListener('mousemove', onMouseMove, {passive: true})
+    return () => win.removeEventListener('mousemove', onMouseMove)
+  }, [widthX, heightY, win])
+
+  return (
+    <div style={desktopStyles.container}>
+      <div style={{...desktopStyles.layer, bottom: transBackgroundY(y), left: transBackgroundX(x)}}>
+        <Kb.ImageIcon style={desktopStyles.background} type="icon-illustration-mars-rover-background" />
+      </div>
+      <div style={{...desktopStyles.layer, bottom: transRoverY(x, y), left: transRoverX(x)}}>
+        <Kb.ImageIcon style={desktopStyles.rover} type="icon-illustration-mars-rover" />
+      </div>
+      <div style={{...desktopStyles.layer, bottom: transForegroundY(y), left: transForegroundX(x)}}>
+        <Kb.ImageIcon style={desktopStyles.foreground} type="icon-illustration-mars-rover-foreground" />
+      </div>
+    </div>
+  )
+}
+
+const RoverNative = () => {
+  const nativeStyles = useNativeStyles()
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" style={nativeStyles.container}>
+      <Kb.ImageIcon style={nativeStyles.background} type="icon-illustration-mars-rover-background" />
+      <Kb.ImageIcon style={nativeStyles.rover} type="icon-illustration-mars-rover" />
+      <Kb.ImageIcon style={nativeStyles.foreground} type="icon-illustration-mars-rover-foreground" />
+    </Kb.Box2>
+  )
+}
+
+const Rover = isMobile ? RoverNative : RoverDesktop
+
+const desktopCommon = {bottom: 0, left: 0, position: 'absolute'} as const
+
+// The three image sizes are the assets' own pixel dimensions, and they are load-bearing:
+// ImageIconDesktop emits an <img> with no width/height attribute, so an unsized layer has a
+// 0x0 box until its bitmap arrives -- and a lazy image with a zero-area box is never fetched,
+// so it stays 0x0 forever. Keep these in step with the png files.
+const useDesktopStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      background: {...desktopCommon, bottom: 10, height: 379, width: 539},
+      container: desktopCommon,
+      foreground: {...desktopCommon, height: 90, width: 539},
+      // the parallax wrappers each supply their own bottom/left inline every render
+      layer: {position: 'absolute'},
+      rover: {height: 78, width: 74},
+    }) as const
+)
+
+const nativeShared = Kb.Styles.isTablet
+  ? ({bottom: 0, position: 'absolute', right: 0} as const)
+  : ({bottom: 0, left: 0, position: 'absolute'} as const)
+
+const useNativeStyles = Kb.Styles.createStyleHook(() => ({
+  background: {...nativeShared, bottom: 10},
+  container: nativeShared,
+  foreground: nativeShared,
+  rover: Kb.Styles.platformStyles({
+    common: {...nativeShared, bottom: 80},
+    isPhone: {left: Kb.Styles.dimensionWidth - 50},
+    isTablet: {right: 50},
+  }),
+}))
+
+export default Rover

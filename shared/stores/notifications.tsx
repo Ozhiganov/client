@@ -1,0 +1,261 @@
+import * as Z from '@/util/zustand'
+import type * as EngineGen from '@/constants/rpc'
+import * as T from '@/constants/types'
+import {bodyToJSON} from '@/constants/rpc-utils'
+import {ignorePromise} from '@/constants/utils'
+import isEqual from 'lodash/isEqual'
+import * as Tabs from '@/constants/tabs'
+import logger from '@/logger'
+import {mapGetEnsureValue} from '@/util/map'
+import {useCurrentUserState} from '@/stores/current-user'
+
+export type BadgeType = 'regular' | 'update' | 'error' | 'uploading'
+export type NotificationKeys = 'kbfsUploading' | 'outOfSpace'
+
+type Store = T.Immutable<{
+  badgeVersion: number
+  deletedTeams: ReadonlyArray<T.RPCGen.DeletedTeamInfo>
+  desktopAppBadgeCount: number
+  deviceBadges: Set<T.Devices.DeviceID>
+  keyState: Map<NotificationKeys, boolean>
+  mobileAppBadgeCount: number
+  newTeamRequests: Map<T.Teams.TeamID, Set<string>>
+  newTeams: Set<T.Teams.TeamID>
+  navBadges: Map<Tabs.Tab, number>
+  teamIDToResetUsers: Map<T.Teams.TeamID, Set<string>>
+  widgetBadge: BadgeType
+}>
+const initialStore: Store = {
+  badgeVersion: -1,
+  deletedTeams: [],
+  desktopAppBadgeCount: 0,
+  deviceBadges: new Set(),
+  keyState: new Map(),
+  mobileAppBadgeCount: 0,
+  navBadges: new Map(),
+  newTeamRequests: new Map(),
+  newTeams: new Set(),
+  teamIDToResetUsers: new Map(),
+  widgetBadge: 'regular',
+}
+
+export type State = Store & {
+  dispatch: {
+    clearDeviceBadges: () => void
+    onEngineIncomingImpl: (action: EngineGen.Actions) => void
+    resetState: () => void
+    badgeApp: (key: NotificationKeys, on: boolean) => void
+    setBadgeCounts: (counts: Map<Tabs.Tab, number>) => void
+  }
+}
+
+const badgeStateToBadgeCounts = (bs: T.RPCGen.BadgeState) => {
+  const {unverifiedEmails, unverifiedPhones} = bs
+  const deletedTeams = bs.deletedTeams ?? []
+  const newDevices = bs.newDevices ?? []
+  const newGitRepoGlobalUniqueIDs = bs.newGitRepoGlobalUniqueIDs ?? []
+  const newTeamAccessRequestCount = bs.newTeamAccessRequestCount
+  const newTeams = bs.newTeams ?? []
+  const revokedDevices = bs.revokedDevices ?? []
+  const teamsWithResetUsers = bs.teamsWithResetUsers ?? []
+  const counts = new Map<Tabs.Tab, number>()
+
+  counts.set(Tabs.peopleTab, bs.homeTodoItems)
+
+  const allDeviceChanges = new Set(newDevices)
+  newDevices.forEach(d => allDeviceChanges.add(d))
+  revokedDevices.forEach(d => allDeviceChanges.add(d))
+
+  // don't see badges related to this device
+  const deviceID = useCurrentUserState.getState().deviceID
+  counts.set(Tabs.devicesTab, allDeviceChanges.size - (allDeviceChanges.has(deviceID) ? 1 : 0))
+  counts.set(Tabs.chatTab, bs.smallTeamBadgeCount + bs.bigTeamBadgeCount)
+  counts.set(Tabs.gitTab, newGitRepoGlobalUniqueIDs.length)
+  counts.set(
+    Tabs.teamsTab,
+    newTeams.length + newTeamAccessRequestCount + teamsWithResetUsers.length + deletedTeams.length
+  )
+  counts.set(Tabs.settingsTab, unverifiedEmails + unverifiedPhones)
+
+  return counts
+}
+
+const badgeStateToTeamIDToResetUsers = (bs: T.RPCGen.BadgeState) => {
+  const teamIDToResetUsers = new Map<T.Teams.TeamID, Set<string>>()
+  bs.teamsWithResetUsers?.forEach(entry => {
+    if (!entry.teamID || !entry.username) {
+      return
+    }
+    const existing = mapGetEnsureValue(teamIDToResetUsers, entry.teamID, new Set<string>())
+    existing.add(entry.username)
+  })
+  return teamIDToResetUsers
+}
+
+const newRequestsGregorPrefix = 'team.request_access:'
+
+const gregorItemsToNewTeamRequests = (
+  items: Array<{md: T.RPCGen.Gregor1.Metadata; item: T.RPCGen.Gregor1.Item}>
+) => {
+  const newTeamRequests = new Map<T.Teams.TeamID, Set<string>>()
+  items.forEach(({item}) => {
+    if (!item.category.startsWith(newRequestsGregorPrefix)) {
+      return
+    }
+    const request = bodyToJSON(item.body) as undefined | {id: T.Teams.TeamID; username: string}
+    if (!request) {
+      return
+    }
+    const requests = mapGetEnsureValue(newTeamRequests, request.id, new Set<string>())
+    requests.add(request.username)
+  })
+  return newTeamRequests
+}
+
+export const useNotifState = Z.createZustand<State>('notifications', (set, get) => {
+  const updateWidgetBadge = (s: Z.WritableDraft<State>) => {
+    let widgetBadge: BadgeType = 'regular'
+    const {keyState} = s
+    if (keyState.get('outOfSpace')) {
+      widgetBadge = 'error'
+    } else if (keyState.get('kbfsUploading')) {
+      widgetBadge = 'uploading'
+    }
+    s.widgetBadge = widgetBadge
+  }
+
+  const dispatch: State['dispatch'] = {
+    badgeApp: (key, on) => {
+      set(s => {
+        const {keyState} = s
+        keyState.set(key, on)
+        updateWidgetBadge(s)
+      })
+    },
+    clearDeviceBadges: () => {
+      ignorePromise(T.RPCGen.deviceDismissDeviceChangeNotificationsRpcPromise())
+      set(s => {
+        s.deviceBadges = new Set()
+      })
+    },
+    onEngineIncomingImpl: action => {
+      switch (action.type) {
+        case 'keybase.1.NotifyBadges.badgeState': {
+          const badgeState = action.payload.params.badgeState
+          // device badges track the latest server state even when the inbox
+          // version guard below skips the rest
+          set(s => {
+            s.deviceBadges = new Set([
+              ...(badgeState.newDevices ?? []),
+              ...(badgeState.revokedDevices ?? []),
+            ])
+          })
+          const currentBadgeVersion = get().badgeVersion
+          if (currentBadgeVersion > badgeState.inboxVers) {
+            break
+          }
+          // badgeState fires on every incoming message; keep identities stable when the
+          // team data didn't change so subscribers (TeamsRoot etc) can bail. Compare
+          // against committed state, not the draft (immer 11 breaks lodash isEqual on drafts).
+          {
+            const prev = get()
+            const deletedTeams = badgeState.deletedTeams ?? []
+            const newTeams = new Set(badgeState.newTeams ?? [])
+            const teamIDToResetUsers = badgeStateToTeamIDToResetUsers(badgeState)
+            set(s => {
+              if (!isEqual(prev.deletedTeams, deletedTeams)) {
+                s.deletedTeams = T.castDraft(deletedTeams)
+              }
+              if (!isEqual(prev.newTeams, newTeams)) {
+                s.newTeams = newTeams
+              }
+              if (!isEqual(prev.teamIDToResetUsers, teamIDToResetUsers)) {
+                s.teamIDToResetUsers = teamIDToResetUsers
+              }
+            })
+          }
+          if (currentBadgeVersion === badgeState.inboxVers) {
+            // Teams badge detail can change without advancing inboxVers, so keep the
+            // Teams tab badge in sync with the latest server-owned badge state.
+            get().dispatch.setBadgeCounts(
+              new Map([[Tabs.teamsTab, badgeStateToBadgeCounts(badgeState).get(Tabs.teamsTab) ?? 0]])
+            )
+            break
+          }
+          set(s => {
+            s.badgeVersion = badgeState.inboxVers
+          })
+          const counts = badgeStateToBadgeCounts(badgeState)
+          get().dispatch.setBadgeCounts(counts)
+          break
+        }
+        case 'keybase.1.gregorUI.pushState': {
+          const {state} = action.payload.params
+          const items = state.items || []
+          const goodState = items.reduce<Array<{md: T.RPCGen.Gregor1.Metadata; item: T.RPCGen.Gregor1.Item}>>(
+            (arr, {md, item}) => {
+              if (md && item) {
+                arr.push({item, md})
+              }
+              return arr
+            },
+            []
+          )
+          if (goodState.length !== items.length) {
+            logger.warn('Lost some messages in filtering out nonNull gregor items')
+          }
+          {
+            const newTeamRequests = gregorItemsToNewTeamRequests(goodState)
+            if (!isEqual(get().newTeamRequests, newTeamRequests)) {
+              set(s => {
+                s.newTeamRequests = newTeamRequests
+              })
+            }
+          }
+          break
+        }
+        default:
+      }
+    },
+    resetState: Z.defaultReset,
+    setBadgeCounts: counts => {
+      set(s => {
+        const chatCount = counts.get(Tabs.chatTab)
+        if (chatCount) {
+          s.mobileAppBadgeCount = chatCount
+        }
+
+        // desktopAppBadgeCount is the sum of badge counts on all tabs. What
+        // happens here is for each tab we deduct the old count from the
+        // current desktopAppBadgeCount, then add the new count into it.
+        //
+        // For example, assume following existing state:
+        // 1) the overall app badge has 12, i.e. state.desktopAppBadgeCount === 12;
+        // 2) and the FS tab count is 4, i.e. state.navBadges.get(Tabs.fsTab) === 4;
+        // Nw we receive `{count: {[Tabs.fsTab]: 7}}` indicating that the
+        // new FS tab badge count should become 7. So we deduct 4 from 12 and
+        // add 7, and we'd get 15.
+        //
+        // This way the app badge count is always consistent with the badged
+        // tabs.
+        s.desktopAppBadgeCount = [...counts.entries()].reduce(
+          (count, [k, v]) => count - (s.navBadges.get(k) || 0) + v,
+          s.desktopAppBadgeCount
+        )
+
+        const navBadges = new Map([...s.navBadges, ...counts])
+        // Compare against committed state, not the draft: immer 11.1.9 sanitizes
+        // constructor/prototype access on drafts (prototype-pollution fix),
+        // making lodash isEqual throw a proxy-invariant TypeError.
+        if (!isEqual(navBadges, get().navBadges)) {
+          s.navBadges = navBadges
+        }
+        updateWidgetBadge(s)
+      })
+    },
+  }
+  return {
+    ...initialStore,
+    dispatch,
+  }
+})

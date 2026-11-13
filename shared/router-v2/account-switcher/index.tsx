@@ -1,0 +1,221 @@
+import * as C from '@/constants'
+import './account-switcher.css'
+import {useConfigState} from '@/stores/config'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import type * as T from '@/constants/types'
+import {useUsersState} from '@/stores/users'
+import {useCurrentUserState} from '@/stores/current-user'
+import {navToProfile} from '@/constants/router'
+import {rememberAccountSwitchTab} from '../account-switch'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const AccountSwitcher = (p: {onSelected?: () => void}) => {
+  const styles = useStyles()
+  const {onSelected} = p
+  const _fullnames = useUsersState(s => s.infoMap)
+  const {
+    accountRows: _accountRows,
+    logoutAndTryToLogInAs: onSelectAccountLoggedOut,
+    logoutToLoggedOutFlow: onLoginAsAnotherUser,
+    switchToAccount,
+    userSwitching,
+  } = useConfigState(
+    C.useShallow(s => ({
+      accountRows: s.configuredAccounts,
+      logoutAndTryToLogInAs: s.dispatch.logoutAndTryToLogInAs,
+      logoutToLoggedOutFlow: s.dispatch.logoutToLoggedOutFlow,
+      switchToAccount: s.dispatch.switchToAccount,
+      userSwitching: s.userSwitching,
+    }))
+  )
+  const you = useCurrentUserState(s => s.username)
+  const fullname = _fullnames.get(you)?.fullname ?? ''
+  // The mid-switch store reset clears the login waiting key while the switch is still running, so
+  // also hold the rows on userSwitching or a second switch can start before the first lands.
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyConfigLogin) || userSwitching
+
+  const onSelectAccountLoggedIn = (username: string) => {
+    const tab = C.Router2.getTab()
+    if (switchToAccount(username) && isMobile) {
+      rememberAccountSwitchTab(you, username, tab)
+    }
+  }
+
+  const accountRows = _accountRows.filter(account => account.username !== you)
+  const props = {
+    accountRows: accountRows.map(account => ({
+      account: account,
+      fullName: (_fullnames.get(account.username) || {fullname: ''}).fullname || '',
+    })),
+    fullname,
+    onLoginAsAnotherUser,
+    onProfileClick: () => navToProfile(you),
+    onSelectAccount: (username: string) => {
+      onSelected?.()
+      const rows = accountRows.filter(account => account.username === username)
+      const loggedIn = (rows.length && rows[0]?.hasStoredSecret) ?? false
+      return loggedIn ? onSelectAccountLoggedIn(username) : onSelectAccountLoggedOut(username)
+    },
+    username: you,
+    waiting,
+  }
+
+  return (
+    <Kb.ScrollView alwaysBounceVertical={false}>
+      <Kb.Box2 direction="vertical" fullWidth={true} centerChildren={true}>
+        {isMobile && <MobileHeader {...props} />}
+        <Kb.Divider style={styles.divider} />
+        {isMobile ? (
+          <AccountsRows {...props} />
+        ) : (
+          <Kb.ScrollView style={styles.desktopScrollview} className="accountSwitcherScrollView">
+            <AccountsRows {...props} />
+          </Kb.ScrollView>
+        )}
+        {props.accountRows.length > 0 && !isMobile && <Kb.Divider style={styles.divider} />}
+      </Kb.Box2>
+    </Kb.ScrollView>
+  )
+}
+
+type AccountRowItem = {
+  account: T.Config.ConfiguredAccount
+  fullName: string
+}
+
+type Props = {
+  accountRows: Array<AccountRowItem>
+  fullname: string
+  onLoginAsAnotherUser: () => void
+  onProfileClick: () => void
+  onSelectAccount: (username: string) => void
+  username: string
+  waiting: boolean
+}
+
+const MobileHeader = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <>
+      <Kb.Box2
+        direction="vertical"
+        gap="tiny"
+        gapStart={true}
+        centerChildren={true}
+        gapEnd={true}
+        fullWidth={true}
+        style={styles.userBox}
+      >
+        <Kb.Avatar username={props.username} onClick={props.onProfileClick} size={128} />
+        <Kb.Box2 direction="vertical" centerChildren={true}>
+          <Kb.Text type="BodyBig" onClick={props.onProfileClick}>
+            {props.username}
+          </Kb.Text>
+          <Kb.Text type="BodySmall" lineClamp={1} onClick={props.onProfileClick}>
+            {props.fullname}
+          </Kb.Text>
+        </Kb.Box2>
+        <Kb.Button fullWidth={true} label="View/Edit profile" mode="Secondary" onClick={props.onProfileClick} />
+        <Kb.Divider style={styles.divider} />
+      </Kb.Box2>
+      <Kb.Box2 direction="vertical" style={styles.buttonBox} fullWidth={true} gap="tiny">
+        <Kb.WaitingButton
+          onClick={props.onLoginAsAnotherUser}
+          label="Log in as another user"
+          mode="Primary"
+          fullWidth={true}
+          waitingKey={C.waitingKeyConfigLoginAsOther}
+          disabled={props.waiting}
+        />
+      </Kb.Box2>
+    </>
+  )
+}
+
+type AccountRowProps = {
+  entry: AccountRowItem
+  onSelectAccount: (user: string) => void
+  waiting: boolean
+}
+const AccountRow = (props: AccountRowProps) => {
+  const styles = useStyles()
+  const {waiting, entry, onSelectAccount} = props
+  const [{clicked, wasWaiting}, setClickedState] = React.useState(() => ({
+    clicked: false,
+    wasWaiting: waiting,
+  }))
+  if (wasWaiting !== waiting) {
+    setClickedState({clicked: waiting ? clicked : false, wasWaiting: waiting})
+  }
+
+  const onClick = waiting
+    ? undefined
+    : () => {
+        setClickedState({clicked: true, wasWaiting: waiting})
+        onSelectAccount(entry.account.username)
+      }
+  return (
+    <Kb.ListItem
+      type={isMobile ? 'Large' : 'Small'}
+      icon={<Kb.Avatar size={isMobile ? 48 : 32} username={entry.account.username} />}
+      firstItem={true}
+      testID={TestIDs.ACCOUNT_SWITCHER_ROW_PREFIX + entry.account.username}
+      action={clicked ? <Kb.ProgressIndicator type="Large" /> : undefined}
+      body={
+        <Kb.Box2 direction="vertical" fullWidth={true} style={waiting ? styles.waiting : undefined}>
+          <Kb.Text type="BodySemibold">{entry.account.username}</Kb.Text>
+          {(entry.fullName || !entry.account.hasStoredSecret) && (
+            <Kb.Box2 direction="horizontal" alignItems="center" fullWidth={true}>
+              <Kb.Text type="BodySmall" lineClamp={1} style={styles.nameText}>
+                {entry.fullName}
+              </Kb.Text>
+              {!entry.account.hasStoredSecret && (
+                <Kb.Text type="BodySmall" style={styles.text2}>
+                  {entry.fullName && ' · '}Signed out
+                </Kb.Text>
+              )}
+            </Kb.Box2>
+          )}
+        </Kb.Box2>
+      }
+      onClick={onClick}
+    />
+  )
+}
+
+const AccountsRows = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} style={styles.accountRows}>
+      {props.accountRows.map(entry => (
+        <AccountRow
+          entry={entry}
+          onSelectAccount={props.onSelectAccount}
+          waiting={props.waiting}
+          key={entry.account.username}
+        />
+      ))}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  accountRows: Kb.Styles.platformStyles({
+    isTablet: {maxWidth: Kb.Styles.globalStyles.mediumWidth},
+  }),
+  buttonBox: Kb.Styles.padding(0, Kb.Styles.globalMargins.small, Kb.Styles.globalMargins.tiny),
+  desktopScrollview: {width: '100%'},
+  divider: {width: '100%'},
+  nameText: Kb.Styles.platformStyles({
+    common: {flexShrink: 1},
+    isElectron: {wordBreak: 'break-all'},
+  }),
+  text2: {flexShrink: 0},
+  userBox: {
+    ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+  },
+  waiting: {opacity: 0.5},
+}))
+
+export default AccountSwitcher

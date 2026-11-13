@@ -6,17 +6,42 @@ of relying on 3rd party binaries shipped from other developers.
 
 ### Pre-requisites
 
-#### Build from Xcode 7
+#### Xcode
 
-- Move any existing /Applications/Xcode.app somewhere else (out of /Applications), otherwise the build scripts will use it instead
-- Download Xcode 7 from the private Keybase group folder on KBFS (macos/Xcode7.app.zip)
-- Place in /Applications and rename to Xcode.app
+First of all, we can't have a kernel extension built for a newer kernel and
+run in on older kernels, but we can generally have a kernel extension built for
+an older kernel and run it on newer kernels. So we'll try to build for the
+oldest possible (compatible) kernel, to have a fewer kernel extensions built as
+possible.
 
-You'll also need the Keybase signing certificate from someone at Keybase.
+It's possible to build for many macOS versions but it requrues a patched Xcode.
+So are targeting 11+ now. We'll build for macOS 11, and make a symlink of
+macOS 12 All these are handled by the build script, but we'll need the
+appropriate SDKs to build against.
+
+Xcode 13 (13.0) is the latest version that includes the macOS 11 SDK, so we'll
+need it installed on the macOS where you build the KBFuse bundle. I have Xcode
+13.2.1 installed as well but not sure it's needed
+
+Older versions of Xcode can be downloaded from the [Apple official developer
+site](https://developer.apple.com/download/more/). It has to live under
+`/Applications`, but under a different name, e.g. `/Applications/Xcode-10.3`.
+Don't worry about making the naming scheme exact, as the OSXFuse builder is
+able to spotlight different versions automatically.
+[Here](https://medium.com/@hacknicity/working-with-multiple-versions-of-xcode-e331c01aa6bc)'s
+a blog post that explains the process of having multiple Xcode installed on the
+same machine.
+
+#### Signing certificate
+
+You'll also need the Keybase signing certificate. Ask around if you don't have
+access to it. Also see
+[this](https://github.com/keybase/client/tree/master/osx/Scripts#build-the-installer)
+for some pointers.
 
 ### Building KBFuse
 
-    VERSION=3.5.5 ./build.sh
+    VERSION=4.2.4 ./build.sh
 
 This should generate a kbfuse.bundle (and fsbundle.tgz, that includes debug symbols)
 which you can submit for PR.
@@ -24,7 +49,15 @@ which you can submit for PR.
 This bundle is included in the KeybaseInstaller.app, so you'll need to build a new
 installer, see [Building the Installer](/osx/Scripts/README.md).
 
-Be sure to switch back to latest Xcode after you build.
+**Versioning can be tricky here, here are some tips from last time**
+
+- Build against the newest macOS SDK
+- Specify an old build target (like 12.3)
+- Manually fixup Info.plist for the extension, since the Fuse build script puts the wrong values in for the minimum version and kext dependencies.
+  The key here is just to look at the commit from last time, and try to mimic the amount of changes to the Info.plist.
+- Make sure the name in the Info.plist doesn't have a version number after it. The Fuse stuff looks up the name without
+  a version number.
+- `sudo kmutil log show` is a great way to see what is happening.
 
 ### Manual Install
 
@@ -48,7 +81,7 @@ Don't try to kextunload unless you have everything unmounted.
 
 After install if you are having problems loading the kext:
 
-    sudo kextutil -l /Library/Filesystems/kbfuse.fs/Contents/Extensions/10.10/kbfuse.kext
+    sudo kextutil -l /Library/Filesystems/kbfuse.fs/Contents/Extensions/11/kbfuse.kext
 
 View kext status:
 

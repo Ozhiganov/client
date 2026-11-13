@@ -1,0 +1,112 @@
+import * as C from '@/constants'
+import * as TB from '@/stores/team-building'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+import {validateEmailAddress} from '@/util/email-address'
+import {UserMatchMention} from './phone-search'
+import {SearchEmptyState} from './common'
+import ContinueButton from './continue-button'
+import {searchWaitingKey} from '@/constants/strings'
+
+type EmailSearchProps = {
+  continueLabel: string
+  namespace: T.TB.AllowedNamespace
+  search: (query: string, service: 'email') => void
+}
+
+const EmailSearch = ({continueLabel, namespace, search}: EmailSearchProps) => {
+  const styles = useStyles()
+  const teamBuildingSearchResults = TB.useTBContext(s => s.searchResults)
+  const [isEmailValid, setEmailValidity] = React.useState(false)
+  const [emailString, setEmailString] = React.useState('')
+  const waiting = C.Waiting.useAnyWaiting(searchWaitingKey)
+  const user: T.TB.User | undefined = teamBuildingSearchResults.get(emailString)?.get('email')?.[0]
+  const canSubmit = !!user && !waiting && isEmailValid
+
+  const onChange = (_text: string) => {
+    // Remove leading or trailing whitespace
+    const text = _text.trim()
+    setEmailString(text)
+    const valid = validateEmailAddress(text)
+    setEmailValidity(valid)
+    if (valid) {
+      search(text, 'email')
+    }
+  }
+
+  const addUsersToTeamSoFar = TB.useTBContext(s => s.dispatch.addUsersToTeamSoFar)
+
+  const onSubmit = () => {
+    if (!user || !canSubmit) {
+      return
+    }
+    addUsersToTeamSoFar([user])
+    // Clear input
+    onChange('')
+  }
+
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} padding="small" style={styles.background}>
+      <Kb.Box2 direction="vertical" fullWidth={true} gap="tiny" flex={1}>
+        <Kb.Input3
+          textType="BodySemibold"
+          autoFocus={true}
+          containerStyle={styles.input}
+          keyboardType="email-address"
+          placeholder="Email address"
+          onChangeText={onChange}
+          onEnterKeyDown={onSubmit}
+          textContentType="emailAddress"
+          value={emailString}
+        />
+        {waiting && (
+          <Kb.Box2 direction="horizontal" fullWidth={true}>
+            <Kb.ProgressIndicator type="Small" />
+          </Kb.Box2>
+        )}
+        {!!user && canSubmit && !!user.serviceMap.keybase ? (
+          <UserMatchMention username={user.serviceMap.keybase} />
+        ) : (
+          <SearchEmptyState
+            icon="iconfont-mention"
+            text={
+              namespace === 'chat'
+                ? 'Start a chat with any email contact, then tell them to install Keybase. Your messages will unlock after they sign up.'
+                : 'Add any email contact, then tell them to install Keybase. They will automatically join the team after they sign up.'
+            }
+          />
+        )}
+        {/* TODO: add support for multiple emails  */}
+      </Kb.Box2>
+      <ContinueButton label={continueLabel} onClick={onSubmit} disabled={!canSubmit} />
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      background: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.blueGrey,
+          flex: 1,
+        },
+        isMobile: {
+          zIndex: -1,
+        },
+      }),
+      input: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.padding(0, Kb.Styles.globalMargins.xsmall),
+          height: 38,
+        },
+        isMobile: {
+          ...Kb.Styles.padding(0, Kb.Styles.globalMargins.small),
+          height: 48,
+        },
+      }),
+    }) as const
+)
+
+export default EmailSearch

@@ -1,0 +1,770 @@
+package unfurl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/golang/groupcache/singleflight"
+	"github.com/keybase/client/go/chat/attachments"
+	"github.com/keybase/client/go/chat/globals"
+	"github.com/keybase/client/go/chat/s3"
+	"github.com/keybase/client/go/chat/storage"
+	"github.com/keybase/client/go/chat/types"
+	"github.com/keybase/client/go/chat/unfurl/display"
+	"github.com/keybase/client/go/chat/utils"
+	"github.com/keybase/client/go/libkb"
+	"github.com/keybase/client/go/protocol/chat1"
+	"github.com/keybase/client/go/protocol/gregor1"
+	"github.com/keybase/clockwork"
+)
+
+type unfurlPermanentError struct {
+	msg string
+}
+
+func newUnfurlPermanentError(msg string) *unfurlPermanentError {
+	return &unfurlPermanentError{
+		msg: msg,
+	}
+}
+
+func (e *unfurlPermanentError) Error() string {
+	return e.msg
+}
+
+type unfurlTask struct {
+	UID    gregor1.UID
+	ConvID chat1.ConversationID
+	URL    string
+	Result *chat1.Unfurl
+}
+
+type UnfurlMessageSender interface {
+	SendUnfurlNonblock(ctx context.Context, convID chat1.ConversationID,
+		msg chat1.MessagePlaintext, clientPrev chat1.MessageID, outboxID chat1.OutboxID) (chat1.OutboxID, error)
+}
+
+const (
+	maxConcurrentPreviewScrapes = 4
+	previewFailureLifetime      = 30 * time.Second
+)
+
+type Unfurler struct {
+	sync.Mutex
+	globals.Contextified
+	utils.DebugLabeler
+
+	unfurlMap map[string]bool
+	// collapses concurrent preview scrapes of the same url. PreviewURLs is a synchronous
+	// rpc that can be called again while an earlier call is still in flight, which the
+	// composer does whenever the user edits a link before its fetch comes back
+	previewGroup singleflight.Group
+	// the composer scrapes on every debounced edit, and each edit of a url is a different
+	// key, so the singleflight above collapses nothing across them. these bound what an
+	// editing session can leave running: a slot limit on the detached scrapes, and a short
+	// memory of the urls that just failed so a dead link is not re-fetched per keystroke.
+	// short, because a url that starts working has to become a card again
+	previewSem      chan struct{}
+	previewFailures *unfurlCache
+	extractor       *Extractor
+	scraper         *Scraper
+	packager        *Packager
+	settings        *Settings
+	sender          UnfurlMessageSender
+	outbox          func(uid gregor1.UID) unfurlOutbox
+
+	// testing
+	unfurlCh chan *chat1.Unfurl
+	retryCh  chan struct{}
+}
+
+var _ types.Unfurler = (*Unfurler)(nil)
+
+func NewUnfurler(g *globals.Context, store attachments.Store, s3signer s3.Signer,
+	storage types.UserConversationBackedStorage, sender UnfurlMessageSender, ri func() chat1.RemoteInterface,
+) *Unfurler {
+	extractor := NewExtractor(g)
+	scraper := NewScraper(g)
+	packager := NewPackager(g, store, s3signer, ri)
+	settings := NewSettings(g, storage)
+	return &Unfurler{
+		previewSem:      make(chan struct{}, maxConcurrentPreviewScrapes),
+		previewFailures: newUnfurlCacheWithLifetime(previewFailureLifetime),
+		Contextified:    globals.NewContextified(g),
+		DebugLabeler:    utils.NewDebugLabeler(g.ExternalG(), "Unfurler", false),
+		unfurlMap:       make(map[string]bool),
+		extractor:       extractor,
+		scraper:         scraper,
+		packager:        packager,
+		settings:        settings,
+		sender:          sender,
+		outbox:          newUnfurlOutbox(g),
+	}
+}
+
+// unfurlOutbox is the part of the outbox a forced unfurl reads to tell an earlier attempt
+// that is still in flight from one that will never deliver
+type unfurlOutbox interface {
+	GetRecord(ctx context.Context, outboxID chat1.OutboxID) (chat1.OutboxRecord, error)
+	RemoveMessage(ctx context.Context, outboxID chat1.OutboxID) (chat1.OutboxRecord, error)
+}
+
+func newUnfurlOutbox(g *globals.Context) func(uid gregor1.UID) unfurlOutbox {
+	return func(uid gregor1.UID) unfurlOutbox { return storage.NewOutbox(g, uid) }
+}
+
+func (u *Unfurler) SetClock(clock clockwork.Clock) {
+	u.scraper.cache.setClock(clock)
+	u.packager.cache.setClock(clock)
+}
+
+func (u *Unfurler) SetTestingRetryCh(ch chan struct{}) {
+	u.retryCh = ch
+}
+
+func (u *Unfurler) SetTestingUnfurlCh(ch chan *chat1.Unfurl) {
+	u.unfurlCh = ch
+}
+
+func (u *Unfurler) Complete(ctx context.Context, outboxID chat1.OutboxID) {
+	defer u.Trace(ctx, nil, "Complete(%s)", outboxID)()
+	if err := u.G().GetKVStore().Delete(u.taskKey(outboxID)); err != nil {
+		u.Debug(ctx, "Complete: failed to delete task: %s", err)
+	}
+	if err := u.G().GetKVStore().Delete(u.statusKey(outboxID)); err != nil {
+		u.Debug(ctx, "Complete: failed to delete status: %s", err)
+	}
+	u.deleteSuppressed(ctx, outboxID)
+}
+
+func (u *Unfurler) statusKey(outboxID chat1.OutboxID) libkb.DbKey {
+	return libkb.DbKey{
+		Typ: libkb.DBUnfurler,
+		Key: fmt.Sprintf("s|%s", outboxID),
+	}
+}
+
+func (u *Unfurler) suppressedKey(outboxID chat1.OutboxID) libkb.DbKey {
+	return libkb.DbKey{
+		Typ: libkb.DBUnfurler,
+		// not "s|", which is statusKey
+		Key: fmt.Sprintf("sup|%s", outboxID),
+	}
+}
+
+func (u *Unfurler) taskKey(outboxID chat1.OutboxID) libkb.DbKey {
+	return libkb.DbKey{
+		Typ: libkb.DBUnfurler,
+		Key: fmt.Sprintf("t|%s", outboxID),
+	}
+}
+
+func (u *Unfurler) Status(ctx context.Context, outboxID chat1.OutboxID) (status types.UnfurlerTaskStatus, res *chat1.UnfurlResult, err error) {
+	defer u.Trace(ctx, nil, "Status(%s)", outboxID)()
+	task, err := u.getTask(ctx, outboxID)
+	if err != nil {
+		u.Debug(ctx, "Status: error finding task: outboxID: %s err: %s", outboxID, err)
+		return types.UnfurlerTaskStatusFailed, nil, err
+	}
+	found, err := u.G().GetKVStore().GetInto(&status, u.statusKey(outboxID))
+	if err != nil {
+		return types.UnfurlerTaskStatusFailed, nil, err
+	}
+	if !found {
+		u.Debug(ctx, "Status: failed to find status, using unfurling: outboxID: %s", outboxID)
+		status = types.UnfurlerTaskStatusUnfurling
+	}
+	if task.Result != nil {
+		return status, &chat1.UnfurlResult{
+			Unfurl: *task.Result,
+			Url:    task.URL,
+		}, nil
+	}
+	return status, nil, nil
+}
+
+func (u *Unfurler) Retry(ctx context.Context, outboxID chat1.OutboxID) {
+	defer u.Trace(ctx, nil, "Retry(%s)", outboxID)()
+	u.unfurl(ctx, outboxID)
+	if u.retryCh != nil {
+		u.retryCh <- struct{}{}
+	}
+}
+
+func (u *Unfurler) extractURLs(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	msg chat1.MessageUnboxed, force bool,
+) (res []ExtractorHit) {
+	if !msg.IsValid() {
+		return nil
+	}
+	body := msg.Valid().MessageBody
+	typ, err := body.MessageType()
+	if err != nil {
+		return nil
+	}
+	switch typ {
+	case chat1.MessageType_TEXT:
+		if force {
+			return u.extractor.ExtractAll(body.Text().Body)
+		}
+		hits, err := u.extractor.Extract(ctx, uid, convID, msg.GetMessageID(), body.Text().Body, u.settings)
+		if err != nil {
+			u.Debug(ctx, "extractURLs: failed to extract: %s", err)
+			return nil
+		}
+		return hits
+	default:
+		// Nothing to do for other message types.
+	}
+	return nil
+}
+
+func (u *Unfurler) getTask(ctx context.Context, outboxID chat1.OutboxID) (res unfurlTask, err error) {
+	found, err := u.G().GetKVStore().GetInto(&res, u.taskKey(outboxID))
+	if err != nil {
+		return res, err
+	}
+	if !found {
+		return res, libkb.NotFoundError{}
+	}
+	return res, nil
+}
+
+func (u *Unfurler) saveTask(ctx context.Context, outboxID chat1.OutboxID, uid gregor1.UID,
+	convID chat1.ConversationID, url string,
+) error {
+	return u.G().GetKVStore().PutObj(u.taskKey(outboxID), nil, unfurlTask{
+		UID:    uid,
+		ConvID: convID,
+		URL:    url,
+	})
+}
+
+func (u *Unfurler) setTaskResult(ctx context.Context, outboxID chat1.OutboxID, unfurl chat1.Unfurl) error {
+	task, err := u.getTask(ctx, outboxID)
+	if err != nil {
+		return err
+	}
+	task.Result = &unfurl
+	return u.G().GetKVStore().PutObj(u.taskKey(outboxID), nil, task)
+}
+
+func (u *Unfurler) setStatus(ctx context.Context, outboxID chat1.OutboxID, status types.UnfurlerTaskStatus) error {
+	return u.G().GetKVStore().PutObj(u.statusKey(outboxID), nil, status)
+}
+
+func (u *Unfurler) makeBaseUnfurlMessage(ctx context.Context, fromMsg chat1.MessageUnboxed, outboxID chat1.OutboxID) (msg chat1.MessagePlaintext, err error) {
+	if !fromMsg.IsValid() {
+		return msg, errors.New("invalid message")
+	}
+	tlfName := fromMsg.Valid().ClientHeader.TlfName
+	public := fromMsg.Valid().ClientHeader.TlfPublic
+	msg = chat1.MessagePlaintext{
+		ClientHeader: chat1.MessageClientHeader{
+			MessageType: chat1.MessageType_UNFURL,
+			TlfName:     tlfName,
+			TlfPublic:   public,
+			OutboxID:    &outboxID,
+			Supersedes:  fromMsg.GetMessageID(),
+		},
+		MessageBody: chat1.NewMessageBodyWithUnfurl(chat1.MessageUnfurl{
+			MessageID: fromMsg.GetMessageID(),
+		}),
+	}
+	return msg, nil
+}
+
+// markSuppressed records that this URL was dismissed for this message, keyed by the same
+// deterministic per-URL outbox ID the unfurl task would use. UnfurlAndSend runs again
+// whenever the user resolves an unfurl prompt for another URL in the same message, and that
+// pass carries no suppress list, so the marker is what keeps the dismissal honoured, on a
+// clock or not. Complete() deletes the marker for a URL that actually unfurled. A pass that
+// issues no prompt will not run again, so it deletes every marker for this message.
+func (u *Unfurler) markSuppressed(ctx context.Context, outboxID chat1.OutboxID) error {
+	return u.G().GetKVStore().PutObj(u.suppressedKey(outboxID), nil, true)
+}
+
+func (u *Unfurler) deleteSuppressed(ctx context.Context, outboxID chat1.OutboxID) {
+	if err := u.G().GetKVStore().Delete(u.suppressedKey(outboxID)); err != nil {
+		u.Debug(ctx, "deleteSuppressed: failed to delete: %s", err)
+	}
+}
+
+func (u *Unfurler) isSuppressed(ctx context.Context, outboxID chat1.OutboxID) bool {
+	var found bool
+	ok, err := u.G().GetKVStore().GetInto(&found, u.suppressedKey(outboxID))
+	if err != nil {
+		u.Debug(ctx, "isSuppressed: failed to read: %s", err)
+		return false
+	}
+	return ok && found
+}
+
+// UnfurlAndSend unfurls the URLs in msg. suppress carries the URLs the sender chose not to
+// unfurl; it arrives from the message's outbox record on the send that posts the message,
+// and is empty on later passes over the same message (resolving an unfurl prompt calls this
+// again), which read the marker left behind by the first pass instead.
+func (u *Unfurler) UnfurlAndSend(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	msg chat1.MessageUnboxed, suppress []string,
+) {
+	defer u.Trace(ctx, nil, "UnfurlAndSend")()
+	u.unfurlAndSend(ctx, uid, convID, msg, suppress, false)
+}
+
+// UnfurlMessage unfurls every URL in msg that is not already unfurled, because the sender
+// asked for it. That choice overrides the mode, both lists and any dismissal for this one
+// message, and leaves the settings as they are.
+func (u *Unfurler) UnfurlMessage(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	msg chat1.MessageUnboxed,
+) {
+	defer u.Trace(ctx, nil, "UnfurlMessage")()
+	u.unfurlAndSend(ctx, uid, convID, msg, nil, true)
+}
+
+// clearFailedTask drops a task that failed and will never deliver: its outbox record errored
+// out or is gone. Anything else is in flight, including a task saved a moment ago whose outbox
+// record is not written yet, and is left alone so the url does not unfurl twice.
+func (u *Unfurler) clearFailedTask(ctx context.Context, uid gregor1.UID, outboxID chat1.OutboxID) bool {
+	var status types.UnfurlerTaskStatus
+	found, err := u.G().GetKVStore().GetInto(&status, u.statusKey(outboxID))
+	if err != nil || !found ||
+		(status != types.UnfurlerTaskStatusFailed && status != types.UnfurlerTaskStatusPermFailed) {
+		return false
+	}
+	outbox := u.outbox(uid)
+	obr, err := outbox.GetRecord(ctx, outboxID)
+	switch err.(type) {
+	case nil:
+		state, err := obr.State.State()
+		if err != nil || state != chat1.OutboxStateType_ERROR {
+			return false
+		}
+		// removing the record completes its task
+		if _, err := outbox.RemoveMessage(ctx, outboxID); err != nil {
+			u.Debug(ctx, "clearFailedTask: failed to remove outbox record: %s", err)
+			return false
+		}
+	case storage.MissError:
+		u.Complete(ctx, outboxID)
+	default:
+		u.Debug(ctx, "clearFailedTask: failed to read outbox record: %s", err)
+		return false
+	}
+	return true
+}
+
+func (u *Unfurler) unfurlAndSend(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	msg chat1.MessageUnboxed, suppress []string, force bool,
+) {
+	// early out for errors
+	if !msg.IsValid() {
+		u.Debug(ctx, "UnfurlAndSend: skipping invalid")
+		return
+	}
+	// get URL hits
+	hits := u.extractURLs(ctx, uid, convID, msg, force)
+	if len(hits) == 0 {
+		return
+	}
+	suppressed := make(map[string]bool, len(suppress))
+	for _, url := range suppress {
+		suppressed[url] = true
+	}
+	// get a map for all the URLs we have already unfurled
+	prevUnfurled := make(map[string]bool)
+	for _, u := range msg.Valid().Unfurls {
+		prevUnfurled[u.Url] = true
+	}
+	prompted := false
+	// for each hit, either prompt the user for action, or generate a new message
+	for _, hit := range hits {
+		if prevUnfurled[hit.URL] {
+			u.Debug(ctx, "UnfurlAndSend: skipping prev unfurled")
+			continue
+		}
+		prevUnfurled[hit.URL] = true // only one action per unique URL
+		// checked for every hit type, not just the unfurl one: a queued message can sit for
+		// a long time, and the whitelist it is classified against is read at send time, so a
+		// url the sender dismissed may have become a prompt hit in the meantime. prompting
+		// for a link they declined is the same broken promise as unfurling it
+		urlOutboxID := storage.GetOutboxIDFromURL(hit.URL, convID, msg)
+		marked := !force && u.isSuppressed(ctx, urlOutboxID)
+		if !force && (suppressed[hit.URL] || marked) {
+			u.Debug(ctx, "UnfurlAndSend: skipping suppressed URL: outboxID: %s", urlOutboxID)
+			if !marked {
+				// remember it: this runs again when the user resolves a prompt for another
+				// url in the same message, and that pass has no suppress list of its own
+				if err := u.markSuppressed(ctx, urlOutboxID); err != nil {
+					u.Debug(ctx, "UnfurlAndSend: failed to mark suppressed: %s", err)
+				}
+			}
+			continue
+		}
+		switch hit.Typ {
+		case ExtractorHitPrompt:
+			prompted = true
+			domain, err := GetDomain(hit.URL)
+			if err != nil {
+				u.Debug(ctx, "UnfurlAndSend: error getting domain for prompt: %s", err)
+				continue
+			}
+			u.G().ActivityNotifier.PromptUnfurl(ctx, uid, convID, msg.GetMessageID(), domain)
+		case ExtractorHitUnfurl:
+			outboxID := urlOutboxID
+			if _, err := u.getTask(ctx, outboxID); err == nil &&
+				(!force || !u.clearFailedTask(ctx, uid, outboxID)) {
+				u.Debug(ctx, "UnfurlAndSend: skipping URL hit, task exists: outboxID: %s", outboxID)
+				continue
+			}
+			unfurlMsg, err := u.makeBaseUnfurlMessage(ctx, msg, outboxID)
+			if err != nil {
+				u.Debug(ctx, "UnfurlAndSend: failed to make message: %s", err)
+				continue
+			}
+			u.Debug(ctx, "UnfurlAndSend: saving task for outboxID: %s", outboxID)
+			if err := u.saveTask(ctx, outboxID, uid, convID, hit.URL); err != nil {
+				u.Debug(ctx, "UnfurlAndSend: failed to save task: %s", err)
+				continue
+			}
+			// Unfurl in background and send the message (requires nonblocking sender)
+			u.unfurl(ctx, outboxID)
+			u.Debug(ctx, "UnfurlAndSend: sending message for outboxID: %s", outboxID)
+			if _, err := u.sender.SendUnfurlNonblock(ctx, convID, unfurlMsg, msg.GetMessageID(), outboxID); err != nil {
+				u.Debug(ctx, "UnfurlAndSend: failed to send message: %s", err)
+			}
+		default:
+			u.Debug(ctx, "UnfurlAndSend: unknown hit typ: %v", hit.Typ)
+		}
+	}
+	if !prompted {
+		for _, hit := range hits {
+			u.deleteSuppressed(ctx, storage.GetOutboxIDFromURL(hit.URL, convID, msg))
+		}
+	}
+}
+
+// Prefetch scrape/packages whitelisted URLs in msgText so the scraper and packager
+// caches are warm. live location calls this before it deletes the previous map unfurl
+// and posts the next one, so the swap is not waiting on a scrape.
+func (u *Unfurler) Prefetch(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	msgText string,
+) (numPrefetched int) {
+	defer u.Trace(ctx, nil, "Prefetch")()
+
+	hits, err := u.extractor.Extract(ctx, uid, convID, 0, msgText, u.settings)
+	if err != nil {
+		u.Debug(ctx, "Prefetch: failed to extract: %s", err)
+		return 0
+	} else if len(hits) == 0 {
+		return 0
+	}
+
+	prevUnfurled := make(map[string]bool)
+	for _, hit := range hits {
+		if prevUnfurled[hit.URL] {
+			u.Debug(ctx, "Prefetch: skipping prev unfurled")
+			continue
+		}
+		prevUnfurled[hit.URL] = true // only one action per unique URL
+		if hit.Typ == ExtractorHitUnfurl {
+			if _, err := u.scrapeAndPackage(ctx, uid, convID, hit.URL); err != nil {
+				u.Debug(ctx, "Prefetch: unable to scrapeAndPackge: %s", err)
+			} else {
+				numPrefetched++
+			}
+		}
+	}
+	return numPrefetched
+}
+
+// previewable reports whether an unfurl can be shown in the pre-send preview. only generic
+// unfurls render there, and a map unfurl is a generic unfurl with MapInfo set, which the
+// message view itself refuses to render. the frontend filters on the same rule, so keep the
+// two in step.
+func previewable(unfurl chat1.Unfurl) bool {
+	typ, err := unfurl.UnfurlType()
+	if err != nil || typ != chat1.UnfurlType_GENERIC {
+		return false
+	}
+	return unfurl.Generic().MapInfo == nil
+}
+
+// %x, not %s: uid and convID are raw bytes and can contain the separator
+func previewScrapeKey(uid gregor1.UID, convID chat1.ConversationID, url string) string {
+	return fmt.Sprintf("%x:%x:%s", uid, convID, url)
+}
+
+// groupedScrapeAndPackage runs scrapeAndPackage through the preview singleflight and
+// semaphore. the slot is taken inside Do so waiters for the same url do not occupy a slot.
+func (u *Unfurler) groupedScrapeAndPackage(ctx context.Context, uid gregor1.UID,
+	convID chat1.ConversationID, url string,
+) (chat1.Unfurl, error) {
+	key := previewScrapeKey(uid, convID, url)
+	scraped, err := u.previewGroup.Do(key, func() (any, error) {
+		u.previewSem <- struct{}{}
+		defer func() { <-u.previewSem }()
+		return u.scrapeAndPackage(ctx, uid, convID, url)
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			u.previewFailures.put(key, err.Error())
+		}
+		return chat1.Unfurl{}, err
+	}
+	u.previewFailures.remove(key)
+	unfurl, ok := scraped.(chat1.Unfurl)
+	if !ok {
+		return chat1.Unfurl{}, fmt.Errorf("unexpected scrape result type: %T", scraped)
+	}
+	return unfurl, nil
+}
+
+// previewScrape scrapes and packages one url, collapsing concurrent calls for the same
+// url into a single scrape.
+//
+// the shared scrape deliberately does not run on the calling context. the composer calls
+// PreviewURLs again on every edit and abandons the call in flight, so whichever caller
+// happens to win the singleflight is also the one most likely to go away: running the
+// scrape on its context would fail every other caller waiting on the same url. callers
+// still honour their own cancellation, they just stop waiting rather than kill the work.
+func (u *Unfurler) previewScrape(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	url string,
+) (chat1.Unfurl, error) {
+	key := previewScrapeKey(uid, convID, url)
+	if item, ok := u.previewFailures.get(key); ok {
+		if err, ok := item.data.(string); ok {
+			return chat1.Unfurl{}, errors.New(err)
+		}
+	}
+	// keeps the caller's log tags and identify behaviour and drops only the
+	// caller's cancellation. the scraper bounds the work with its own request
+	// timeout. logout still cancels it.
+	scrapeCtx := globals.WithStop(context.WithoutCancel(ctx), u.G().SessionContext())
+	type scrapeRes struct {
+		unfurl chat1.Unfurl
+		err    error
+	}
+	ch := make(chan scrapeRes, 1)
+	go func() {
+		unfurl, err := u.groupedScrapeAndPackage(scrapeCtx, uid, convID, url)
+		ch <- scrapeRes{unfurl: unfurl, err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.unfurl, res.err
+	case <-ctx.Done():
+		return chat1.Unfurl{}, ctx.Err()
+	}
+}
+
+// carded reports whether a url could get a preview card at all, from the domain alone.
+// previewable answers the same question from a scraped unfurl, but a failed scrape has no
+// unfurl to ask about, and reporting one of these as un-previewable would suppress an
+// unfurl the send's own retries would have landed. keep the two rules in step: this is the
+// part of previewable that is knowable before the scrape.
+func carded(url string) bool {
+	domain, err := GetDomain(url)
+	if err != nil {
+		return true
+	}
+	return ClassifyDomain(domain) == chat1.UnfurlType_GENERIC
+}
+
+// PreviewURLs scrapes and packages the whitelisted URLs in text and returns display-ready
+// unfurls, so a client can show a preview before sending. Only generic unfurls carry a
+// display; a url that cannot be previewed at all comes back with a nil unfurl so the client
+// can suppress it on send.
+//
+// URLs whose domain is not whitelisted are left out entirely: the send prompts for those,
+// and the prompt is itself the chance to decline, so there is nothing for the composer to
+// offer and nothing to suppress.
+func (u *Unfurler) PreviewURLs(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	text string,
+) (res []chat1.UnfurlPreviewInfo) {
+	defer u.Trace(ctx, nil, "PreviewURLs")()
+	hits, err := u.extractor.Extract(ctx, uid, convID, 0, text, u.settings)
+	if err != nil {
+		u.Debug(ctx, "PreviewURLs: failed to extract: %s", err)
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, hit := range hits {
+		if hit.Typ != ExtractorHitUnfurl || seen[hit.URL] {
+			continue
+		}
+		seen[hit.URL] = true
+		unfurl, err := u.previewScrape(ctx, uid, convID, hit.URL)
+		if err != nil {
+			u.Debug(ctx, "PreviewURLs: unable to scrapeAndPackage: %s", err)
+			if ctx.Err() != nil {
+				return res
+			}
+			if !carded(hit.URL) {
+				continue
+			}
+			// reported rather than dropped: UnfurlAndSend would still queue this url and
+			// retry it in the background for minutes after the send, so a card the user
+			// never saw could land in the sent message with no way to have declined it.
+			// telling the client makes it suppress the url instead
+			res = append(res, chat1.UnfurlPreviewInfo{Url: hit.URL})
+			continue
+		}
+		if !previewable(unfurl) {
+			// a giphy or a map: no card in the composer, but the send unfurls it the same
+			// as it always has, so this is not something the client should suppress
+			continue
+		}
+		disp, err := display.DisplayUnfurl(ctx, u.G().AttachmentURLSrv, convID, unfurl)
+		if err != nil {
+			u.Debug(ctx, "PreviewURLs: failed to display: %s", err)
+			continue
+		}
+		res = append(res, chat1.UnfurlPreviewInfo{Url: hit.URL, Unfurl: &disp})
+	}
+	return res
+}
+
+func (u *Unfurler) checkAndSetUnfurling(ctx context.Context, outboxID chat1.OutboxID) (inprogress bool) {
+	u.Lock()
+	defer u.Unlock()
+	if u.unfurlMap[outboxID.String()] {
+		return true
+	}
+	u.unfurlMap[outboxID.String()] = true
+	return false
+}
+
+func (u *Unfurler) doneUnfurling(outboxID chat1.OutboxID) {
+	u.Lock()
+	defer u.Unlock()
+	delete(u.unfurlMap, outboxID.String())
+}
+
+func (u *Unfurler) detectPermError(err error) bool {
+	switch e := err.(type) {
+	case *net.DNSError:
+		return !e.Temporary() //nolint
+	case *url.Error:
+		return !e.Temporary()
+	case *unfurlPermanentError:
+		return true
+	}
+	return err.Error() == "Not Found"
+}
+
+func (u *Unfurler) testingSendUnfurl(unfurl *chat1.Unfurl) {
+	if u.unfurlCh != nil {
+		u.unfurlCh <- unfurl
+	}
+}
+
+func (u *Unfurler) scrapeAndPackage(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+	url string,
+) (unfurl chat1.Unfurl, err error) {
+	unfurlRaw, err := u.scraper.Scrape(ctx, url, nil)
+	if err != nil {
+		u.Debug(ctx, "unfurl: failed to scrape: <error msg suppressed> (%T)", err)
+		return unfurl, err
+	}
+	packaged, err := u.packager.Package(ctx, uid, convID, unfurlRaw)
+	if err != nil {
+		u.Debug(ctx, "unfurl: failed to package: %s", err)
+		return unfurl, err
+	}
+	return packaged, err
+}
+
+func (u *Unfurler) unfurl(ctx context.Context, outboxID chat1.OutboxID) {
+	defer u.Trace(ctx, nil, "unfurl(%s)", outboxID)()
+	if u.checkAndSetUnfurling(ctx, outboxID) {
+		u.Debug(ctx, "unfurl: already unfurling outboxID: %s", outboxID)
+		return
+	}
+	// Detach from the caller so the RPC ending does not kill the scrape, and
+	// cancel it when the chat session ends.
+	ctx = globals.WithStop(libkb.CopyTagsToBackground(ctx), u.G().SessionContext())
+	f := func(ctx context.Context) (unfurl *chat1.Unfurl, err error) {
+		defer func() { u.testingSendUnfurl(unfurl) }()
+		defer u.doneUnfurling(outboxID)
+		defer func() {
+			if err != nil {
+				status := types.UnfurlerTaskStatusFailed
+				if u.detectPermError(err) {
+					status = types.UnfurlerTaskStatusPermFailed
+				}
+				if err := u.setStatus(ctx, outboxID, status); err != nil {
+					u.Debug(ctx, "unfurl: failed to set failed status: %s", err)
+				}
+			} else {
+				// if it worked, then force Deliverer to run and send our message
+				u.G().MessageDeliverer.ForceDeliverLoop(ctx)
+			}
+		}()
+		task, err := u.getTask(ctx, outboxID)
+		if err != nil {
+			u.Debug(ctx, "unfurl: failed to get task: %s", err)
+			return nil, err
+		}
+		if err := u.setStatus(ctx, outboxID, types.UnfurlerTaskStatusUnfurling); err != nil {
+			u.Debug(ctx, "unfurl: failed to set status: %s", err)
+		}
+		packaged, err := u.scrapeAndPackage(ctx, task.UID, task.ConvID, task.URL)
+		if err != nil {
+			return nil, err
+		}
+		unfurl = new(chat1.Unfurl)
+		*unfurl = packaged
+		if err := u.setTaskResult(ctx, outboxID, *unfurl); err != nil {
+			u.Debug(ctx, "unfurl: failed to set task result: %s", err)
+			return nil, err
+		}
+		if err := u.setStatus(ctx, outboxID, types.UnfurlerTaskStatusSuccess); err != nil {
+			u.Debug(ctx, "unfurl: failed to set task status: %s", err)
+			return nil, err
+		}
+		return unfurl, nil
+	}
+	go func() { _, _ = f(ctx) }()
+}
+
+func (u *Unfurler) GetSettings(ctx context.Context, uid gregor1.UID) (res chat1.UnfurlSettings, err error) {
+	defer u.Trace(ctx, nil, "GetSettings")()
+	return u.settings.Get(ctx, uid)
+}
+
+func (u *Unfurler) WhitelistAdd(ctx context.Context, uid gregor1.UID, domain string) (err error) {
+	defer u.Trace(ctx, nil, "WhitelistAdd")()
+	return u.settings.WhitelistAdd(ctx, uid, domain)
+}
+
+func (u *Unfurler) WhitelistRemove(ctx context.Context, uid gregor1.UID, domain string) (err error) {
+	defer u.Trace(ctx, nil, "WhitelistRemove")()
+	return u.settings.WhitelistRemove(ctx, uid, domain)
+}
+
+func (u *Unfurler) BlocklistAdd(ctx context.Context, uid gregor1.UID, domain string) (err error) {
+	defer u.Trace(ctx, nil, "BlocklistAdd")()
+	return u.settings.BlocklistAdd(ctx, uid, domain)
+}
+
+func (u *Unfurler) WhitelistAddExemption(ctx context.Context, uid gregor1.UID,
+	exemption types.WhitelistExemption,
+) {
+	defer u.Trace(ctx, nil, "WhitelistAddExemption")()
+	u.extractor.AddWhitelistExemption(ctx, uid, exemption)
+}
+
+func (u *Unfurler) SetMode(ctx context.Context, uid gregor1.UID, mode chat1.UnfurlMode) (err error) {
+	defer u.Trace(ctx, nil, "SetMode")()
+	return u.settings.SetMode(ctx, uid, mode)
+}
+
+func (u *Unfurler) SetSettings(ctx context.Context, uid gregor1.UID, settings chat1.UnfurlSettings) (err error) {
+	defer u.Trace(ctx, nil, "SetSettings")()
+	return u.settings.Set(ctx, uid, settings)
+}

@@ -1,0 +1,99 @@
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {useOpen} from '@/fs/common/use-open'
+import {useRowStyles, StillCommon} from './common'
+import * as Kb from '@/common-adapters'
+import {TlfInfoLine, Filename} from '@/fs/common'
+import * as FS from '@/constants/fs'
+import {useCurrentUserState} from '@/stores/current-user'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type OwnProps = {
+  destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource
+  disabled: boolean
+  mixedMode?: boolean
+  name: string
+  tlfType: T.FS.TlfType
+}
+
+const TLFContainer = (p: OwnProps) => {
+  const styles = useStyles()
+  const rowStyles = useRowStyles()
+  const {tlfType, name, mixedMode, destinationPickerSource, disabled} = p
+  const username = useCurrentUserState(s => s.username)
+  const path = FS.tlfTypeAndNameToPath(tlfType, name)
+  const _usernames = FS.getUsernamesFromTlfName(name).filter(u => u !== username)
+  const onOpen = useOpen({destinationPickerSource, path})
+  // Only include the user if they're the only one
+  const usernames = !_usernames.length ? [username] : _usernames
+
+  const content = (
+    <Kb.BoxGrow>
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        fullHeight={true}
+        style={Kb.Styles.collapseStyles([styles.leftBox, disabled && rowStyles.opacity30])}
+      >
+        <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.minWidth}>
+          <Filename
+            type={FS.pathTypeToTextType(T.FS.PathType.Folder)}
+            style={Kb.Styles.collapseStyles([rowStyles.rowText, styles.kerning])}
+            path={path}
+          />
+        </Kb.Box2>
+        <TlfInfoLine path={path} mode="row" mixedMode={mixedMode} />
+      </Kb.Box2>
+    </Kb.BoxGrow>
+  )
+
+  const avatar = (
+    <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.avatarBox}>
+      {FS.isTeamPath(path) ? (
+        <Kb.Avatar size={32} isTeam={true} teamname={usernames[0]} />
+      ) : (
+        <Kb.AvatarLine maxShown={4} size={32} layout="horizontal" usernames={usernames} />
+      )}
+    </Kb.Box2>
+  )
+
+  return (
+    <StillCommon
+      path={path}
+      inDestinationPicker={!!destinationPickerSource}
+      onOpen={disabled ? undefined : onOpen}
+      testID={TestIDs.FILES_ROW}
+      mixedMode={mixedMode}
+      writingToJournal={false}
+      body={
+        isMobile ? (
+          <Kb.Box2 direction="vertical" fullWidth={true} flex={1} justifyContent="center" style={rowStyles.itemBox}>
+            {content}
+          </Kb.Box2>
+        ) : undefined
+      }
+      content={
+        !isMobile ? (
+          <>
+            {content}
+            {avatar}
+          </>
+        ) : undefined
+      }
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      avatarBox: {marginRight: Kb.Styles.globalMargins.xsmall},
+      kerning: {letterSpacing: 0.2},
+      leftBox: {flex: 1, justifyContent: 'center', minWidth: 0},
+      minWidth: {minWidth: 0},
+    }) as const
+)
+
+// memo: fs root rebuilds section data on every FsDataContext write; props are
+// primitives so rows bail
+export default React.memo(TLFContainer)

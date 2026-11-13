@@ -1,0 +1,70 @@
+import * as fs from 'fs'
+import * as path from 'path'
+import {computeDiff} from './generate-report-shared.mts'
+import {MANUAL_ONLY} from './electron/manual-only.ts'
+import {KNOWN_FAILURES, KNOWN_FAILURES_FILE} from './electron/known-failures.ts'
+import {darkVariantOf, runFlowReport} from './shared/gate/flow-report.mts'
+import {flowResultsDir} from './electron/results-dirs.ts'
+import type {CardData} from './generate-report-shared.mts'
+
+const storybookDir = 'tests/results/storybook-desktop'
+const storybookPrevDir = 'tests/results/storybook-prev'
+
+const parseStorybookScreenshots = (): Array<CardData> => {
+  if (!fs.existsSync(storybookDir)) return []
+  const cases: CardData[] = []
+  function walk(dir: string, rel: string) {
+    for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
+      const fullPath = path.join(dir, entry.name)
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name
+      if (entry.isDirectory()) {
+        walk(fullPath, relPath)
+      } else if (entry.name.endsWith('.png')) {
+        const label = relPath.replace(/\.png$/, '').replaceAll('/', ' / ').replace(/-/g, ' ')
+        const prevPath = path.join(storybookPrevDir, relPath)
+        const prevScreenshotPath = fs.existsSync(prevPath) ? prevPath : null
+        const diff = prevScreenshotPath ? computeDiff(fullPath, prevScreenshotPath) : null
+        cases.push({label, passed: true, durationMs: 0, screenshotPath: fullPath, prevScreenshotPath, diff, errorMessage: null})
+      }
+    }
+  }
+  walk(storybookDir, '')
+  return cases.sort((a, b) => a.label.localeCompare(b.label))
+}
+
+function saveStorybookBaseline(cards: CardData[]) {
+  fs.mkdirSync(storybookPrevDir, {recursive: true})
+  let saved = 0
+  for (const card of cards) {
+    if (!card.screenshotPath || !fs.existsSync(card.screenshotPath)) continue
+    const relPath = path.relative(storybookDir, card.screenshotPath)
+    const destDir = path.dirname(path.join(storybookPrevDir, relPath))
+    fs.mkdirSync(destDir, {recursive: true})
+    fs.copyFileSync(card.screenshotPath, path.join(storybookPrevDir, relPath))
+    saved++
+  }
+  console.log(`Storybook baseline saved: ${saved} screenshots to ${storybookPrevDir}/`)
+}
+
+// The last release gate's results by default; --targeted for a flows run outside the gate
+// (results-dirs.ts). Either way they go into the one report, which keeps the cards a run lacks.
+const targeted = process.argv.includes('--targeted')
+
+process.exitCode = runFlowReport({
+  checklistPath: 'tests/results/manual-checklist.md',
+  debugDir: 'tests/results/electron-debug',
+  extraSections: () => {
+    const cards = parseStorybookScreenshots()
+    return cards.length > 0 ? [{header: `Storybook · ${cards.length} stories`, cards, excludeFromStats: true}] : []
+  },
+  known: KNOWN_FAILURES,
+  knownListFile: KNOWN_FAILURES_FILE,
+  manualOnly: MANUAL_ONLY,
+  outputPath: 'tests/results/electron-report.html',
+  prevDir: 'tests/results/electron-prev',
+  resultsPath: `${flowResultsDir('tests/results', !targeted)}/report/results.json`,
+  runHint: targeted ? 'yarn test:e2e:desktop' : 'yarn test:e2e:desktop:release',
+  saveExtraBaseline: saveStorybookBaseline,
+  title: 'Keybase Electron E2E Tests',
+  variantOf: darkVariantOf,
+})

@@ -1,0 +1,45 @@
+/* global module */
+
+// Native-only React Native packages with no desktop equivalent.
+// Used in two places:
+//   1. ignored-modules.js → webpack aliases them to null-module.js
+//   2. jest.config.js → Jest stubs each with its own empty module
+//
+// When a merged .tsx file adds a new native-only package in an isMobile branch, add it here.
+module.exports = [
+  '@legendapp/list/keyboard',
+  'lottie-react-native',
+  'expo-audio',
+  'expo-location',
+  'expo-video',
+  '@gorhom/bottom-sheet',
+  'react-native-keyboard-controller',
+  'react-native-screens',
+  'react-native-safe-area-context',
+  'expo-modules-core',
+  'react-native-kb',
+  'react-native-reanimated',
+  'react-native-worklets',
+  'expo',
+  'expo-image-picker',
+  '@react-native-picker/picker',
+  'expo-clipboard',
+  'expo-image',
+  'expo-contacts',
+  'expo-localization',
+  'expo-media-library',
+  'expo-file-system',
+  'expo-glass-effect',
+  'expo-status-bar',
+  'react-native-screens/experimental',
+  '@react-navigation/bottom-tabs',
+  'react-native-gesture-handler',
+  'expo-constants',
+  'expo-screen-capture',
+  'expo-task-manager',
+  'expo-network',
+  '@gorhom/portal',
+  'expo-document-picker',
+  'expo-haptics',
+  'expo-camera',
+]

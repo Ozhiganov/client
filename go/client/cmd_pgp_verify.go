@@ -4,9 +4,8 @@
 package client
 
 import (
-	"io/ioutil"
-
-	"golang.org/x/net/context"
+	"context"
+	"os"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -59,7 +58,7 @@ func (c *CmdPGPVerify) Run() error {
 	protocols := []rpc.Protocol{
 		NewStreamUIProtocol(c.G()),
 		NewSecretUIProtocol(c.G()),
-		NewIdentifyTrackUIProtocol(c.G()),
+		NewIdentifyUIProtocol(c.G()),
 		NewPgpUIProtocol(c.G()),
 	}
 	if err := RegisterProtocolsWithContext(protocols, c.G()); err != nil {
@@ -89,14 +88,14 @@ func (c *CmdPGPVerify) ParseArgv(ctx *cli.Context) error {
 
 	msg := ctx.String("message")
 	infile := ctx.String("infile")
-	if err := c.FilterInit(msg, infile, "/dev/null"); err != nil {
+	if err := c.FilterInit(c.G(), msg, infile, "/dev/null"); err != nil {
 		return err
 	}
 	c.signedBy = ctx.String("signed-by")
 	c.detachedFilename = ctx.String("detached")
 
 	if len(c.detachedFilename) > 0 {
-		data, err := ioutil.ReadFile(c.detachedFilename)
+		data, err := os.ReadFile(c.detachedFilename)
 		if err != nil {
 			return err
 		}

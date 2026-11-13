@@ -1,0 +1,113 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import type * as React from 'react'
+import UnconnectedFollowButton from '@/profile/user/actions/follow-button'
+import {useFollowerState} from '@/stores/followers'
+import {useTrackerProfile} from '@/tracker/use-profile'
+
+const renderItem = (_: number, item: T.RPCGen.ProcessedContact) => <Item item={item} />
+type ItemHeight = React.ComponentProps<typeof Kb.List<T.RPCGen.ProcessedContact>>['itemHeight']
+const itemHeight = {height: 96, type: 'fixed' as const} satisfies ItemHeight
+
+type FollowProps = {
+  username: string
+  small?: boolean
+}
+
+// used by people/follow-notification
+export const FollowButton = (props: FollowProps) => {
+  const {username} = props
+  const {details: userDetails, loadProfile} = useTrackerProfile(username)
+  const followThem = useFollowerState(s => s.following.has(username))
+  const followsYou = useFollowerState(s => s.followers.has(username))
+  const {guiID} = userDetails
+
+  const followUser = C.useRPC(T.RPCGen.identify3Identify3FollowUserRpcPromise)
+  const followWaitingKey = C.waitingKeySettingsFollowButton(username)
+
+  const onFollow = () =>
+    followUser(
+      [{follow: true, guiID}, followWaitingKey],
+      () => loadProfile(false),
+      () => {}
+    )
+  const onUnfollow = () =>
+    followUser(
+      [{follow: false, guiID}, followWaitingKey],
+      () => loadProfile(false),
+      () => {}
+    )
+
+  const waitingKey: T.Waiting.WaitingKeys = [followWaitingKey, C.waitingKeyTrackerProfileLoad]
+
+  return (
+    <UnconnectedFollowButton
+      disabled={!guiID}
+      following={followThem}
+      followsYou={followsYou}
+      waitingKey={waitingKey}
+      small={props.small}
+      onFollow={onFollow}
+      onUnfollow={onUnfollow}
+    />
+  )
+}
+
+const Item = ({item}: {item: T.RPCGen.ProcessedContact}) => {
+  const styles = useStyles()
+  const username = item.username
+  const label = item.contactName || item.component.phoneNumber || item.component.email || ''
+
+  return (
+    <Kb.Box2 direction="horizontal" key={username} fullWidth={true}>
+      <Kb.Box2 alignSelf="center" direction="vertical" style={styles.avatar}>
+        <Kb.Avatar username={username} size={48} />
+      </Kb.Box2>
+      <Kb.Box2 direction="vertical" flex={1}>
+        <Kb.ConnectedUsernames colorFollowing={true} type="BodyBold" usernames={username} />
+        <Kb.Text type="BodySmall">{label}</Kb.Text>
+        <Kb.Box2 direction="horizontal" gap="tiny" fullWidth={true} style={styles.buttons}>
+          <FollowButton username={username} small={true} />
+          <Kb.WaveButton username={username} small={true} />
+        </Kb.Box2>
+        <Kb.Divider style={styles.divider} />
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const ContactsJoinedModal = (props: {contacts: ReadonlyArray<T.RPCGen.ProcessedContact>}) => {
+  const styles = useStyles()
+  const following = useFollowerState(s => s.following)
+  const filteredPeople = props.contacts.filter(p => !following.has(p.username))
+  return (
+    <Kb.ModalScreen scroll={false} padding="none">
+      <Kb.Text type="Body" style={styles.woot} center={true}>
+        Woot! Some of your contacts are already on Keybase.
+      </Kb.Text>
+      <Kb.List items={filteredPeople} renderItem={renderItem} indexAsKey={true} itemHeight={itemHeight} />
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      avatar: {
+        marginLeft: Kb.Styles.globalMargins.tiny,
+        marginRight: Kb.Styles.globalMargins.small,
+      },
+      buttons: {
+        marginBottom: Kb.Styles.globalMargins.tiny,
+        marginTop: Kb.Styles.globalMargins.xtiny,
+      },
+      divider: {...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny)},
+      woot: {
+        ...Kb.Styles.marginV(Kb.Styles.globalMargins.small),
+        ...Kb.Styles.marginH(Kb.Styles.globalMargins.medium),
+      },
+    }) as const
+)
+
+export default ContactsJoinedModal

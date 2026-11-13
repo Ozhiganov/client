@@ -6,6 +6,7 @@ package systests
 // Test various RPCs that are used mainly in other clients but not by the CLI.
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -13,16 +14,15 @@ import (
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/client/go/service"
-	context "golang.org/x/net/context"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAccountDeadlock(t *testing.T) {
-	tc := setupTest(t, "resolve2")
-	tc2 := cloneContext(tc)
-
-	libkb.G.LocalDb = nil
-
+	tc := setupTest(t, "deadlock")
 	defer tc.Cleanup()
+	tc2 := cloneContext(tc)
+	defer tc2.Cleanup()
 
 	stopCh := make(chan error)
 	svc := service.NewService(tc.G, false)
@@ -46,25 +46,27 @@ func TestAccountDeadlock(t *testing.T) {
 
 	currentStatusLoop(t, tc2.G, signupDoneCh)
 
-	if err := client.CtlServiceStop(tc2.G); err != nil {
-		t.Fatal(err)
+	if err := CtlStop(tc2.G); err != nil {
+		require.NoError(t, err)
 	}
 
 	// If the server failed, it's also an error
 	if err := <-stopCh; err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 }
 
 func issueSignup(t *testing.T, g *libkb.GlobalContext) {
 	cli, err := client.GetSignupClient(g)
 	if err != nil {
-		t.Fatalf("failed to get new identifyclient: %v", err)
+		t.Errorf("failed to get new identifyclient: %v", err)
+		return
 	}
 
 	id, err := libkb.RandString("", 5)
 	if err != nil {
-		t.Fatalf("Failed to get a random string: %s", err)
+		t.Errorf("Failed to get a random string: %s", err)
+		return
 	}
 
 	arg := keybase1.SignupArg{
@@ -77,15 +79,14 @@ func issueSignup(t *testing.T, g *libkb.GlobalContext) {
 	}
 
 	if _, err := cli.Signup(context.TODO(), arg); err != nil {
-		t.Fatalf("signup failed: %s", err)
+		assert.NoError(t, err,
+			"signup failed: %s", err)
 	}
 }
 
 func currentStatusLoop(t *testing.T, g *libkb.GlobalContext, stopCh chan struct{}) {
 	cli, err := client.GetSessionClient(g)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	for {
 		select {
 		case <-stopCh:
@@ -93,7 +94,10 @@ func currentStatusLoop(t *testing.T, g *libkb.GlobalContext, stopCh chan struct{
 		case <-time.After(50 * time.Millisecond):
 			_, err := cli.CurrentSession(context.TODO(), 0)
 			if err != nil {
-				t.Fatal(err)
+				if _, ok := err.(libkb.NoSessionError); !ok {
+					require.True(t, ok,
+						err)
+				}
 			}
 		}
 	}

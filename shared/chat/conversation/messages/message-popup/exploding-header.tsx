@@ -1,0 +1,188 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {formatTimeForPopup, formatTimeForRevoked, msToDHMS} from '@/util/timestamp'
+import {addTicker, removeTicker} from '@/util/second-timer'
+import {navToProfile} from '@/constants/router'
+import {humanReadableFileSize} from '@/constants/fs'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {
+  explodesAt: number
+  author: string
+  botUsername?: string
+  deviceName: string
+  deviceRevokedAt?: number
+  fileSize?: number
+  hideTimer: boolean
+  timestamp: number
+  yourMessage: boolean
+  onHidden: () => void
+}
+
+const _secondsLeft = (explodesAt: number) => {
+  const now = Date.now()
+  let secondsLeft = Math.floor((explodesAt - now) / 1000)
+  if (secondsLeft < 0) {
+    secondsLeft = 0
+  }
+  return secondsLeft
+}
+
+const ExplodingPopupHeader = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {explodesAt, onHidden} = props
+  const [secondsLeft, setSecondsLeft] = React.useState(_secondsLeft(explodesAt))
+
+  React.useEffect(() => {
+    const id = addTicker(() => setSecondsLeft(_secondsLeft(explodesAt)))
+    return () => {
+      removeTicker(id)
+    }
+  }, [explodesAt])
+
+  const onUsernameClicked = (user: string) => {
+    navToProfile(user)
+    onHidden()
+  }
+
+  const [now] = React.useState(() => Date.now())
+
+  const {author, botUsername, deviceName, deviceRevokedAt, fileSize, hideTimer, timestamp} = props
+  const prettySize = fileSize ? humanReadableFileSize(fileSize) : ''
+  const icon = <Kb.ImageIcon style={styles.headerIcon} type={headerIconType} />
+  const info = (
+    <Kb.Box2 direction="vertical" fullWidth={true} padding="xsmall" testID={TestIDs.CHAT_EXPLODING_HEADER}>
+      <Kb.Box2 alignSelf="center" direction="horizontal">
+        <Kb.Box2 alignSelf="center" direction="horizontal" gap="xtiny" gapStart={true} alignItems="center">
+          <Kb.Avatar username={author} size={16} onClick="profile" />
+          <Kb.ConnectedUsernames
+            onUsernameClicked={onUsernameClicked}
+            colorFollowing={true}
+            colorYou={true}
+            usernames={author}
+            underline={true}
+            type="BodySmallBold"
+          />
+          <Kb.Text center={true} type="BodySmall">
+            {deviceName}
+          </Kb.Text>
+        </Kb.Box2>
+      </Kb.Box2>
+      {botUsername ? (
+        <Kb.Box2 alignSelf="center" direction="horizontal">
+          <Kb.Text type="BodySmall">also encrypted for</Kb.Text>
+          <Kb.Box2 direction="horizontal" gap="xtiny" gapStart={true} alignItems="center">
+            <Kb.Avatar username={botUsername} size={16} onClick="profile" />
+            <Kb.ConnectedUsernames
+              onUsernameClicked="profile"
+              colorFollowing={true}
+              colorYou={true}
+              usernames={botUsername}
+              underline={true}
+              type="BodySmallBold"
+            />
+          </Kb.Box2>
+        </Kb.Box2>
+      ) : null}
+      <Kb.Box2 direction="vertical">
+        <Kb.Text center={true} type="BodySmall">
+          {formatTimeForPopup(timestamp)}
+        </Kb.Text>
+        {prettySize ? (
+          <Kb.Text center={true} type="BodySmall">
+            {prettySize}
+          </Kb.Text>
+        ) : null}
+        {deviceRevokedAt ? (
+          <Kb.Text center={true} type="BodySmallSemibold" style={Kb.Styles.collapseStyles([styles.popupHeaderText, styles.revokedAt])}>
+            Device revoked on {formatTimeForRevoked(deviceRevokedAt)}
+          </Kb.Text>
+        ) : null}
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+
+  const banner = (
+    <Kb.Box2
+      direction="vertical"
+      fullWidth={true}
+      style={Kb.Styles.collapseStyles([
+        styles.timerBox,
+        {
+          backgroundColor:
+            secondsLeft < oneMinuteInS ? theme.red : theme.black,
+        },
+      ])}
+    >
+      <Kb.Box2 direction="vertical">
+        <Kb.Text type="BodySmall" style={styles.whiteText}>
+          {props.explodesAt === 0 ? 'EXPLODED MESSAGE' : 'EXPLODING MESSAGE'}
+        </Kb.Text>
+      </Kb.Box2>
+      {props.explodesAt === 0 ? null : hideTimer ? (
+        <Kb.ProgressIndicator white={true} style={Kb.Styles.size(17)} />
+      ) : (
+        <Kb.Box2 direction="horizontal" gap="tiny" gapStart={true} gapEnd={true}>
+          <Kb.Icon
+            type="iconfont-timer"
+            fontSize={isMobile ? 20 : 16}
+            color={theme.white}
+          />
+          <Kb.Text style={styles.timerText} type="BodySemibold">
+            {msToDHMS(props.explodesAt - now)}
+          </Kb.Text>
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.popupContainer}>
+      {isMobile ? null : icon}
+      {banner}
+      {info}
+      <Kb.Divider style={styles.fullWidth} />
+    </Kb.Box2>
+  )
+}
+
+const headerIconType = isMobile ? 'icon-fancy-bomb-mobile-226-96' : 'icon-fancy-bomb-desktop-150-72'
+const headerIconHeight = 48
+const oneMinuteInS = 60
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      headerIcon: {
+        height: headerIconHeight,
+        ...Kb.Styles.marginV(Kb.Styles.globalMargins.xtiny),
+      },
+      popupContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          maxWidth: 240,
+          minWidth: 200,
+        },
+      }),
+      popupHeaderText: {
+        backgroundColor: theme.blue,
+        color: theme.white,
+        ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.small),
+      },
+      revokedAt: {
+        borderBottomLeftRadius: 3,
+        borderBottomRightRadius: 3,
+        width: '100%',
+      },
+      timerBox: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.centered(),
+        },
+        isMobile: {height: 46},
+      }),
+      fullWidth: {width: '100%'},
+      timerText: {alignSelf: 'center', color: theme.white},
+      whiteText: {color: theme.white},
+    }) as const
+)
+
+export default ExplodingPopupHeader

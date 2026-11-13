@@ -1,15 +1,16 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build windows
+//go:build windows
 
 package minterm
 
 import (
-	"github.com/keybase/client/go/logger"
-	"golang.org/x/crypto/ssh/terminal"
 	"io"
 	"os"
+
+	"github.com/keybase/client/go/logger"
+	"github.com/keybase/go-crypto/ssh/terminal"
 )
 
 // terminal takes io.ReadWriter, so for windows we mash

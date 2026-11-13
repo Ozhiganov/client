@@ -1,0 +1,425 @@
+import * as React from 'react'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {findLast} from '@/util/arrays'
+import {useCurrentUserState} from '@/stores/current-user'
+import {metasReceived, useInboxMetadataState} from '@/chat/inbox/metadata'
+import {ignorePromise} from '@/constants/utils'
+import {whenModalsGone} from '@/constants/router'
+import {useThrottledCallback} from '@/util/use-debounce'
+import {
+  useConversationThreadActions,
+  useConversationThreadNotifications,
+  useConversationThreadStore,
+  useThreadMeta,
+} from '../thread-context'
+import {closeConversationThreadSearch} from '../thread-navigation'
+import {useConversationSendActions} from '../send-actions'
+import {
+  consumeInputIntent,
+  registerInputIntentConsumer,
+  useInputIntentState,
+  type InputIntent,
+} from '../input-intent-store'
+import {takeSuppressSnapshot, type SuppressSnapshot} from '../unfurl-preview-state'
+import {ComposerContext, makeComposer} from './composer'
+
+type ConversationInputStore = T.Immutable<{
+  commandMarkdown?: T.RPCChat.UICommandMarkdown
+  commandStatus?: T.Chat.CommandStatusInfo
+  editing: T.Chat.Ordinal
+  giphyResult?: T.RPCChat.GiphySearchResults
+  giphyWindow: boolean
+  replyTo: T.Chat.Ordinal
+}>
+
+type ConversationInputDispatch = {
+  clearReplyTo: () => void
+  injectIntoInput: (text: string, focus?: boolean) => void
+  resetState: () => void
+  sendComposerText: (text: string, unfurlSuppress?: SuppressSnapshot) => void
+  sendGiphyResult: (result: T.RPCChat.GiphySearchResult) => void
+  setCommandMarkdown: (md?: T.RPCChat.UICommandMarkdown) => void
+  setCommandStatusInfo: (info?: T.Chat.CommandStatusInfo) => void
+  setEditing: (ordinal: T.Chat.Ordinal | 'last' | 'clear') => void
+  setGiphyResult: (result?: T.RPCChat.GiphySearchResults) => void
+  setGiphyWindow: (show: boolean) => void
+  // What every Reply does: quote this message, close thread search, focus the composer.
+  reply: (ordinal: T.Chat.Ordinal) => void
+  toggleGiphyPrefill: () => void
+}
+
+export interface ConversationInputState extends ConversationInputStore {
+  dispatch: ConversationInputDispatch
+}
+
+const emptyOrdinal = T.Chat.numberToOrdinal(0)
+
+const initialConversationInputStore: ConversationInputStore = {
+  commandMarkdown: undefined,
+  commandStatus: undefined,
+  editing: emptyOrdinal,
+  giphyResult: undefined,
+  giphyWindow: false,
+  replyTo: emptyOrdinal,
+}
+
+type InputAction =
+  | {type: 'afterSend'}
+  | {type: 'resetState'}
+  | {type: 'setCommandMarkdown'; md?: T.RPCChat.UICommandMarkdown}
+  | {type: 'setCommandStatusInfo'; info?: T.Chat.CommandStatusInfo}
+  | {type: 'setEditing'; ordinal: T.Chat.Ordinal}
+  | {type: 'setGiphyResult'; result?: T.RPCChat.GiphySearchResults}
+  | {type: 'setGiphyWindow'; show: boolean}
+  | {type: 'setReplyTo'; ordinal: T.Chat.Ordinal}
+
+const inputReducer = (state: ConversationInputStore, action: InputAction): ConversationInputStore => {
+  switch (action.type) {
+    case 'afterSend':
+      return {
+        ...state,
+        commandMarkdown: undefined,
+        editing: emptyOrdinal,
+        giphyWindow: false,
+        replyTo: emptyOrdinal,
+      }
+    case 'resetState':
+      return initialConversationInputStore
+    case 'setCommandMarkdown':
+      return {...state, commandMarkdown: action.md}
+    case 'setCommandStatusInfo':
+      return {...state, commandStatus: action.info}
+    case 'setEditing':
+      return {...state, editing: action.ordinal}
+    case 'setGiphyResult':
+      return {...state, giphyResult: action.result}
+    case 'setGiphyWindow':
+      return {...state, giphyWindow: action.show}
+    case 'setReplyTo':
+      return {...state, replyTo: action.ordinal}
+  }
+}
+
+const StateContext = React.createContext<ConversationInputStore | undefined>(undefined)
+StateContext.displayName = 'ConversationInputStateContext'
+const DispatchContext = React.createContext<ConversationInputDispatch | undefined>(undefined)
+DispatchContext.displayName = 'ConversationInputDispatchContext'
+const CanReplyContext = React.createContext(false)
+CanReplyContext.displayName = 'ConversationCanReplyContext'
+
+// 'highlight' belongs to ConversationCenterProvider; claiming it here would let this provider
+// silently eat an intent meant for the other consumer.
+// `as const` (not a widened ReadonlyArray<InputIntent['type']>) so consumeInputIntent's generic
+// narrows its return to exactly these four members - no cast needed at the call site below.
+const storeInputIntentTypes = ['commandStatus', 'injectText', 'setEditing', 'setReplyTo'] as const
+
+export const ConversationInputProvider = (p: React.PropsWithChildren<{id: T.Chat.ConversationIDKey}>) => {
+  const {children, id} = p
+  const [state, dispatchState] = React.useReducer(inputReducer, initialConversationInputStore)
+  // Only setEditing reads thread state, so read it lazily instead of subscribing —
+  // a subscription here re-renders the whole input subtree on every thread change.
+  const threadStore = useConversationThreadStore()
+  const {sendGiphyResult: sendGiphyResultAction, sendMessage} = useConversationSendActions()
+  const {isRetired, rpc} = useConversationThreadActions()
+  const getMeta = () => useInboxMetadataState.getState().metas.get(id)
+  const saveDraftRaw = (text: string) => {
+    // The unmount flush runs when an account switch takes this screen down, after its thread has
+    // retired: a draft typed here is not the next account's, locally or in the service.
+    if (isRetired()) {
+      return
+    }
+    // Immediately update local meta.draft so switching back to this thread
+    // before the async unbox completes won't re-inject the old stale draft.
+    // Merges from the current meta (same inbox version), so force past gating.
+    const currentMeta = getMeta()
+    if (currentMeta) {
+      metasReceived([{...currentMeta, draft: text}], undefined, {force: true})
+    }
+    const f = async () => {
+      await rpc.saveDraft({conversationIDKey: id, text, tlfName: currentMeta?.tlfname ?? ''})
+    }
+    ignorePromise(f())
+  }
+  // flushOnUnmount: leaving the conversation must still save what was typed in the last 200ms
+  const saveDraft = useThrottledCallback(saveDraftRaw, 200, {flushOnUnmount: true, trailing: true})
+  const [composer] = React.useState(() =>
+    makeComposer({
+      flushDraft: () => {
+        saveDraft.flush()
+      },
+      // the meta useThreadMeta renders from, so this and the rendered draft differ only by render lag
+      getDraft: () => {
+        const meta = getMeta()
+        return meta?.conversationIDKey === id ? meta.draft : undefined
+      },
+      isReadOnly: () => !!getMeta()?.cannotWrite,
+      saveDraft: text => {
+        saveDraft(text)
+      },
+      takeUnfurlSnapshot: () => takeSuppressSnapshot(id),
+    })
+  )
+
+  const injectIntoInput = React.useEffectEvent((text: string, focus?: boolean) => {
+    composer.inject(text, focus)
+  })
+  const resetState = React.useEffectEvent(() => {
+    dispatchState({type: 'resetState'})
+  })
+  const setCommandMarkdown = React.useEffectEvent((md?: T.RPCChat.UICommandMarkdown) => {
+    dispatchState({md, type: 'setCommandMarkdown'})
+  })
+  const setCommandStatusInfo = React.useEffectEvent((info?: T.Chat.CommandStatusInfo) => {
+    dispatchState({info, type: 'setCommandStatusInfo'})
+  })
+  const setGiphyResult = React.useEffectEvent((result?: T.RPCChat.GiphySearchResults) => {
+    dispatchState({result, type: 'setGiphyResult'})
+  })
+  const setGiphyWindow = React.useEffectEvent((show: boolean) => {
+    dispatchState({show, type: 'setGiphyWindow'})
+  })
+  // An edit or a reply focuses the composer, on every platform and from every entry point, once
+  // any modal it came from (the phone message menu) is gone: a TextInput focused under a modal
+  // that is still presented takes first responder unreliably on iOS. Leaving the conversation
+  // drops a wait still pending.
+  const cancelFocusRef = React.useRef<() => void>(undefined)
+  const focusOnceModalsGone = () => {
+    cancelFocusRef.current = whenModalsGone(() => composer.focus())
+  }
+  React.useEffect(
+    () => () => {
+      cancelFocusRef.current?.()
+    },
+    [id]
+  )
+  const reply = React.useEffectEvent((ordinal: T.Chat.Ordinal) => {
+    // a reply could never be sent
+    if (getMeta()?.cannotWrite) {
+      logger.info('[chat] reply refused: the conversation is read-only')
+      return
+    }
+    dispatchState({ordinal, type: 'setReplyTo'})
+    closeConversationThreadSearch(id)
+    focusOnceModalsGone()
+  })
+  const clearReplyTo = React.useEffectEvent(() => {
+    dispatchState({ordinal: emptyOrdinal, type: 'setReplyTo'})
+  })
+  const setEditing = React.useEffectEvent((e: T.Chat.Ordinal | 'last' | 'clear') => {
+    if (e === 'clear') {
+      dispatchState({ordinal: emptyOrdinal, type: 'setEditing'})
+      composer.clear()
+      return
+    }
+
+    const {messageMap, messageOrdinals} = threadStore.getState()
+    let ordinal: T.Chat.Ordinal | undefined
+    if (e === 'last') {
+      const editLastUser = useCurrentUserState.getState().username
+      ordinal = messageOrdinals
+        ? findLast(messageOrdinals, o => {
+            const message = messageMap.get(o)
+            return !!(
+              (message?.type === 'text' || message?.type === 'attachment') &&
+              message.author === editLastUser &&
+              !message.exploded &&
+              message.isEditable
+            )
+          })
+        : undefined
+    } else {
+      ordinal = e
+    }
+
+    // A bail leaves the composer exactly as it was, so from the message menu it reads as "Edit
+    // did nothing" and there is no other signal that it happened - worth an error. 'last' is the
+    // desktop composer's up-arrow handler, though: pressing up in a conversation you have never
+    // posted in finds nothing to edit, which is an ordinary outcome and not a fault to report at
+    // error level, into remote logs, on every keystroke.
+    if (!ordinal) {
+      if (e === 'last') {
+        logger.info('[chat] setEditing found no editable message of yours (last)')
+      } else {
+        logger.error('[chat] setEditing found no editable message (ordinal)')
+      }
+      return
+    }
+    const message = messageMap.get(ordinal)
+    if (message?.type === 'text' || message?.type === 'attachment') {
+      if (!composer.startEdit(message.type === 'text' ? message.text.stringValue() : message.title)) {
+        logger.info('[chat] setEditing refused: the conversation is read-only')
+        return
+      }
+      dispatchState({ordinal, type: 'setEditing'})
+      focusOnceModalsGone()
+    } else {
+      logger.error(`[chat] setEditing ignored ordinal ${ordinal}: message is ${message?.type ?? 'missing'}`)
+    }
+  })
+  const restoreText = React.useEffectEvent((text: string) => {
+    composer.restore(text)
+  })
+  const sendComposerText = React.useEffectEvent((text: string, unfurlSuppress?: SuppressSnapshot) => {
+    sendMessage(text, {
+      editingOrdinal: state.editing,
+      onRestoreText: restoreText,
+      replyToOrdinal: state.replyTo,
+      unfurlSuppress,
+    })
+    dispatchState({type: 'afterSend'})
+  })
+  const sendGiphyResult = React.useEffectEvent((result: T.RPCChat.GiphySearchResult) => {
+    sendGiphyResultAction(result, state.replyTo)
+    dispatchState({type: 'afterSend'})
+    composer.clear()
+  })
+  const toggleGiphyPrefill = React.useEffectEvent(() => {
+    composer.inject(state.giphyWindow ? '' : '/giphy ')
+  })
+  const [inputDispatch] = React.useState<ConversationInputDispatch>(() => ({
+    clearReplyTo,
+    injectIntoInput,
+    reply,
+    resetState,
+    sendComposerText,
+    sendGiphyResult,
+    setCommandMarkdown,
+    setCommandStatusInfo,
+    setEditing,
+    setGiphyResult,
+    setGiphyWindow,
+    toggleGiphyPrefill,
+  }))
+
+  const applyInputAction = React.useEffectEvent(
+    (action: T.Immutable<Exclude<InputIntent, {type: 'highlight'}>>) => {
+      switch (action.type) {
+        case 'commandStatus':
+          setCommandStatusInfo(
+            action.info
+              ? {
+                  actions: T.castDraft(action.info.actions),
+                  displayText: action.info.displayText,
+                  displayType: action.info.displayType,
+                }
+              : undefined
+          )
+          break
+        case 'injectText':
+          if (action.text !== undefined) {
+            if (action.append) {
+              composer.append(action.text)
+            } else {
+              injectIntoInput(action.text)
+            }
+          }
+          if (action.notice) {
+            setCommandStatusInfo({
+              actions: [],
+              displayText: action.notice,
+              displayType: T.RPCChat.UICommandStatusDisplayTyp.warning,
+            })
+          }
+          break
+        case 'setEditing':
+          setEditing(action.ordinal)
+          break
+        case 'setReplyTo':
+          reply(action.ordinal)
+          break
+      }
+    }
+  )
+  // Registration is what makes this provider's mount a fact the store can check instead of
+  // inferring it from "somebody consumed synchronously". It rides this passive effect, so it
+  // survives a react-freeze hide (layout effects only) but not <Activity mode="hidden">, which
+  // unmounts passive effects - see the registry in input-intent-store.tsx for what that costs.
+  React.useEffect(() => {
+    const consume = () => {
+      const intent = consumeInputIntent(id, storeInputIntentTypes)
+      if (intent) {
+        applyInputAction(intent)
+      }
+    }
+    const unregister = registerInputIntentConsumer(id, storeInputIntentTypes)
+    consume()
+    const unsubscribe = useInputIntentState.subscribe(consume)
+    return () => {
+      unsubscribe()
+      unregister()
+    }
+  }, [id])
+
+  useConversationThreadNotifications(notification => {
+    switch (notification.type) {
+      case 'commandStatus':
+        setCommandStatusInfo({
+          actions: T.castDraft(notification.actions) || [],
+          displayText: notification.displayText,
+          displayType: notification.displayType,
+        })
+        return
+      case 'commandMarkdown':
+        setCommandMarkdown(notification.md || undefined)
+        return
+      case 'giphyToggleResultWindow':
+        if (notification.clearInput) {
+          injectIntoInput('')
+        }
+        setGiphyWindow(notification.show)
+        return
+      case 'giphySearchResults':
+        setGiphyResult(notification.results)
+        return
+      default:
+    }
+  })
+
+  const canReply = useThreadMeta(m => !m.cannotWrite)
+
+  return (
+    <ComposerContext value={composer}>
+      <DispatchContext value={inputDispatch}>
+        <CanReplyContext value={canReply}>
+          <StateContext value={state}>{children}</StateContext>
+        </CanReplyContext>
+      </DispatchContext>
+    </ComposerContext>
+  )
+}
+
+// For callers that may or may not sit inside the provider — the message popup is rendered inline
+// in the thread on desktop but as its own modal route on phones, and from the info panel and the
+// attachment viewer it is outside the thread entirely.
+//
+// Both paths end in the same reducer in the same tick: a mounted provider consumes an intent
+// synchronously inside the store's setState, so this is not a fast path against a slow one. What
+// the context gives you is scope - the dispatch belongs to the thread you are actually rendered
+// inside, so a popup cannot drive some other conversation's composer. Callers with no provider
+// above them name the conversation explicitly instead, through setThreadInputEditing /
+// setThreadInputReplyTo (constants/router.tsx) and the input-intent store.
+export function useConversationInputDispatchOptional(): ConversationInputDispatch | undefined {
+  return React.useContext(DispatchContext)
+}
+
+export function useConversationInput<T>(selector: (state: ConversationInputState) => T): T {
+  const state = React.useContext(StateContext)
+  const dispatch = React.useContext(DispatchContext)
+  if (!state || !dispatch) {
+    throw new Error('Missing ConversationInputProvider in the tree')
+  }
+  return selector({...state, dispatch})
+}
+
+export function useConversationInputDispatch<T>(selector: (dispatch: ConversationInputDispatch) => T): T {
+  const dispatch = React.useContext(DispatchContext)
+  if (!dispatch) {
+    throw new Error('Missing ConversationInputProvider in the tree')
+  }
+  return selector(dispatch)
+}
+
+// A Reply where the user can't post is refused by the composer, so no gesture offers one there.
+// Read once per thread by the provider, so no message row reads the inbox store for it.
+export const useCanReply = () => React.useContext(CanReplyContext)

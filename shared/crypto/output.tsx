@@ -1,0 +1,454 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as Path from '@/util/path'
+import * as React from 'react'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import type {IconType} from '@/common-adapters/icon.constants-gen'
+import type {CommonState} from './helpers'
+import {pickFiles} from '@/util/misc'
+import * as FS from '@/constants/fs'
+import {copyToClipboard} from '@/util/storeless-actions'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+
+type CryptoOutputProps = {
+  actionLabel: string
+  onChooseOutputFolder: (destinationDir: string) => void
+  outputFileIcon?: IconType
+  outputTextType: 'cipher' | 'plain'
+  state: CommonState
+}
+
+type OutputActionsBarProps = {
+  canReplyInChat: boolean
+  canSaveAsText: boolean
+  onSaveAsText?: () => void
+  sensitiveOutput?: boolean
+  state: CommonState
+}
+
+type SignedSenderProps = {
+  isSelfSigned: boolean
+  state: CommonState
+}
+
+type OutputInfoProps = {
+  children:
+    | string
+    | React.ReactElement<typeof Kb.BannerParagraph>
+    | Array<React.ReactElement<typeof Kb.BannerParagraph>>
+  outputStatus?: CommonState['outputStatus']
+}
+
+export const CryptoSignedSender = ({isSelfSigned, state}: SignedSenderProps) => {
+  const styles = useStyles()
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyCrypto)
+  const signed = state.outputSigned
+  const signedByUsername = state.outputSenderUsername
+  const signedByFullname = state.outputSenderFullname
+
+  const avatarSize = isSelfSigned ? 16 : isMobile ? 32 : 48
+  const usernameType = isSelfSigned ? 'BodySmallBold' : 'BodyBold'
+
+  const space = isMobile ? '' : ' '
+  const signedByText = `Signed by ${isSelfSigned ? `${space}you` : ''}`
+
+  if (!state.outputStatus) {
+    return null
+  }
+
+  return (
+    <>
+      <Kb.Divider />
+      <Kb.Box2
+        direction="horizontal"
+        fullWidth={true}
+        alignItems="center"
+        justifyContent="flex-start"
+        gap={signed && signedByUsername && !isSelfSigned ? 'xsmall' : 'xtiny'}
+        noShrink={true}
+        style={Kb.Styles.collapseStyles([
+          styles.signedContainer,
+          isSelfSigned ? styles.signedContainerSelf : styles.signedContainerOther,
+        ])}
+      >
+        {signed && signedByUsername ? (
+          <>
+            <Kb.Avatar size={avatarSize} username={signedByUsername} />
+            {isSelfSigned ? (
+              <Kb.Box2 direction="horizontal" gap="xtiny" style={styles.signedByText}>
+                <Kb.Text type="BodySmall">{signedByText}</Kb.Text>
+                <Kb.ConnectedUsernames
+                  type={usernameType}
+                  usernames={[signedByUsername]}
+                  colorFollowing={true}
+                  colorYou={true}
+                />
+              </Kb.Box2>
+            ) : (
+              <Kb.Box2 direction="vertical">
+                <Kb.ConnectedUsernames
+                  type={usernameType}
+                  usernames={[signedByUsername]}
+                  colorFollowing={true}
+                  colorYou={true}
+                />
+                {signedByFullname ? <Kb.Text type="BodySmall">{signedByFullname}</Kb.Text> : null}
+              </Kb.Box2>
+            )}
+          </>
+        ) : (
+          <>
+            <Kb.ImageIcon type="icon-placeholder-secret-user-16" />
+            {isSelfSigned ? null : <Kb.Text type="BodySmallSemibold">Anonymous sender</Kb.Text>}
+            <Kb.Text type="BodySmall">
+              {isSelfSigned ? 'Not signed (Sending anonymously)' : '(Not signed)'}
+            </Kb.Text>
+          </>
+        )}
+        {waiting && <Kb.ProgressIndicator type="Small" white={false} />}
+      </Kb.Box2>
+    </>
+  )
+}
+
+const OutputProgress = ({state}: {state: CommonState}) => {
+  const styles = useStyles()
+  if (!state.inProgress) {
+    return null
+  }
+  if (!state.bytesTotal) {
+    return <Kb.ProgressIndicator type="Large" white={false} />
+  }
+
+  const ratio = state.bytesComplete === 0 ? 0 : state.bytesComplete / state.bytesTotal
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center">
+      <Kb.ProgressBar ratio={ratio} style={styles.progressBar} />
+      <Kb.Text type="Body">{`${FS.humanizeBytes(state.bytesComplete, 1)} / ${FS.humanizeBytes(
+        state.bytesTotal,
+        1
+      )}`}</Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+// A text operation re-runs on every keystroke, so 'pending' alternates with 'success' as
+// fast as the user types. Keep showing the last output through a re-run instead of dropping
+// back to the placeholder, which reads as the whole pane blinking.
+const hasOutput = (state: CommonState) => state.outputStatus === 'success' || !!state.output
+
+export const OutputInfoBanner = ({outputStatus, children}: OutputInfoProps) => {
+  const styles = useStyles()
+  // 'pending' too: text input re-runs the operation on every keystroke, and dropping the
+  // banner for each run makes it blink.
+  return outputStatus ? (
+    <Kb.Banner
+      color="grey"
+      style={styles.banner}
+      textContainerStyle={styles.bannerContainer}
+      narrow={isMobile}
+    >
+      {children}
+    </Kb.Banner>
+  ) : null
+}
+
+export const CryptoOutputActionsBar = ({
+  canReplyInChat,
+  canSaveAsText,
+  onSaveAsText,
+  sensitiveOutput,
+  state,
+}: OutputActionsBarProps) => {
+  const styles = useStyles()
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyCrypto)
+  const actionsDisabled = waiting || !state.outputValid
+
+  const onShowInFinder = () => {
+    openLocalPathInSystemFileManagerDesktop(state.output)
+  }
+
+  const navigateUp = C.Router2.navigateUp
+  const previewConversation = C.Router2.previewConversation
+  const onReplyInChat = (username: string) => {
+    navigateUp()
+    previewConversation({participants: [username], reason: 'search'})
+  }
+
+  const popupAnchor = React.useRef<Kb.MeasureRef | null>(null)
+  const [showingToast, setShowingToast] = React.useState(false)
+  const setHideToastTimeout = Kb.useTimeout(() => setShowingToast(false), 1500)
+  const [lastShowingToast, setLastShowingToast] = React.useState(showingToast)
+  if (lastShowingToast !== showingToast) {
+    setLastShowingToast(showingToast)
+    if (showingToast) {
+      setHideToastTimeout()
+    }
+  }
+
+  const copy = () => {
+    if (!state.output) return
+    setShowingToast(true)
+    copyToClipboard(state.output, sensitiveOutput)
+  }
+
+  return hasOutput(state) ? (
+    <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.outputActionsBarContainer}>
+      {state.outputType === 'file' && !isMobile ? (
+        <Kb.ButtonBar direction="row" align="flex-start" style={styles.buttonBar}>
+          <Kb.Button
+            mode="Secondary"
+            label={`Open in ${Kb.Styles.fileUIName}`}
+            onClick={onShowInFinder}
+          />
+        </Kb.ButtonBar>
+      ) : (
+        <Kb.ButtonBar
+          direction="row"
+          align={Kb.Styles.isTablet ? 'center' : 'flex-start'}
+          style={styles.buttonBar}
+        >
+          {canReplyInChat && state.outputSigned && state.outputSenderUsername ? (
+            <Kb.Button
+              mode="Primary"
+              label="Reply in chat"
+              disabled={actionsDisabled}
+              fullWidth={isMobile}
+              onClick={() => onReplyInChat(state.outputSenderUsername ?? '')}
+            />
+          ) : null}
+          <Kb.Box2 alignSelf="center" direction="horizontal" ref={popupAnchor}>
+            <Kb.Toast position="top center" attachTo={popupAnchor} visible={showingToast}>
+              <Kb.Text type="BodySmall" style={styles.toastText}>
+                Copied to clipboard
+              </Kb.Text>
+            </Kb.Toast>
+            {isMobile && canReplyInChat ? null : (
+              <Kb.Button
+                mode={isMobile ? 'Primary' : 'Secondary'}
+                label="Copy to clipboard"
+                disabled={actionsDisabled}
+                fullWidth={isMobile}
+                onClick={copy}
+              />
+            )}
+          </Kb.Box2>
+          {canSaveAsText && !isMobile && onSaveAsText ? (
+            <Kb.Button
+              mode="Secondary"
+              label="Save as TXT"
+              onClick={onSaveAsText}
+              disabled={actionsDisabled}
+            />
+          ) : null}
+        </Kb.ButtonBar>
+      )}
+    </Kb.Box2>
+  ) : (
+    <Kb.Box2
+      direction="horizontal"
+      fullWidth={true}
+      style={Kb.Styles.collapseStyles([styles.outputActionsBarContainer, styles.outputPlaceholder])}
+    >
+      <Kb.ButtonBar direction="row" style={styles.buttonBar}>
+        {null}
+      </Kb.ButtonBar>
+    </Kb.Box2>
+  )
+}
+
+const OutputFileDestination = ({
+  actionLabel,
+  input,
+  onChooseOutputFolder,
+}: {
+  actionLabel: string
+  input: string
+  onChooseOutputFolder: (destinationDir: string) => void
+}) => {
+  const onOpenFile = () => {
+    const f = async () => {
+      const defaultPath = Path.dirname(input)
+      const filePaths = await pickFiles({
+        allowDirectories: true,
+        allowFiles: false,
+        buttonLabel: 'Select',
+        ...(C.isDarwin ? {defaultPath} : {}),
+      })
+      if (!filePaths.length) return
+      onChooseOutputFolder(filePaths[0] ?? '')
+    }
+    C.ignorePromise(f())
+  }
+
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true}>
+      <Kb.ButtonBar>
+        <Kb.Button mode="Primary" label={`${actionLabel} to ...`} onClick={onOpenFile} />
+      </Kb.ButtonBar>
+    </Kb.Box2>
+  )
+}
+
+const MobileScroll = isMobile ? Kb.ScrollView : React.Fragment
+
+export const CryptoOutput = ({
+  actionLabel,
+  onChooseOutputFolder,
+  outputFileIcon,
+  outputTextType,
+  state,
+}: CryptoOutputProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyCrypto)
+  const actionsDisabled = waiting || !state.outputValid
+
+  const fileOutputTextColor =
+    outputTextType === 'cipher' ? theme.greenDark : theme.black
+
+  if (!hasOutput(state)) {
+    return (
+      <Kb.Box2
+        direction="vertical"
+        fullHeight={true}
+        fullWidth={true}
+        centerChildren={true}
+        style={styles.outputPlaceholder}
+      >
+        {state.inProgress ? (
+          <OutputProgress state={state} />
+        ) : (
+          state.inputType === 'file' &&
+          state.outputStatus !== 'pending' && (
+            <OutputFileDestination
+              actionLabel={actionLabel}
+              input={state.input}
+              onChooseOutputFolder={onChooseOutputFolder}
+            />
+          )
+        )}
+      </Kb.Box2>
+    )
+  }
+
+  if (state.outputType === 'file') {
+    return (
+      <Kb.Box2
+        direction="horizontal"
+        fullHeight={true}
+        fullWidth={true}
+        alignItems="center"
+        padding="xsmall"
+      >
+        {outputFileIcon ? <Kb.ImageIcon type={outputFileIcon} /> : null}
+        <Kb.Text
+          type="BodyPrimaryLink"
+          style={Kb.Styles.collapseStyles([styles.fileOutputText, {color: fileOutputTextColor}])}
+          onClick={() => state.output && openLocalPathInSystemFileManagerDesktop(state.output)}
+        >
+          {state.output}
+        </Kb.Text>
+      </Kb.Box2>
+    )
+  }
+
+  return (
+    <Kb.Box2 direction="vertical" fullHeight={true} fullWidth={true} style={styles.container} testID={TestIDs.CRYPTO_OUTPUT}>
+      <MobileScroll>
+        <Kb.Text
+          type={outputTextType === 'cipher' ? 'Terminal' : 'Body'}
+          selectable={!actionsDisabled}
+          style={styles.output}
+        >
+          {state.output}
+        </Kb.Text>
+      </MobileScroll>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      banner: {
+        ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny),
+        minHeight: 40,
+      },
+      bannerContainer: {
+        ...Kb.Styles.padding(0),
+      },
+      buttonBar: {
+        height: Kb.Styles.globalMargins.large,
+        minHeight: Kb.Styles.globalMargins.large,
+      },
+      container: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.globalStyles.flexGrow,
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny),
+          overflowY: 'auto',
+        },
+        isMobile: {
+          flexShrink: 1,
+        },
+      }),
+      fileOutputText: {...Kb.Styles.globalStyles.fontSemibold},
+      output: Kb.Styles.platformStyles({
+        common: {
+          color: theme.black,
+        },
+        isElectron: {
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        },
+        isMobile: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.small),
+        },
+      }),
+      outputActionsBarContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny),
+        },
+        isMobile: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.small),
+          backgroundColor: theme.blueGrey,
+        },
+        isTablet: {
+          ...Kb.Styles.centered(),
+        },
+      }),
+      outputPlaceholder: {backgroundColor: theme.blueGreyLight},
+      progressBar: {
+        width: 200,
+      },
+      signedByText: {
+        alignItems: 'baseline',
+      },
+      signedContainer: Kb.Styles.platformStyles({
+        common: {
+          minHeight: Kb.Styles.globalMargins.mediumLarge,
+        },
+        isMobile: {
+          minHeight: Kb.Styles.globalMargins.large,
+        },
+      }),
+      signedContainerOther: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+          paddingTop: Kb.Styles.globalMargins.tiny,
+        },
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        },
+      }),
+      signedContainerSelf: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.xtiny, Kb.Styles.globalMargins.tiny),
+        },
+        isMobile: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.xsmall, Kb.Styles.globalMargins.small),
+        },
+      }),
+      toastText: {color: theme.white, textAlign: 'center'},
+    }) as const
+)

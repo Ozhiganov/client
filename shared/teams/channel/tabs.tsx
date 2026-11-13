@@ -1,0 +1,55 @@
+import * as Kb from '@/common-adapters'
+import type {Tab as TabType} from '@/common-adapters/tabs'
+
+export type TabKey = 'members' | 'attachments' | 'bots' | 'settings' | 'loading'
+
+export type Props = {
+  admin: boolean
+  selectedTab: TabKey
+  setSelectedTab: (t: TabKey) => void
+}
+
+const ChannelTabs = (props: Props) => {
+  const styles = useStyles()
+  const {selectedTab, setSelectedTab} = props
+  const tabs: Array<TabType<TabKey>> = [
+    {title: 'members' as const},
+    {title: 'attachments' as const},
+    {title: 'bots' as const},
+    ...(props.admin ? [{title: 'settings' as const}] : []),
+  ]
+
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.container}>
+      <Kb.Tabs
+        clickableBoxStyle={styles.clickableBox}
+        tabs={tabs}
+        selectedTab={selectedTab}
+        onSelect={setSelectedTab}
+        style={styles.tabContainer}
+        tabStyle={styles.tab}
+      />
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  clickableBox: {
+    flexGrow: 1,
+  },
+  container: {
+    backgroundColor: theme.white,
+  },
+  tab: Kb.Styles.platformStyles({
+    isMobile: {
+      ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+    },
+  }),
+  tabContainer: {
+    backgroundColor: theme.white,
+    flexBasis: '100%',
+    marginTop: 0,
+  },
+}))
+
+export default ChannelTabs

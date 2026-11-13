@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build windows
+//go:build windows
 
 package service
 
@@ -18,13 +18,19 @@ var (
 	kernel32DLL        = windows.NewLazySystemDLL("kernel32.dll")
 	getVolumeProc      = kernel32DLL.NewProc("GetVolumeInformationW")
 	queryDosDeviceProc = kernel32DLL.NewProc("QueryDosDeviceW")
+	getDriveTypeProc   = kernel32DLL.NewProc("GetDriveTypeW")
+)
+
+const (
+	driveUnknown   = 0
+	driveNoRootDir = 1
 )
 
 // getVolumeName requires a drive letter and colon with a
 // trailing backslash
 func getVolumeName(RootPathName string) (string, error) {
-	var VolumeNameBuffer = make([]uint16, syscall.MAX_PATH+1)
-	var nVolumeNameSize = uint32(len(VolumeNameBuffer))
+	VolumeNameBuffer := make([]uint16, syscall.MAX_PATH+1)
+	nVolumeNameSize := uint32(len(VolumeNameBuffer))
 
 	_, _, callErr := getVolumeProc.Call(
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(RootPathName))),
@@ -47,9 +53,8 @@ func getVolumeName(RootPathName string) (string, error) {
 // getDosVolumeName requires a drive letter and colon with no
 // trailing backslash
 func getDosVolumeName(path string) (string, error) {
-
-	var VolumeNameBuffer = make([]uint16, syscall.MAX_PATH+1)
-	var nVolumeNameSize = uint32(len(VolumeNameBuffer))
+	VolumeNameBuffer := make([]uint16, syscall.MAX_PATH+1)
+	nVolumeNameSize := uint32(len(VolumeNameBuffer))
 
 	ret, _, err := queryDosDeviceProc.Call(
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(path))),
@@ -70,8 +75,17 @@ func isCdRom(path string) bool {
 	return false
 }
 
+func isDriveFree(drive string) bool {
+	driveType, _, _ := getDriveTypeProc.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(drive))))
+	// 3rd return value is non-null even in success case
+	if driveType == driveUnknown || driveType == driveNoRootDir {
+		return true
+	}
+	return false
+}
+
 func getMountDirs() ([]string, error) {
-	//start with drive D
+	// start with drive D
 	i := uint(3)
 	var drives []string
 	for ; i < 26; i++ {
@@ -87,6 +101,9 @@ func getMountDirs() ([]string, error) {
 		// including errors retrieving same.
 		// (we plan to change from KBFS to Keybase)
 		if len(volume) > 0 && volume != "KBFS" && volume != "Keybase" {
+			continue
+		}
+		if !isDriveFree(path + "\\") {
 			continue
 		}
 		drives = append(drives, path)

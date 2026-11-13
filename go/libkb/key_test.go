@@ -5,8 +5,11 @@ package libkb
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
+//nolint:gosec // G101: Test PGP key for key testing, not real credentials
 var gabrielSecret = `
 -----BEGIN PGP PRIVATE KEY BLOCK-----
 Comment: GPGTools - http://gpgtools.org
@@ -124,8 +127,6 @@ var allKeys = []string{
 func TestParseKeys(t *testing.T) {
 	for _, k := range allKeys {
 		_, _, err := ReadOneKeyFromString(k)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 	}
 }

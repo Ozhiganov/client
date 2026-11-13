@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build !darwin
+//go:build !darwin
 
 package client
 
@@ -32,6 +32,8 @@ func (s *CmdCtlStart) ParseArgv(ctx *cli.Context) error {
 }
 
 func (s *CmdCtlStart) Run() (err error) {
+	// The ForceFork side effect above is all this command does. The
+	// autoforking logic handles launchd and systemd also.
 	return nil
 }
 

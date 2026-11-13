@@ -1,0 +1,643 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import QRImage from './qr-image'
+import QRScan from './qr-scan'
+import {produce} from 'immer'
+import Troubleshooting from '../troubleshooting'
+import * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {useCurrentUserState} from '@/stores/current-user'
+import type {Device} from '@/constants/provision'
+import {submitProvisionTextCode} from '../flow'
+import ProvisionWaitingOverlay from '../waiting-overlay'
+
+type OwnProps = {
+  deviceName?: string
+  error?: string
+  otherDevice: Device
+  textCode: string
+}
+
+const CodePageContainer = (op: OwnProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const storeDeviceName = useCurrentUserState(s => s.deviceName)
+  const currentDeviceAlreadyProvisioned = !!storeDeviceName
+  const {otherDevice, textCode} = op
+  const error = op.error ?? ''
+  const currentDeviceName = currentDeviceAlreadyProvisioned ? storeDeviceName : (op.deviceName ?? '')
+  const currentDevice = {
+    created: 0,
+    currentDevice: false,
+    deviceID: T.Devices.stringToDeviceID(''),
+    deviceNumberOfType: 0,
+    lastUsed: 0,
+    name: currentDeviceName,
+    type: currentDeviceType,
+  } satisfies T.Devices.Device
+  const iconNumber = T.Devices.deviceNumberToIconNumber(otherDevice.deviceNumberOfType)
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyProvision)
+
+  const onBack = C.Router2.navigateUp
+
+  const _onSubmitTextCode = (code: string) => {
+    if (!waiting) {
+      submitProvisionTextCode(code)
+    }
+  }
+
+  const [code, setCode] = React.useState('')
+  const [troubleshooting, setTroubleshooting] = React.useState(false)
+
+  const defaultTab = (() => {
+    const getTabOrOpposite = (tabToShowToNew: Tab) => {
+      if (!currentDeviceAlreadyProvisioned) return tabToShowToNew
+      switch (tabToShowToNew) {
+        case 'QR':
+          return 'QR'
+        case 'enterText':
+          return 'viewText'
+        case 'viewText':
+          return 'enterText'
+      }
+    }
+
+    switch (currentDeviceType) {
+      case 'mobile':
+        return getTabOrOpposite('QR')
+      case 'desktop':
+        return otherDevice.type === 'desktop' ? getTabOrOpposite('viewText') : getTabOrOpposite('QR')
+    }
+  })()
+
+  const [tabState, setTabState] = React.useState({defaultTab, tab: defaultTab})
+
+  if (tabState.defaultTab !== defaultTab) {
+    setTabState({defaultTab, tab: defaultTab})
+  }
+
+  const tab = tabState.defaultTab === defaultTab ? tabState.tab : defaultTab
+  const setTab = (tab: Tab) =>
+    setTabState(
+      produce(draft => {
+        draft.tab = tab
+      })
+    )
+  const tabBackground = tab === 'QR' ? theme.blueLight : theme.green
+  const buttonType = tab === 'QR' ? ('Default' as const) : ('Success' as const)
+  const buttonLabelStyle = tab === 'QR' ? styles.primaryOnBlueLabel : styles.primaryOnGreenLabel
+
+  const onSubmitTextCode = () => _onSubmitTextCode(code)
+
+  // We're in a modal unless this is a desktop being newly provisioned.
+  const inModal = currentDeviceType !== 'desktop' || currentDeviceAlreadyProvisioned
+  // a modal route over the logged-in app (the phone's logged-out flow lays out like one, without the box)
+  const inModalBox = !!Kb.useModalBox()
+
+  const body = () => {
+    let content: React.ReactNode = null
+    switch (tab) {
+      case 'QR':
+        content = <Qr textCode={textCode} currentDeviceAlreadyProvisioned={currentDeviceAlreadyProvisioned} />
+        break
+      case 'viewText':
+        content = <ViewText textCode={textCode} />
+        break
+      case 'enterText':
+        content = (
+          <EnterText
+            code={code}
+            setCode={setCode}
+            onSubmitTextCode={onSubmitTextCode}
+            otherDevice={otherDevice}
+          />
+        )
+        break
+      default:
+    }
+    return (
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        overflow="hidden"
+        relative={true}
+        flex={1}
+        style={{backgroundColor: tabBackground}}
+        testID={TestIDs.PROVISION_CODE_PAGE}
+      >
+        <Kb.Box2
+          direction="vertical"
+          fullHeight={true}
+          justifyContent="center"
+          alignItems={currentDeviceAlreadyProvisioned ? 'flex-start' : 'flex-end'}
+          style={styles.imageContainer}
+        >
+          <Kb.ImageIcon
+            type={tab === 'QR' ? 'illustration-bg-provisioning-blue' : 'illustration-bg-provisioning-green'}
+            style={currentDeviceAlreadyProvisioned ? styles.backgroundOnLeft : styles.backgroundOnRight}
+          />
+        </Kb.Box2>
+        {!currentDeviceAlreadyProvisioned && !isMobile && (
+          <>
+            <Kb.BackButton
+              onClick={onBack}
+              iconColor={theme.white}
+              style={styles.backButton}
+              textStyle={styles.backButtonText}
+            />
+            <Kb.Divider />
+          </>
+        )}
+        <Kb.ErrorBanner error={error} />
+        <Kb.Box2 direction="vertical" fullWidth={true} flex={1} relative={true}>
+          <Kb.Box2 direction="vertical" fullHeight={true} style={Kb.Styles.globalStyles.flexGrow}>
+            <Kb.Box2
+              direction="vertical"
+              style={styles.container}
+              fullWidth={true}
+              gap="tiny"
+              justifyContent="space-between"
+            >
+              <Instructions
+                currentDeviceAlreadyProvisioned={currentDeviceAlreadyProvisioned}
+                currentDevice={currentDevice}
+                currentDeviceName={currentDeviceName}
+                otherDevice={otherDevice}
+                iconNumber={iconNumber}
+              />
+              {content}
+              <SwitchTab
+                selected={tab}
+                onSelect={setTab}
+                otherDevice={otherDevice}
+                currentDeviceAlreadyProvisioned={currentDeviceAlreadyProvisioned}
+              />
+              {!inModal && footer().content}
+            </Kb.Box2>
+          </Kb.Box2>
+        </Kb.Box2>
+        {!inModal && otherDevice.type === 'desktop' && heyWaitBanner()}
+        {!inModal && troubleshooting && (
+          <Kb.Popup intent="dialog" onHidden={() => setTroubleshooting(false)}>
+            {troubleshootingContent()}
+          </Kb.Popup>
+        )}
+        <ProvisionWaitingOverlay />
+      </Kb.Box2>
+    )
+  }
+
+  const footer = () => {
+    const showHeyWaitInFooter =
+      currentDeviceType === 'mobile' &&
+      currentDeviceType === otherDevice.type &&
+      !currentDeviceAlreadyProvisioned
+    return {
+      content: (
+        <Kb.Box2
+          alignItems="center"
+          direction="vertical"
+          gap={isMobile ? 'medium' : 'small'}
+          gapEnd={!showHeyWaitInFooter}
+          fullWidth={true}
+        >
+          {tab === 'enterText' && (
+            <Kb.WaitingButton
+              fullWidth={true}
+              type={buttonType}
+              label="Continue"
+              onClick={onSubmitTextCode}
+              disabled={!code || waiting}
+              style={Kb.Styles.collapseStyles([styles.enterTextButton, styles.primaryOnColor])}
+              labelStyle={buttonLabelStyle}
+              waitingKey={C.waitingKeyProvision}
+            />
+          )}
+          {tab !== 'enterText' && inModal && !isMobile && (
+            <Kb.WaitingButton
+              fullWidth={true}
+              type={buttonType}
+              label="Close"
+              onClick={onBack}
+              onlyDisable={true}
+              style={Kb.Styles.collapseStyles([styles.closeButton, styles.primaryOnColor])}
+              labelStyle={buttonLabelStyle}
+              waitingKey={C.waitingKeyProvision}
+            />
+          )}
+          {showHeyWaitInFooter && heyWaitBanner()}
+        </Kb.Box2>
+      ),
+      style: {
+        backgroundColor: tabBackground,
+        ...Kb.Styles.padding(Kb.Styles.globalMargins.xsmall, 0, 0),
+      },
+    }
+  }
+
+  const heyWaitBanner = () => (
+    <Kb.ClickableBox onClick={() => setTroubleshooting(true)} direction="vertical" fullWidth={true}>
+      <Kb.Banner color="yellow">
+        <Kb.BannerParagraph
+          bannerColor="yellow"
+          content={[
+            `Are you on that ${otherDevice.type === 'mobile' ? 'phone' : 'computer'} now? `,
+            {onClick: () => setTroubleshooting(true), text: 'Resolve'},
+          ]}
+        />
+      </Kb.Banner>
+    </Kb.ClickableBox>
+  )
+
+  const troubleshootingContent = () => (
+    <Troubleshooting
+      device={otherDevice}
+      mode={tab === 'QR' ? 'QR' : 'text'}
+      onCancel={() => setTroubleshooting(false)}
+    />
+  )
+
+  // Workaround for no modals while logged out: display just the troubleshooting content if we're on mobile and it's open;
+  // When we're on desktop being newly provisioned, it's rendered inside body()
+  if (isMobile && troubleshooting) {
+    return troubleshootingContent()
+  }
+  const content = body()
+  if (inModalBox) {
+    const f = footer()
+    return (
+      <Kb.ModalScreen
+        scroll={false}
+        padding="none"
+        footer={f.content}
+        footerDivider={false}
+        style={{backgroundColor: tabBackground}}
+      >
+        {content}
+      </Kb.ModalScreen>
+    )
+  }
+  if (inModal) {
+    const f = footer()
+    return (
+      <>
+        {content}
+        <Kb.ModalFooter style={f.style}>
+          {f.content}
+        </Kb.ModalFooter>
+      </>
+    )
+  }
+  return content
+}
+
+export type DeviceType = 'mobile' | 'desktop'
+export type Tab = 'QR' | 'enterText' | 'viewText'
+
+const currentDeviceType: DeviceType = isMobile ? 'mobile' : 'desktop'
+
+const textType = 'BodySemibold'
+
+const SwitchTab = (props: {
+  selected: Tab
+  onSelect: (tab: Tab) => void
+  otherDevice: Device
+  currentDeviceAlreadyProvisioned: boolean
+}) => {
+  const styles = useStyles()
+  const {onSelect} = props
+  if (currentDeviceType === 'desktop' && props.otherDevice.type === 'desktop') {
+    return null
+  }
+
+  let label: string
+  let tab: Tab
+
+  if (props.selected === 'QR') {
+    label = 'Type secret instead'
+    if (currentDeviceType === 'mobile' && props.otherDevice.type === 'mobile') {
+      tab = (props.currentDeviceAlreadyProvisioned ? isMobile : !isMobile) ? 'viewText' : 'enterText'
+    } else if (currentDeviceType === 'mobile') {
+      tab = 'viewText'
+    } else {
+      tab = 'enterText'
+    }
+  } else {
+    label = 'Scan QR instead'
+    tab = 'QR'
+  }
+
+  return (
+    <Kb.Box2 alignSelf="center" direction="horizontal" gap="xtiny" alignItems="center">
+      <Kb.Text
+        type="BodySmallPrimaryLink"
+        negative={true}
+        onClick={() => onSelect(tab)}
+        style={styles.switchTab}
+      >
+        {label}
+      </Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const Qr = (props: {textCode: string; currentDeviceAlreadyProvisioned: boolean}) => {
+  const styles = useStyles()
+  return currentDeviceType === 'desktop' ? (
+      <Kb.Box2 alignSelf="center" direction="vertical" style={styles.qrOnlyContainer}>
+        <QRImage code={props.textCode} cellSize={8} />
+      </Kb.Box2>
+    ) : (
+      <Kb.Box2 alignSelf="center"
+        style={Kb.Styles.collapseStyles([
+          styles.qrContainer,
+          props.currentDeviceAlreadyProvisioned && styles.qrContainerFlip,
+        ])}
+        direction="vertical"
+      >
+        <Kb.Box2 alignSelf="center" direction="vertical" style={styles.qrImageContainer}>
+          <QRImage code={props.textCode} />
+        </Kb.Box2>
+        <QRScan />
+      </Kb.Box2>
+    )
+}
+
+const EnterText = (props: {
+  code: string
+  setCode: (code: string) => void
+  onSubmitTextCode: (c: string) => void
+  otherDevice: Device
+}) => {
+  const styles = useStyles()
+  const {code, setCode} = props
+  const {onSubmitTextCode} = props
+  const onSubmit = (e?: React.KeyboardEvent) => {
+    e?.preventDefault()
+    if (code) {
+      onSubmitTextCode(code)
+    }
+  }
+  return (
+    <Kb.Box2
+      direction="vertical"
+      alignItems={isMobile ? 'stretch' : 'center'}
+      alignSelf="stretch"
+      gap="small"
+    >
+      <Kb.Input3
+        autoFocus={true}
+        multiline={true}
+        onChangeText={setCode}
+        onEnterKeyDown={onSubmit}
+        rowsMin={3}
+        placeholder={`Type the ${props.otherDevice.type === 'mobile' ? '9' : '8'}-word secret code`}
+        textType="Terminal"
+        hideBorder={true}
+        containerStyle={styles.enterTextContainer2}
+        inputStyle={styles.enterTextColor}
+        value={code}
+      />
+    </Kb.Box2>
+  )
+}
+
+const ViewText = (props: {textCode: string}) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" alignItems="center" style={styles.viewTextContainer}>
+      <Kb.Text center={true} type="Terminal" style={styles.viewTextCode}>
+        {props.textCode}
+      </Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const getIcon = (type: T.Devices.DeviceType, iconNumber: T.Devices.IconNumber) => {
+  switch (type) {
+    case 'desktop':
+      return `icon-computer-background-${iconNumber}-96` as const
+    case 'mobile':
+      return `icon-phone-background-${iconNumber}-96` as const
+    default:
+      return 'icon-computer-96' as const
+  }
+}
+
+const Instructions = (p: {
+  currentDeviceAlreadyProvisioned: boolean
+  currentDevice: T.Devices.Device
+  currentDeviceName: string
+  otherDevice: Device
+  iconNumber: T.Devices.IconNumber
+}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const iconType = getIcon(
+    p.currentDeviceAlreadyProvisioned ? p.currentDevice.type : p.otherDevice.type,
+    p.iconNumber
+  )
+
+  let content: React.ReactNode
+
+  const icon = (
+    <Kb.ImageIcon
+      type={iconType}
+      style={Kb.Styles.collapseStyles([
+        styles.deviceIcon,
+        p.currentDevice.type === 'desktop' && styles.deviceIconDesktop,
+        p.currentDevice.type === 'mobile' && styles.deviceIconMobile,
+      ])}
+    />
+  )
+
+  if (p.currentDeviceAlreadyProvisioned) {
+    content = (
+      <Kb.Box2 alignSelf="center" alignItems="center" direction="horizontal" style={styles.flexWrap}>
+        <Kb.Text type={textType} style={styles.instructions}>
+          Ready to authorize using
+        </Kb.Text>
+        {icon}
+        <Kb.Text type={textType} style={styles.instructions}>
+          {p.currentDeviceName}.
+        </Kb.Text>
+      </Kb.Box2>
+    )
+  } else {
+    const hamburger =
+      p.otherDevice.type === 'mobile' ? (
+        <Kb.Box2 alignSelf="center"
+          alignItems="center"
+          direction="horizontal"
+          centerChildren={true}
+          gap="xtiny"
+          style={Kb.Styles.globalStyles.flexWrap}
+        >
+          <Kb.Icon
+            type="iconfont-nav-2-hamburger"
+            color={theme.white}
+            sizeType="Default"
+            style={styles.hamburger}
+          />
+          <Kb.Icon type="iconfont-arrow-right" color={theme.white} sizeType="Tiny" />
+          <Kb.Text type={textType} style={styles.instructions}>
+            Devices
+          </Kb.Text>
+        </Kb.Box2>
+      ) : null
+    content = (
+      <>
+        <Kb.Box2 alignSelf="center" alignItems="flex-end" direction="horizontal" gap="xtiny">
+          <Kb.Text
+            type={textType}
+            style={Kb.Styles.collapseStyles([styles.instructions, styles.instructionsUpper])}
+          >
+            On
+          </Kb.Text>
+          {icon}
+          <Kb.Text
+            type={textType}
+            style={Kb.Styles.collapseStyles([styles.instructions, styles.instructionsUpper])}
+          >
+            {p.otherDevice.name}, go to {p.otherDevice.type === 'desktop' && 'Devices'}
+          </Kb.Text>
+        </Kb.Box2>
+        {hamburger}
+        <Kb.Text type={textType} style={styles.instructionsContainer} center={true}>
+          <Kb.Text
+            type={textType}
+            style={Kb.Styles.collapseStyles([styles.instructions, styles.instructionsUpper])}
+          >
+            {`and authorize a new ${p.currentDevice.type === 'desktop' ? 'computer' : 'phone'}.`}
+          </Kb.Text>
+        </Kb.Text>
+      </>
+    )
+  }
+
+  return <Kb.Box2 alignSelf="center" direction="vertical">{content}</Kb.Box2>
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      backButton: Kb.Styles.platformStyles({
+        isElectron: {
+          alignSelf: 'flex-start',
+          marginTop: 56, // we're under the header, need to shift down
+          paddingBottom: Kb.Styles.globalMargins.small,
+          paddingLeft: Kb.Styles.globalMargins.xsmall,
+          position: 'relative', // otherwise the absolutely positioned background makes this unclickable
+          zIndex: undefined, // annoyingly this is set inside Kb.BackButton
+        },
+        isMobile: {
+          marginBottom: 0,
+          marginLeft: 0,
+          marginTop: 0,
+        },
+      }),
+      backButtonText: {color: theme.white},
+      backgroundOnLeft: {marginLeft: -230},
+      backgroundOnRight: {marginRight: -230},
+      closeButton: Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+      container: Kb.Styles.platformStyles({
+        isElectron: {
+          height: '100%',
+          padding: Kb.Styles.globalMargins.large,
+        },
+        isMobile: {
+          flexGrow: 1,
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.small),
+        },
+      }),
+      deviceIcon: Kb.Styles.size(32),
+      deviceIconDesktop: {
+        marginLeft: Kb.Styles.globalMargins.xtiny,
+        marginRight: Kb.Styles.globalMargins.xxtiny,
+      },
+      deviceIconMobile: {
+        marginLeft: Kb.Styles.globalMargins.xxtiny,
+        marginRight: 0,
+      },
+      enterTextButton: {
+        ...Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+        maxWidth: isMobile ? undefined : 460,
+        width: '90%',
+      },
+      enterTextColor: {color: theme.greenDark},
+      enterTextContainer2: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.white,
+          borderRadius: Kb.Styles.borderRadius,
+          ...Kb.Styles.padding(15, 20),
+        },
+        isElectron: {maxWidth: 460},
+        isMobile: {width: '100%'},
+      }),
+      flexWrap: Kb.Styles.platformStyles({isMobile: {flexWrap: 'wrap'}}),
+      hamburger: Kb.Styles.platformStyles({
+        isMobile: {
+          bottom: 1,
+          marginRight: Kb.Styles.globalMargins.xtiny,
+          position: 'relative',
+          right: 1,
+        },
+      }),
+      imageContainer: {
+        ...Kb.Styles.globalStyles.fillAbsolute,
+      },
+      instructions: {color: theme.white},
+      instructionsContainer: {padding: Kb.Styles.globalMargins.tiny},
+      instructionsUpper: {marginBottom: Kb.Styles.globalMargins.tiny},
+      primaryOnBlueLabel: {color: theme.blueDark},
+      primaryOnColor: {backgroundColor: theme.white},
+      primaryOnGreenLabel: {color: theme.greenDark},
+      qrContainer: Kb.Styles.platformStyles({
+        common: {
+          // MUST be white, else darkmode messes up the qr code
+          backgroundColor: theme.whiteOrWhite,
+          borderRadius: isAndroid ? 0 : 8, // If this is set to ANYTHING other than 0 android DOESN"T WORK!!!!!! The qr scanner totally breaks
+          flexDirection: 'column',
+          padding: 4,
+        },
+        isElectron: {width: 220},
+        isMobile: {width: 160},
+      }),
+      qrContainerFlip: {flexDirection: 'column-reverse'},
+      qrImageContainer: Kb.Styles.paddingV(10),
+      qrOnlyContainer: {
+        backgroundColor: theme.whiteOrWhite,
+        borderRadius: 8,
+        padding: 20,
+      },
+      switchTab: {
+        marginBottom: Kb.Styles.globalMargins.xtiny,
+        marginTop: Kb.Styles.globalMargins.tiny,
+      },
+      viewTextCode: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.globalStyles.fontTerminalSemibold,
+          color: theme.greenLight,
+          fontSize: 16,
+        },
+        isElectron: {maxWidth: 330},
+      }),
+      viewTextContainer: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.greenDark,
+          borderRadius: Kb.Styles.borderRadius,
+        },
+        isElectron: {
+          maxWidth: 460,
+          ...Kb.Styles.padding(20, 64),
+        },
+        isMobile: {
+          alignSelf: 'stretch',
+          ...Kb.Styles.padding(20),
+        },
+      }),
+    }) as const
+)
+
+export default CodePageContainer

@@ -1,0 +1,25 @@
+import type {Props} from './index.shared'
+import {RelativeFloatingBox} from './relative-floating-box.desktop'
+
+const DesktopFloatingBox = (props: Props) => {
+  const {attachTo, disableEscapeKey, position, positionFallbacks, children, offset} = props
+  const {onHidden, propagateOutsideClicks, containerStyle, matchDimension} = props
+
+  return (
+    <RelativeFloatingBox
+      attachTo={attachTo}
+      disableEscapeKey={disableEscapeKey}
+      position={position || 'bottom center'}
+      positionFallbacks={positionFallbacks}
+      matchDimension={!!matchDimension}
+      onHidden={onHidden}
+      propagateOutsideClicks={propagateOutsideClicks}
+      style={containerStyle}
+      offset={offset}
+    >
+      {children}
+    </RelativeFloatingBox>
+  )
+}
+
+export default DesktopFloatingBox

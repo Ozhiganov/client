@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build !windows
+//go:build !windows
 
 package mounter
 
@@ -17,7 +17,9 @@ import (
 // Unmount tries to unmount normally and then if force if unsuccessful.
 func Unmount(dir string, force bool, log Log) error {
 	if !force {
+		//nolint:staticcheck // SA4023: err always/never nil depending on GOOS
 		mounted, err := IsMounted(dir, log)
+		//nolint:staticcheck // SA4023: err always/never nil depending on GOOS
 		if err != nil {
 			return err
 		}
@@ -39,10 +41,10 @@ func Unmount(dir string, force bool, log Log) error {
 	return err
 }
 
-// ForceUnmount tries to forceably unmount a directory
+// ForceUnmount tries to forcibly unmount a directory
 func ForceUnmount(dir string, log Log) error {
 	switch runtime.GOOS {
-	case "darwin":
+	case "darwin", "ios":
 		log.Info("Force unmounting with diskutil")
 		out, err := exec.Command("/usr/sbin/diskutil", "unmountDisk", "force", dir).CombinedOutput()
 		log.Debug("Output: %s", string(out))

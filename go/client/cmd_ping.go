@@ -4,6 +4,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -12,10 +13,10 @@ import (
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
 	"github.com/keybase/client/go/libkb"
-	gregor1 "github.com/keybase/client/go/protocol/gregor1"
-	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/gregor1"
+	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"golang.org/x/net/context"
 )
 
 type CmdPing struct {
@@ -28,15 +29,23 @@ func (v *CmdPing) Run() error {
 		return PingGregor(v.G())
 	}
 
-	_, err := v.G().API.Post(libkb.APIArg{Endpoint: "ping"})
+	mctx := libkb.NewMetaContextBackground(v.G())
+
+	_, err := v.G().API.Post(mctx, libkb.APIArg{Endpoint: "ping"})
 	if err != nil {
 		return err
 	}
-	_, err = v.G().API.Get(libkb.APIArg{Endpoint: "ping"})
+	_, err = v.G().API.Get(mctx, libkb.APIArg{Endpoint: "ping"})
 	if err != nil {
 		return err
 	}
-	v.G().Log.Info(fmt.Sprintf("API Server at %s is up", v.G().Env.GetServerURI()))
+
+	serverURI, err := v.G().Env.GetServerURI()
+	if err != nil {
+		return err
+	}
+
+	v.G().Log.Info(fmt.Sprintf("API Server at %s is up", serverURI))
 
 	return nil
 }
@@ -80,20 +89,15 @@ type pingGregorTransport struct {
 
 var _ rpc.ConnectionTransport = (*pingGregorTransport)(nil)
 
-func newConnTransport(host string) *pingGregorTransport {
-	return &pingGregorTransport{
-		host: host,
-	}
-}
-
 func (t *pingGregorTransport) Dial(context.Context) (rpc.Transporter, error) {
-	t.G().Log.Debug("pingGregorTransport Dial", t.host)
+	t.G().Log.Debug("pingGregorTransport Dial %s", t.host)
 	var err error
-	t.conn, err = net.Dial("tcp", t.host)
+	t.conn, err = libkb.ProxyDial(t.G().Env, "tcp", t.host)
 	if err != nil {
 		return nil, err
 	}
-	t.stagedTransport = rpc.NewTransport(t.conn, nil, nil)
+	t.stagedTransport = rpc.NewTransport(t.conn, nil, nil,
+		nil, rpc.DefaultMaxFrameLength)
 	return t.stagedTransport, nil
 }
 
@@ -104,13 +108,26 @@ func (t *pingGregorTransport) IsConnected() bool {
 
 func (t *pingGregorTransport) Finalize() {
 	t.G().Log.Debug("pingGregorTransport Finalize")
+	if t.transport != nil {
+		t.transport.Close()
+	}
 	t.transport = t.stagedTransport
 	t.stagedTransport = nil
 }
 
 func (t *pingGregorTransport) Close() {
 	t.G().Log.Debug("pingGregorTransport Close")
-	t.conn.Close()
+	if t.conn != nil {
+		t.conn.Close()
+	}
+	if t.transport != nil {
+		t.transport.Close()
+	}
+	t.transport = nil
+	if t.stagedTransport != nil {
+		t.stagedTransport.Close()
+	}
+	t.stagedTransport = nil
 }
 
 // pingGregorHandler implements rpc.ConnectionHandler
@@ -122,10 +139,6 @@ type pingGregorHandler struct {
 
 var _ rpc.ConnectionHandler = (*pingGregorHandler)(nil)
 
-func newGregorHandler() *pingGregorHandler {
-	return &pingGregorHandler{}
-}
-
 func (g *pingGregorHandler) HandlerName() string {
 	return "ping gregor"
 }
@@ -136,7 +149,7 @@ func (g *pingGregorHandler) OnConnect(ctx context.Context, conn *rpc.Connection,
 	response, err := ac.Ping(ctx)
 	if err != nil {
 		g.pingErrors <- err
-	} else if response != "pong" {
+	} else if response != "pong" && response != "" {
 		g.pingErrors <- fmt.Errorf("Got an unexpected response from ping: %#v", response)
 	} else {
 		g.pingSuccess <- struct{}{}
@@ -145,33 +158,33 @@ func (g *pingGregorHandler) OnConnect(ctx context.Context, conn *rpc.Connection,
 }
 
 func (g *pingGregorHandler) OnConnectError(err error, reconnectThrottleDuration time.Duration) {
-	g.G().Log.Debug("pingGregorHandler OnConnectError", err)
+	g.G().Log.Debug("pingGregorHandler OnConnectError: %v", err)
 	g.pingErrors <- err
 }
 
 func (g *pingGregorHandler) OnDisconnected(ctx context.Context, status rpc.DisconnectStatus) {
-	g.G().Log.Debug("pingGregorHandler OnDisconnected", status)
+	g.G().Log.Debug("pingGregorHandler OnDisconnected: %v", status)
 }
 
 func (g *pingGregorHandler) OnDoCommandError(err error, nextTime time.Duration) {
-	g.G().Log.Debug("pingGregorHandler DoCommandError", err)
+	g.G().Log.Debug("pingGregorHandler DoCommandError: %v", err)
 	g.pingErrors <- err
 }
 
 func (g *pingGregorHandler) ShouldRetry(name string, err error) bool {
-	g.G().Log.Debug("pingGregorHandler ShouldRetry", name, err)
+	g.G().Log.Debug("pingGregorHandler ShouldRetry: %s %v", name, err)
 	g.pingErrors <- err
 	return false
 }
 
 func (g *pingGregorHandler) ShouldRetryOnConnect(err error) bool {
-	g.G().Log.Debug("pingGregorHandler ShouldRetryOnConnect", err)
+	g.G().Log.Debug("pingGregorHandler ShouldRetryOnConnect: %v", err)
 	g.pingErrors <- err
 	return false
 }
 
 func (g *pingGregorHandler) BroadcastMessage(ctx context.Context, m gregor1.Message) error {
-	g.G().Log.Debug("pingGregorHandler BroadcaseMessage", m)
+	g.G().Log.Debug("pingGregorHandler BroadcaseMessage: %v", m)
 	return nil
 }
 
@@ -192,7 +205,9 @@ func PingGregor(g *libkb.GlobalContext) error {
 	opts := rpc.ConnectionOpts{
 		WrapErrorFunc: keybase1.WrapError,
 	}
-	connection := rpc.NewConnectionWithTransport(rpcHandler, transport, keybase1.ErrorUnwrapper{}, g.Log, opts)
+	connection := rpc.NewConnectionWithTransport(rpcHandler, transport,
+		keybase1.ErrorUnwrapper{},
+		logger.LogOutputWithDepthAdder{Logger: g.Log}, opts)
 	select {
 	case err := <-rpcHandler.pingErrors:
 		pingError = fmt.Errorf("Gregor ping FAILED: %s", err.Error())

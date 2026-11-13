@@ -4,10 +4,9 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"os"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -47,7 +46,7 @@ func (c *cmdTlfCryptKeys) Run() error {
 		return err
 	}
 
-	if err = RegisterProtocolsWithContext(nil, G); err != nil {
+	if err = RegisterProtocolsWithContext(nil, c.G()); err != nil {
 		return err
 	}
 

@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"testing"
+
+	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestProfileEdit(t *testing.T) {
@@ -13,34 +15,31 @@ func TestProfileEdit(t *testing.T) {
 
 	identify := func() keybase1.UserCard {
 		i := newIdentify2WithUIDTester(tc.G)
-		tc.G.Services = i
+		tc.G.SetProofServices(i)
 
 		// add NoSkipSelf and NeedProofSet to go through with the full identify,
 		// with RPCs to the outside and all.
 		arg := &keybase1.Identify2Arg{
-			Uid:          fu.UID(),
-			NoSkipSelf:   true,
-			NeedProofSet: true,
+			Uid:              fu.UID(),
+			NoSkipSelf:       true,
+			NeedProofSet:     true,
+			IdentifyBehavior: keybase1.TLFIdentifyBehavior_CLI,
 		}
 		eng := NewIdentify2WithUID(tc.G, arg)
-		ctx := Context{IdentifyUI: i}
-
+		uis := libkb.UIs{IdentifyUI: i}
 		waiter := launchWaiter(t, i.finishCh)
-		err := eng.Run(&ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		m := NewMetaContextForTest(tc).WithUIs(uis)
+		err := eng.Run(m)
+		require.NoError(t, err)
 		waiter()
 		return i.card
 	}
 
 	update := func(b, n, l string) {
 		eng := NewProfileEdit(tc.G, keybase1.ProfileEditArg{Location: l, FullName: n, Bio: b})
-		ctx := Context{}
-		err := eng.Run(&ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		m := NewMetaContextForTest(tc)
+		err := eng.Run(m)
+		require.NoError(t, err)
 	}
 
 	check := func(card keybase1.UserCard, b, n, l string) {

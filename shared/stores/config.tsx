@@ -1,0 +1,714 @@
+import * as T from "@/constants/types";
+import { ignorePromise, timeoutPromise } from "@/constants/utils";
+import {
+  waitingKeyConfigLogin,
+  waitingKeyConfigLoginAsOther,
+} from "@/constants/strings";
+import type * as EngineGen from "@/constants/rpc";
+import * as Z from "@/util/zustand";
+import { noConversationIDKey } from "@/constants/types/chat/common";
+import isEqual from "lodash/isEqual";
+import logger from "@/logger";
+import type { Tab } from "@/constants/tabs";
+import {
+  RPCError,
+  convertToError,
+  isErrorTransient,
+  isQuietCancel,
+  niceError,
+} from "@/util/errors";
+import { type CommonResponseHandler } from "@/engine/types";
+import {
+  setAccountLoggedIn,
+  setAccountSwitching,
+  startNewAccountGeneration,
+} from "@/engine/account-generation";
+import { disposeDialogsForLogout } from "@/engine/dialog";
+import { invalidPasswordErrorString } from "@/constants/config";
+import { navigateAppendOnceRootHas } from "@/constants/router";
+import { onEngineConnected as onEngineConnectedInPlatform } from "@/util/storeless-actions";
+import { useDaemonState } from "@/stores/daemon";
+import { getCallPort, hasCallPort } from "@/engine/call-port";
+
+type Store = T.Immutable<{
+  allowAnimatedEmojis: boolean;
+  badgeState?: T.RPCGen.BadgeState;
+  chatBuiltinCommands?: T.Chat.StaticConfig["builtinCommands"];
+  chatDeletableByDeleteHistory?: Set<T.Chat.MessageType>;
+  configuredAccounts: Array<T.Config.ConfiguredAccount>;
+  defaultUsername: string;
+  globalError?: Error | RPCError;
+  gregorPushState: Array<{ md: T.RPCGregor.Metadata; item: T.RPCGregor.Item }>;
+  loginError?: RPCError;
+  httpSrv: {
+    address: string;
+    token: string;
+  };
+  installerRanCount: number;
+  isOnline: boolean;
+  justDeletedSelf: string;
+  justRevokedSelf: string;
+  loggedIn: boolean;
+  outOfDate: T.Config.OutOfDate;
+  revokedTrigger: number;
+  runtimeStats?: T.RPCGen.RuntimeStats;
+  startup: {
+    loaded: boolean;
+    conversation: T.Chat.ConversationIDKey;
+    // uid of the account that persisted `conversation` (from ui.routeState2).
+    // Used to avoid replaying a conversation under a different account.
+    conversationUid?: string;
+    tab?: Tab;
+  };
+  userSwitching: boolean;
+  // The account an in-progress switch is logging into ('' when none)
+  userSwitchingTo: string;
+  // Whether the in-progress switch started while logged in
+  userSwitchingFromLoggedIn: boolean;
+  windowShownCount: Map<string, number>;
+}>;
+
+const initialStore: Store = {
+  allowAnimatedEmojis: true,
+  badgeState: undefined,
+  chatBuiltinCommands: undefined,
+  chatDeletableByDeleteHistory: undefined,
+  configuredAccounts: [],
+  defaultUsername: "",
+  globalError: undefined,
+  gregorPushState: [],
+  httpSrv: {
+    address: "",
+    token: "",
+  },
+  installerRanCount: 0,
+  isOnline: true,
+  justDeletedSelf: "",
+  justRevokedSelf: "",
+  loggedIn: false,
+  loginError: undefined,
+  outOfDate: {
+    critical: false,
+    message: "",
+    outOfDate: false,
+    updating: false,
+  },
+  revokedTrigger: 0,
+  startup: {
+    conversation: noConversationIDKey,
+    loaded: false,
+  },
+  userSwitching: false,
+  userSwitchingFromLoggedIn: false,
+  userSwitchingTo: "",
+  windowShownCount: new Map(),
+};
+
+export type State = Store & {
+  dispatch: {
+    checkForUpdate: () => void;
+    endUserSwitchLandedOn: (username: string) => void;
+    initAppUpdateLoop: () => void;
+    installerRan: () => void;
+    loadIsOnline: () => void;
+    login: (username: string, password: string) => void;
+    setLoginError: (error?: RPCError) => void;
+    logoutToLoggedOutFlow: () => void;
+    logoutAndTryToLogInAs: (username: string) => void;
+    onEngineConnected: () => void;
+    onEngineIncoming: (action: EngineGen.Actions) => void;
+    powerMonitorEvent: (event: string) => void;
+    resetState: (isDebug?: boolean) => void;
+    resetRevokedSelf: () => void;
+    revoke: (deviceName: string, wasCurrentDevice: boolean) => void;
+    refreshAccounts: () => Promise<void>;
+    setAccounts: (a: Store["configuredAccounts"]) => void;
+    setBadgeState: (b: State["badgeState"]) => void;
+    setChatStaticConfig: (s: T.Chat.StaticConfig) => void;
+    setDefaultUsername: (u: string) => void;
+    setGlobalError: (e?: unknown) => void;
+    setHTTPSrvInfo: (address: string, token: string) => void;
+    setJustDeletedSelf: (s: string) => void;
+    setLoggedIn: (l: boolean) => void;
+    setStartupDetails: (st: Omit<Store["startup"], "loaded">) => void;
+    setOutOfDate: (outOfDate: T.Config.OutOfDate) => void;
+    setUpdating: () => void;
+    // Starting a switch names its target; switchToAccount is the one place that does.
+    setUserSwitching: (...args: [sw: true, to: string] | [sw: false]) => void;
+    // Starts a switch to a stored account unless one is already running. Returns whether it started.
+    switchToAccount: (username: string) => boolean;
+    toggleRuntimeStats: () => void;
+    updateGregorCategory: (
+      category: string,
+      body: string,
+      dtime?: { offset: number; time: number },
+    ) => void;
+  };
+};
+
+export const useConfigState = Z.createZustand<State>("config", (set, get) => {
+  let inflightRefreshAccounts: Promise<void> | undefined;
+  // Bumped by every login. A login that fails after a newer one started (e.g. a tapped push for
+  // another account switching while a password login is still running) must not end the newer
+  // switch or show its own error.
+  let loginGeneration = 0;
+
+  const _checkForUpdate = async () => {
+    try {
+      const { status, message } =
+        await T.RPCGen.configGetUpdateInfoRpcPromise();
+      get().dispatch.setOutOfDate(
+        status !== T.RPCGen.UpdateInfoStatus.upToDate
+          ? {
+              critical:
+                status === T.RPCGen.UpdateInfoStatus.criticallyOutOfDate,
+              message,
+              outOfDate: true,
+              updating: false,
+            }
+          : {
+              critical: false,
+              message: "",
+              outOfDate: false,
+              updating: false,
+            },
+      );
+    } catch (err) {
+      logger.warn("error getting update info: ", err);
+    }
+  };
+
+  const setGregorPushState = (state: T.RPCGen.Gregor1.State) => {
+    const items = state.items || [];
+    const goodState = items.reduce<
+      Array<{ md: T.RPCGregor.Metadata; item: T.RPCGregor.Item }>
+    >((arr, { md, item }) => {
+      if (md && item) {
+        arr.push({ item, md });
+      }
+      return arr;
+    }, []);
+    if (goodState.length !== items.length) {
+      logger.warn("Lost some messages in filtering out nonNull gregor items");
+    }
+    set((s) => {
+      s.gregorPushState = T.castDraft(goodState);
+      s.allowAnimatedEmojis = !goodState.find(
+        (i) => i.item.category === "emojianimations",
+      );
+    });
+  };
+
+  const updateRuntimeStats = (stats?: T.RPCGen.RuntimeStats) => {
+    set((s) => {
+      s.runtimeStats = stats
+        ? T.castDraft({ ...s.runtimeStats, ...stats })
+        : undefined;
+    });
+  };
+
+  const dispatch: State["dispatch"] = {
+    checkForUpdate: () => {
+      const f = async () => {
+        await _checkForUpdate();
+      };
+      ignorePromise(f());
+    },
+    endUserSwitchLandedOn: (username) => {
+      // A navigator that comes up for an account a newer switch has already moved past (the user
+      // picked another account mid-switch) must leave that switch running.
+      const { userSwitching, userSwitchingTo } = get();
+      if (userSwitching && userSwitchingTo === username) {
+        get().dispatch.setUserSwitching(false);
+      }
+    },
+    initAppUpdateLoop: () => {
+      const f = async () => {
+        while (true) {
+          try {
+            await _checkForUpdate();
+          } catch {}
+          await timeoutPromise(3_600_000); // 1 hr
+        }
+      };
+      ignorePromise(f());
+    },
+    installerRan: () => {
+      set((s) => {
+        s.installerRanCount++;
+      });
+    },
+    loadIsOnline: () => {
+      const f = async () => {
+        try {
+          const isOnline = await T.RPCGen.loginIsOnlineRpcPromise(undefined);
+          set((s) => {
+            s.isOnline = isOnline;
+          });
+        } catch (err) {
+          logger.warn("Error in checking whether we are online", err);
+        }
+      };
+      ignorePromise(f());
+    },
+    login: (username, passphrase) => {
+      const cancelDesc = "Canceling RPC";
+      const cancelOnCallback = (
+        _: unknown,
+        response: CommonResponseHandler,
+      ) => {
+        response.error({
+          code: T.RPCGen.StatusCode.scgeneric,
+          desc: cancelDesc,
+        });
+      };
+      const ignoreCallback = () => {};
+      const generation = ++loginGeneration;
+      const superseded = () => generation !== loginGeneration;
+      const f = async () => {
+        try {
+          await T.RPCGen.loginLoginRpcListener({
+            customResponseIncomingCallMap: {
+              "keybase.1.gpgUi.selectKey": cancelOnCallback,
+              "keybase.1.loginUi.getEmailOrUsername": cancelOnCallback,
+              // The zero value Go has always read here: decline the reset
+              "keybase.1.loginUi.promptResetAccount": (_, response) =>
+                response.result(T.RPCGen.ResetPromptResponse.nothing),
+              "keybase.1.provisionUi.DisplayAndPromptSecret": cancelOnCallback,
+              "keybase.1.provisionUi.PromptNewDeviceName": (_, response) => {
+                cancelOnCallback(undefined, response);
+                if (superseded()) return;
+                // This account needs provisioning; hand off to the provision flow. 'username' lives in
+                // the logged-out stack, which the routers keep unmounted while userSwitching is set, so
+                // end the switch and push once that stack is up.
+                get().dispatch.setUserSwitching(false);
+                navigateAppendOnceRootHas("loggedOut", {
+                  name: "username",
+                  params: { autoSubmit: true, username },
+                });
+              },
+              "keybase.1.provisionUi.chooseDevice": cancelOnCallback,
+              // The zero value Go has always read here; a login never adds another device
+              "keybase.1.provisionUi.chooseDeviceType": (_, response) =>
+                response.result(T.RPCGen.DeviceType.desktop),
+              "keybase.1.provisionUi.chooseGPGMethod": cancelOnCallback,
+              // The zero value Go has always read here: no GPG signing
+              "keybase.1.provisionUi.switchToGPGSignOK": (_, response) =>
+                response.result(false),
+              "keybase.1.secretUi.getPassphrase": (params, response) => {
+                if (
+                  params.pinentry.type === T.RPCGen.PassphraseType.passPhrase
+                ) {
+                  // Service asking us again due to a bad passphrase?
+                  if (params.pinentry.retryLabel) {
+                    cancelOnCallback(params, response);
+                    if (superseded()) return;
+                    let retryLabel = params.pinentry.retryLabel;
+                    if (retryLabel === invalidPasswordErrorString) {
+                      retryLabel = "Incorrect password.";
+                    }
+                    const error = new RPCError(
+                      retryLabel,
+                      T.RPCGen.StatusCode.scinputerror,
+                    );
+                    get().dispatch.setLoginError(error);
+                  } else {
+                    response.result({ passphrase, storeSecret: false });
+                  }
+                } else {
+                  cancelOnCallback(params, response);
+                }
+              },
+            },
+            // cancel if we get any of these callbacks, we're logging in, not provisioning
+            incomingCallMap: {
+              "keybase.1.loginUi.displayPrimaryPaperKey": ignoreCallback,
+              "keybase.1.provisionUi.DisplaySecretExchanged": ignoreCallback,
+              "keybase.1.provisionUi.ProvisioneeSuccess": ignoreCallback,
+              "keybase.1.provisionUi.ProvisionerSuccess": ignoreCallback,
+            },
+            params: {
+              clientType: T.RPCGen.ClientType.guiMain,
+              deviceName: "",
+              deviceType: isMobile ? "mobile" : "desktop",
+              doUserSwitch: true,
+              paperKey: "",
+              username,
+            },
+            waitingKey: waitingKeyConfigLogin,
+          });
+          logger.info("login call succeeded");
+        } catch (error) {
+          if (superseded()) {
+            logger.info(
+              "login failed after a newer login started, ignoring",
+              error,
+            );
+            return;
+          }
+          // Every failure that was not superseded ends the switch here; nothing else would. The session
+          // refresh in finally then applies whatever the daemon says, a logged-out status included.
+          get().dispatch.setUserSwitching(false);
+          if (!(error instanceof RPCError)) {
+            return;
+          }
+          // Already logged in: the daemon's session says so. Canceling: nothing to report.
+          if (
+            error.code !== T.RPCGen.StatusCode.scalreadyloggedin &&
+            error.desc !== cancelDesc &&
+            !isQuietCancel(error)
+          ) {
+            // A copy: the engine hands the same error to the waiting key
+            get().dispatch.setLoginError(
+              new RPCError(
+                niceError(error),
+                error.code,
+                error.fields,
+                error.name,
+                undefined,
+                error.kind,
+              ),
+            );
+          }
+        } finally {
+          // After the switch ends: a failed switch must apply a logged-out session.
+          useDaemonState
+            .getState()
+            .dispatch.refreshSessionFromDaemon("login returned");
+        }
+      };
+      get().dispatch.setLoginError();
+      get().dispatch.setDefaultUsername(username);
+      ignorePromise(f());
+    },
+    logoutAndTryToLogInAs: (username) => {
+      const f = async () => {
+        if (get().loggedIn) {
+          await T.RPCGen.loginLogoutRpcPromise(
+            { force: false, keepSecrets: true },
+            waitingKeyConfigLogin,
+          );
+        }
+        get().dispatch.setDefaultUsername(username);
+      };
+      ignorePromise(f());
+    },
+    logoutToLoggedOutFlow: () => {
+      const f = async () => {
+        if (get().loggedIn) {
+          await T.RPCGen.loginLogoutRpcPromise(
+            { force: false, keepSecrets: true },
+            waitingKeyConfigLoginAsOther,
+          );
+        }
+      };
+      ignorePromise(f());
+    },
+    onEngineConnected: () => {
+      // An engine reset drops in-flight RPCs without settling their promises; a refresh
+      // caught by that would poison the dedupe cache forever
+      inflightRefreshAccounts = undefined;
+      // If ever you want to get OOBMs for a different system, then you need to enter it here.
+      const registerForGregorNotifications = async () => {
+        try {
+          await T.RPCGen.delegateUiCtlRegisterGregorFirehoseFilteredRpcPromise({
+            systems: [],
+          });
+          logger.info("Registered gregor listener");
+        } catch (error) {
+          logger.warn("error in registering gregor listener: ", error);
+        }
+      };
+      ignorePromise(registerForGregorNotifications());
+
+      onEngineConnectedInPlatform();
+    },
+    onEngineIncoming: (action) => {
+      switch (action.type) {
+        case "keybase.1.NotifyAudit.rootAuditError":
+          get().dispatch.setGlobalError(
+            new Error(
+              `Keybase is buggy, please report this: ${action.payload.params.message}`,
+            ),
+          );
+          break;
+        case "keybase.1.NotifyAudit.boxAuditError":
+          get().dispatch.setGlobalError(
+            new Error(
+              `Keybase had a problem loading a team, please report this with \`keybase log send\`: ${action.payload.params.message}`,
+            ),
+          );
+          break;
+        case "keybase.1.NotifyBadges.badgeState":
+          get().dispatch.setBadgeState(action.payload.params.badgeState);
+          break;
+        case "keybase.1.gregorUI.pushState": {
+          const { state } = action.payload.params;
+          setGregorPushState(state);
+          break;
+        }
+        case "keybase.1.NotifyRuntimeStats.runtimeStatsUpdate": {
+          updateRuntimeStats(action.payload.params.stats ?? undefined);
+          break;
+        }
+        case "keybase.1.NotifyService.HTTPSrvInfoUpdate": {
+          get().dispatch.setHTTPSrvInfo(
+            action.payload.params.info.address,
+            action.payload.params.info.token,
+          );
+          break;
+        }
+        default:
+      }
+    },
+    powerMonitorEvent: (event) => {
+      const f = async () => {
+        await T.RPCGen.appStatePowerMonitorEventRpcPromise({ event });
+      };
+      ignorePromise(f());
+    },
+    refreshAccounts: async () => {
+      if (inflightRefreshAccounts) {
+        return inflightRefreshAccounts;
+      }
+      const f = async () => {
+        const defaultUsername = get().defaultUsername;
+        const configuredAccounts =
+          (await T.RPCGen.loginGetConfiguredAccountsRpcPromise()) ?? [];
+        const { setAccounts, setDefaultUsername } = get().dispatch;
+
+        let existingDefaultFound = false as boolean;
+        let currentName = "";
+        const nextConfiguredAccounts: Array<T.Config.ConfiguredAccount> = [];
+
+        configuredAccounts.forEach((account) => {
+          const { username, isCurrent, fullname, hasStoredSecret, uid } =
+            account;
+          if (username === defaultUsername) {
+            existingDefaultFound = true;
+          }
+          if (isCurrent) {
+            currentName = account.username;
+          }
+          nextConfiguredAccounts.push({
+            fullname,
+            hasStoredSecret,
+            uid,
+            username,
+          });
+        });
+        if (!existingDefaultFound) {
+          setDefaultUsername(currentName);
+        }
+        setAccounts(nextConfiguredAccounts);
+      };
+      const p = f();
+      inflightRefreshAccounts = p;
+      try {
+        await p;
+      } finally {
+        if (inflightRefreshAccounts === p) {
+          inflightRefreshAccounts = undefined;
+        }
+      }
+    },
+    resetRevokedSelf: () => {
+      set((s) => {
+        s.justRevokedSelf = "";
+      });
+    },
+    resetState: (isDebug) => {
+      if (isDebug) return;
+      setAccountLoggedIn(false);
+      set((s) => ({
+        ...initialStore,
+        chatBuiltinCommands: s.chatBuiltinCommands,
+        chatDeletableByDeleteHistory: s.chatDeletableByDeleteHistory,
+        configuredAccounts: s.configuredAccounts,
+        defaultUsername: s.defaultUsername,
+        dispatch: s.dispatch,
+        // process-wide, not per account; nothing reloads it on logout
+        httpSrv: s.httpSrv,
+        startup: { loaded: s.startup.loaded },
+        userSwitching: s.userSwitching,
+        userSwitchingFromLoggedIn: s.userSwitchingFromLoggedIn,
+        userSwitchingTo: s.userSwitchingTo,
+      }));
+    },
+    revoke: (name, wasCurrentDevice) => {
+      if (wasCurrentDevice) {
+        const { configuredAccounts, defaultUsername } = get();
+        const acc = configuredAccounts.find(
+          (n) => n.username !== defaultUsername,
+        );
+        const du = acc?.username ?? "";
+        set((s) => {
+          s.defaultUsername = du;
+          s.justRevokedSelf = name;
+          s.revokedTrigger++;
+        });
+      }
+    },
+    setAccounts: (a) => {
+      // Compare against committed state, not the draft: immer 11.1.9 sanitizes
+      // constructor/prototype access on drafts (prototype-pollution fix), which
+      // makes lodash isEqual throw a proxy-invariant TypeError on a draft.
+      if (isEqual(a, get().configuredAccounts)) return;
+      set((s) => {
+        s.configuredAccounts = T.castDraft(a);
+      });
+    },
+    setBadgeState: (b) => {
+      if (get().badgeState === b) return;
+      set((s) => {
+        s.badgeState = T.castDraft(b);
+      });
+    },
+    setChatStaticConfig: (staticConfig) => {
+      set((s) => {
+        s.chatBuiltinCommands = T.castDraft(staticConfig.builtinCommands);
+        s.chatDeletableByDeleteHistory = new Set(
+          staticConfig.deletableByDeleteHistory,
+        );
+      });
+    },
+    setDefaultUsername: (u) => {
+      set((s) => {
+        s.defaultUsername = u;
+      });
+    },
+    setGlobalError: (_e) => {
+      if (_e) {
+        const e = convertToError(_e);
+        set((s) => {
+          s.globalError = e;
+        });
+        logger.error("Error (global):", e.message, e);
+        if (isErrorTransient(e)) {
+          logger.info("globalError silencing:", e);
+          return;
+        }
+      } else {
+        set((s) => {
+          s.globalError = undefined;
+        });
+      }
+    },
+    setHTTPSrvInfo: (address, token) => {
+      set((s) => {
+        s.httpSrv.address = address;
+        s.httpSrv.token = token;
+      });
+    },
+    setJustDeletedSelf: (self) => {
+      set((s) => {
+        s.justDeletedSelf = self;
+      });
+    },
+    setLoggedIn: (loggedIn) => {
+      const changed = get().loggedIn !== loggedIn;
+      if (changed && !loggedIn) {
+        startNewAccountGeneration();
+        disposeDialogsForLogout();
+      }
+      setAccountLoggedIn(loggedIn);
+      set((s) => {
+        s.loggedIn = loggedIn;
+      });
+      if (changed && !loggedIn) {
+        Z.resetAllStores();
+      }
+    },
+    setLoginError: (error) => {
+      set((s) => {
+        s.loginError = error;
+      });
+      if (error) {
+        get().dispatch.setUserSwitching(false);
+      }
+    },
+    setOutOfDate: (outOfDate) => {
+      set((s) => {
+        Object.assign(s.outOfDate, outOfDate);
+      });
+    },
+    setStartupDetails: (st) => {
+      set((s) => {
+        if (s.startup.loaded) {
+          return;
+        }
+        s.startup = {
+          ...st,
+          loaded: true,
+        };
+      });
+    },
+    setUpdating: () => {
+      set((s) => {
+        s.outOfDate.updating = true;
+      });
+    },
+    setUserSwitching: (...args) => {
+      const [sw, to] = args;
+      // Read before the reset below, which clears loggedIn
+      const fromLoggedIn = sw && get().loggedIn;
+      const starting = sw && !get().userSwitching;
+      // Set before the reset, which keeps these: a subscriber that sees loggedIn go false must
+      // already see the switch, or it reads the reset as a logout.
+      set((s) => {
+        s.userSwitching = sw;
+        s.userSwitchingFromLoggedIn = fromLoggedIn;
+        s.userSwitchingTo = sw ? to : "";
+      });
+      if (starting) {
+        // The reset logs the old account out of our stores without going through setLoggedIn
+        if (fromLoggedIn) {
+          startNewAccountGeneration();
+        }
+        // Account-scoped calls made from here on wait for the switch to end: until then the service
+        // may still have the old account
+        setAccountSwitching(true);
+        disposeDialogsForLogout();
+        Z.resetAllStores();
+        if (hasCallPort()) {
+          getCallPort().cancelOutstandingSessions();
+        }
+      } else if (!sw) {
+        setAccountSwitching(false);
+      }
+    },
+    switchToAccount: (username) => {
+      if (get().userSwitching) return false;
+      get().dispatch.setUserSwitching(true, username);
+      get().dispatch.login(username, "");
+      return true;
+    },
+    toggleRuntimeStats: () => {
+      const f = async () => {
+        await T.RPCGen.configToggleRuntimeStatsRpcPromise();
+      };
+      ignorePromise(f());
+    },
+    updateGregorCategory: (category, body, dtime) => {
+      const f = async () => {
+        try {
+          await T.RPCGen.gregorUpdateCategoryRpcPromise({
+            body,
+            category,
+            dtime: dtime || { offset: 0, time: 0 },
+          });
+        } catch {}
+      };
+      ignorePromise(f());
+    },
+  };
+  return {
+    ...initialStore,
+    dispatch,
+  };
+});
+
+export const isChatSessionReady = () => {
+  const { loggedIn, userSwitching } = useConfigState.getState();
+  return loggedIn && !userSwitching;
+};

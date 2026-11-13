@@ -1,0 +1,58 @@
+import * as Kb from '@/common-adapters'
+
+const HelloBot = () => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.container} alignItems="flex-start">
+      <Kb.ImageIcon type="icon-fancy-hellobot-hi-96" style={styles.image} />
+      <Kb.Box2 direction="vertical" gap="xtiny" fullHeight={true} padding="medium">
+        <Kb.Text type="BodySmallSemibold" style={styles.header} negative={true}>
+          {"Hi, I'm Hello Bot. You can play puzzles with me or ask for help."}
+        </Kb.Text>
+        <Kb.Text type="BodySmallSemibold" style={styles.header} negative={true}>
+          Everyday is an adventure.
+        </Kb.Text>
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.orange,
+          borderRadius: Kb.Styles.borderRadius,
+        },
+        isElectron: {
+          height: 100,
+          marginTop: Kb.Styles.globalMargins.xsmall,
+          maxWidth: 400,
+        },
+        isMobile: {
+          marginLeft: Kb.Styles.globalMargins.small,
+          marginRight: Kb.Styles.globalMargins.small,
+          marginTop: Kb.Styles.globalMargins.small,
+          width: 288,
+        },
+      }),
+      header: {
+        maxWidth: isMobile ? 126 : undefined,
+      },
+      image: Kb.Styles.platformStyles({
+        common: {
+          marginLeft: Kb.Styles.globalMargins.medium,
+        },
+        isElectron: {
+          marginTop: -Kb.Styles.globalMargins.xsmall,
+        },
+        isMobile: {
+          alignSelf: 'center',
+          marginTop: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+    }) as const
+)
+
+export default HelloBot

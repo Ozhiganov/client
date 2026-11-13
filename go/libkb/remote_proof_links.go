@@ -4,6 +4,8 @@
 package libkb
 
 import (
+	"slices"
+
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	jsonw "github.com/keybase/go-jsonw"
 )
@@ -11,6 +13,7 @@ import (
 // RemoteProofLinks holds a set of RemoteProofChainLinks,
 // organized by service.
 type RemoteProofLinks struct {
+	Contextified
 	links map[string][]ProofLinkWithState
 }
 
@@ -23,15 +26,15 @@ type ProofLinkWithState struct {
 
 // NewRemoteProofLinks creates a new empty collection of proof
 // links.
-func NewRemoteProofLinks() *RemoteProofLinks {
-	return &RemoteProofLinks{}
+func NewRemoteProofLinks(g *GlobalContext) *RemoteProofLinks {
+	return &RemoteProofLinks{
+		Contextified: NewContextified(g),
+		links:        make(map[string][]ProofLinkWithState),
+	}
 }
 
 // Insert adds a link to the collection of proof links.
 func (r *RemoteProofLinks) Insert(link RemoteProofChainLink, err ProofError) {
-	if r.links == nil {
-		r.links = make(map[string][]ProofLinkWithState)
-	}
 	key := link.TableKey()
 	if len(key) == 0 {
 		return
@@ -42,25 +45,17 @@ func (r *RemoteProofLinks) Insert(link RemoteProofChainLink, err ProofError) {
 // ForService returns all the active proof links for a service.
 func (r *RemoteProofLinks) ForService(st ServiceType) []RemoteProofChainLink {
 	var links []RemoteProofChainLink
-	for _, k := range st.AllStringKeys() {
-		for _, l := range r.links[k] {
-			if l.link.IsRevoked() {
-				continue
-			}
-			links = append(links, l.link)
+	for _, linkWithState := range r.links[st.Key()] {
+		if linkWithState.link.LastWriterWins() {
+			// Clear the array if it's a last-writer wins service.
+			// (like many social networks)
+			links = nil
 		}
-	}
-
-	// Chop the array off if it's a last-writer wins service
-	// (like many social networks).
-	for i := len(links) - 1; i >= 0; i-- {
-		if links[i].LastWriterWins() {
-			links = links[i:]
-			break
+		if linkWithState.link.IsRevoked() {
+			continue
 		}
-
+		links = append(links, linkWithState.link)
 	}
-
 	return links
 }
 
@@ -82,7 +77,7 @@ func (r *RemoteProofLinks) TrackingStatement() *jsonw.Wrapper {
 	for _, x := range r.active() {
 		d, err := x.link.ToTrackingStatement(x.state)
 		if err != nil {
-			G.Log.Warning("Problem with a proof: %s", err)
+			r.G().Log.Warning("Problem with a proof: %s", err)
 			continue
 		}
 		if d != nil {
@@ -92,7 +87,7 @@ func (r *RemoteProofLinks) TrackingStatement() *jsonw.Wrapper {
 
 	res := jsonw.NewArray(len(proofs))
 	for i, proof := range proofs {
-		res.SetIndex(i, proof)
+		_ = res.SetIndex(i, proof)
 	}
 	return res
 }
@@ -113,12 +108,7 @@ func (r *RemoteProofLinks) AddProofsToSet(existing *ProofSet, okStates []keybase
 		okStates = []keybase1.ProofState{keybase1.ProofState_OK}
 	}
 	isOkState := func(s1 keybase1.ProofState) bool {
-		for _, s2 := range okStates {
-			if s1 == s2 {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(okStates, s1)
 	}
 	for _, a := range r.active() {
 		if !isOkState(a.state) {
@@ -143,11 +133,10 @@ func (r *RemoteProofLinks) active() []ProofLinkWithState {
 
 	// Loop over all types of services
 	for _, list := range r.links {
-
 		// Loop over all proofs for that type, from most recent,
 		// to oldest.
-		for i := len(list) - 1; i >= 0; i-- {
-			both := list[i]
+		for _, both := range slices.Backward(list) {
+
 			link := both.link
 			id := CanonicalProofName(link)
 
@@ -188,3 +177,13 @@ func (p ProofLinkWithState) ToKeyValuePair() (string, string) {
 }
 
 func (p ProofLinkWithState) GetProofType() keybase1.ProofType { return p.link.GetProofType() }
+
+func (r *RemoteProofLinks) toServiceSummary() (ret UserServiceSummary) {
+	ret = make(UserServiceSummary, len(r.links))
+	activeProofs := r.Active()
+	for _, proof := range activeProofs {
+		key, val := proof.ToKeyValuePair()
+		ret[key] = val
+	}
+	return ret
+}

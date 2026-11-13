@@ -1,0 +1,50 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Styles from '@/styles'
+import {View} from 'react-native'
+import {useNavigation} from '@react-navigation/native'
+import {useIsFocused} from '@react-navigation/core'
+import type {BottomTabNavigationProp} from '@react-navigation/bottom-tabs'
+import type {RootParamList} from '@/router-v2/route-params'
+
+const isLiquidGlassActive = C.isPhone && C.isLiquidGlassSupported
+
+// True when BottomAccessory hosts its children in the tab bar's accessory row.
+// When false children render inline and must lay themselves out (no row context).
+export const isBottomAccessoryHosted = isLiquidGlassActive
+
+const useStyles = Styles.createStyleHook(() => ({
+  container: {
+    ...Styles.globalStyles.fillAbsolute,
+    alignItems: 'stretch',
+    flexDirection: 'row',
+  },
+}))
+
+const BottomAccessoryMobile = ({children}: {children: React.ReactNode}) => {
+  const styles = useStyles()
+  const navigation = useNavigation()
+  const isFocused = useIsFocused()
+
+  React.useEffect(() => {
+    if (!isFocused) return
+    const parent = navigation.getParent() as BottomTabNavigationProp<RootParamList> | undefined
+    parent?.setOptions({
+      bottomAccessory: (): React.ReactNode => (
+        <View style={Styles.castStyleNative(styles.container)}>
+          {children}
+        </View>
+      ),
+    })
+    return () => {
+      parent?.setOptions({bottomAccessory: undefined})
+    }
+  }, [children, isFocused, navigation, styles.container])
+
+  return null
+}
+
+export const BottomAccessory = ({children}: {children: React.ReactNode}) => {
+  if (!isMobile || !isLiquidGlassActive) return <>{children}</>
+  return <BottomAccessoryMobile>{children}</BottomAccessoryMobile>
+}

@@ -1,0 +1,56 @@
+/// <reference types="jest" />
+
+export {}
+
+export type RequestIdleCallbackHandle = unknown
+export type RequestIdleCallbackOptions = {
+  timeout: number
+}
+export type RequestIdleCallbackDeadline = {
+  readonly didTimeout: boolean
+  timeRemaining: () => number
+}
+
+export interface Console {
+  _log: unknown
+  _warn: unknown
+  _error: unknown
+  _info: unknown
+}
+
+declare global {
+  var DEBUGNavigator: unknown
+  var DEBUGRouter2: unknown
+  var DEBUGmadeEngine: boolean | undefined
+  var DEBUGStore: unknown
+  var DEBUGEngine: unknown
+  var DEBUGLoaded: boolean | undefined
+  var KBCONSTANTS: unknown
+  var KBINBOX: unknown
+  var DEBUGLog: (s: unknown) => void
+  var DEBUGWarn: (s: unknown) => void
+  var DEBUGInfo: (s: unknown) => void
+  var DEBUGError: (s: unknown) => void
+  var _fromPreload: unknown
+  var __HOT__: boolean
+  var __DEV__: boolean
+  var __VERSION__: string
+  var __FILE_SUFFIX__: string
+  var __PROFILE__: boolean
+  // Returns false if the native write to Go failed
+  var rpcOnGo: undefined | ((msg: unknown) => boolean)
+  var rpcOnJs: undefined | ((objs: unknown, count: number) => void)
+  // Platform globals — injected by webpack DefinePlugin / Metro Babel plugin.
+  // No import needed; use these identifiers directly.
+  var isMobile: boolean
+  var isElectron: boolean
+  var isAndroid: boolean
+  var isIOS: boolean
+  // Metro's HMR runtime exposes webpack-compatible `module.hot` (mobile only).
+  // Augments @types/node's NodeJS.Module so we don't depend on @types/webpack-env.
+  namespace NodeJS {
+    interface Module {
+      hot?: {accept: (cb?: () => void) => void}
+    }
+  }
+}

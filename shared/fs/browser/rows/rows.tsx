@@ -1,0 +1,190 @@
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as RowTypes from './types'
+import type * as T from '@/constants/types'
+import Placeholder from './placeholder'
+import TlfType from './tlf-type'
+import Tlf from './tlf'
+import Still from './still'
+import Editing from './editing'
+import {normalRowHeight} from './common'
+import {UploadButton} from '@/fs/common'
+
+export type Props = {
+  destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource
+  emptyMode: 'empty' | 'not-empty-but-no-match' | 'not-empty'
+  items: Array<RowTypes.RowItem>
+  path: T.FS.Path
+}
+
+export const WrapRow = ({children}: {children: React.ReactNode}) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} noShrink={true} style={styles.rowContainer}>
+      {children}
+      <Kb.Divider key="divider" style={styles.divider} />
+    </Kb.Box2>
+  )
+}
+
+const EmptyRow = () => {
+  const styles = useStyles()
+  return <Kb.Box2 direction="vertical" fullWidth={true} noShrink={true} style={styles.rowContainer} />
+}
+
+function Rows(props: Props & {listKey: string}) {
+  const {destinationPickerSource, items, emptyMode, listKey} = props
+
+  const _rowRenderer = (_: number, item: RowTypes.RowItem) => {
+    switch (item.rowType) {
+      case RowTypes.RowType.Placeholder:
+        return (
+          <WrapRow>
+            <Placeholder type={item.type} />
+          </WrapRow>
+        )
+      case RowTypes.RowType.TlfType:
+        return (
+          <WrapRow>
+            <TlfType name={item.name} destinationPickerSource={destinationPickerSource} />
+          </WrapRow>
+        )
+      case RowTypes.RowType.Tlf:
+        return (
+          <WrapRow>
+            <Tlf
+              disabled={item.disabled}
+              name={item.name}
+              tlfType={item.tlfType}
+              destinationPickerSource={destinationPickerSource}
+            />
+          </WrapRow>
+        )
+      case RowTypes.RowType.Still:
+        return (
+          <WrapRow>
+            {item.editSession ? (
+              <Editing editSession={item.editSession} />
+            ) : (
+              <Still path={item.path} destinationPickerSource={destinationPickerSource} />
+            )}
+          </WrapRow>
+        )
+      case RowTypes.RowType.NewFolder:
+        return (
+          <WrapRow>
+            <Editing editSession={item.editSession} />
+          </WrapRow>
+        )
+      case RowTypes.RowType.Empty:
+        return <EmptyRow />
+      case RowTypes.RowType.Header:
+        return item.node
+      default:
+        return (
+          <WrapRow>
+            <Kb.Text type="BodySmallError">This should not happen.</Kb.Text>
+          </WrapRow>
+        )
+    }
+  }
+
+  const _getVariableRowLayout = (rowItems: Array<RowTypes.RowItem>, index: number) => ({
+    index,
+    length: getRowHeight(rowItems[index] || _unknownEmptyRowItem),
+    offset: rowItems.slice(0, index).reduce((offset, row) => offset + getRowHeight(row), 0),
+  })
+
+  const _getTopVariableRowCountAndTotalHeight = (rowItems: Array<RowTypes.RowItem>) => {
+    const index = rowItems.findIndex(row => row.rowType !== RowTypes.RowType.Header)
+    return index === -1
+      ? {count: rowItems.length, totalHeight: -1}
+      : {count: index, totalHeight: _getVariableRowLayout(rowItems, index).offset}
+  }
+
+  const _getItemLayout = (index: number) => {
+    const top = _getTopVariableRowCountAndTotalHeight(items)
+    if (index < top.count) {
+      return _getVariableRowLayout(items, index)
+    }
+    return {
+      index,
+      length: getRowHeight(items[index] || _unknownEmptyRowItem),
+      offset: (index - top.count) * normalRowHeight + top.totalHeight,
+    }
+  }
+
+  return emptyMode !== 'not-empty' ? (
+    <Kb.Box2 direction="vertical" fullHeight={true} fullWidth={true}>
+      {
+        // The folder is empty so these should all be header rows.
+        items.map(item => item.rowType === RowTypes.RowType.Header && item.node)
+      }
+      <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.globalStyles.flexGrow} centerChildren={true} gap="small">
+        <Kb.Text type="BodySmall">
+          {emptyMode === 'empty' ? 'This folder is empty.' : 'Sorry, no folder or file was found.'}
+        </Kb.Text>
+        {emptyMode === 'empty' && <UploadButton path={props.path} />}
+      </Kb.Box2>
+    </Kb.Box2>
+  ) : (
+    <Kb.BoxGrow>
+      <Kb.List
+        key={listKey}
+        keyProperty="key"
+        items={items}
+        bounces={true}
+        itemHeight={{
+          getItemLayout: _getItemLayout,
+          type: 'variable',
+        }}
+        renderItem={_rowRenderer}
+      />
+    </Kb.BoxGrow>
+  )
+}
+
+const RowsWithAutoLoad = (props: Props) => {
+  // List caches offsets. So have the key derive from layouts so that we
+  // trigger a re-render when layout changes. Also encode items length into
+  // this, otherwise we'd get taller-than content rows when going into a
+  // smaller folder from a larger one.
+  const {items} = props
+  const headerEndIndex = items.findIndex(row => row.rowType !== RowTypes.RowType.Header)
+  const listKey =
+    items
+      .slice(0, headerEndIndex === -1 ? items.length : headerEndIndex)
+      .map(row => getRowHeight(row).toString())
+      .join('-') + `:${items.length}`
+  return <Rows {...props} listKey={listKey} />
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      divider: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.black_05_on_white,
+        },
+        isElectron: {
+          marginLeft: 94,
+        },
+        isMobile: {
+          marginLeft: 102,
+        },
+      }),
+      rowContainer: {
+        height: normalRowHeight,
+      },
+    }) as const
+)
+
+const getRowHeight = (row: RowTypes.RowItem) =>
+  row.rowType === RowTypes.RowType.Header ? row.height : normalRowHeight
+
+const _unknownEmptyRowItem = {
+  key: 'unknown-empty-row-item',
+  rowType: RowTypes.RowType.Empty,
+} satisfies RowTypes.EmptyRowItem
+
+export default RowsWithAutoLoad

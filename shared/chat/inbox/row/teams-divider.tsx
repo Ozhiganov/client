@@ -1,0 +1,92 @@
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import * as RowSizes from './sizes'
+
+type Props = {
+  badgeCount?: number
+  hiddenCountDelta?: number
+  smallTeamsExpanded: boolean
+  showButton: boolean
+  hiddenCount: number
+  toggle: () => void
+  style?: Kb.Styles.StylesCrossPlatform
+}
+
+function TeamsDivider(props: Props) {
+  const styles = useStyles()
+  const {badgeCount = 0, showButton, style, hiddenCountDelta, toggle, smallTeamsExpanded} = props
+  let {hiddenCount} = props
+
+  if (!isMobile) {
+    hiddenCount += hiddenCountDelta ?? 0
+  }
+
+  // only show if there's more to load
+  const reallyShow = showButton && !!hiddenCount
+  const loadMore = async () => T.RPCChat.localRequestInboxSmallIncreaseRpcPromise().catch(() => {})
+
+  hiddenCount = Math.max(0, hiddenCount)
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      fullWidth={true}
+      noShrink={true}
+      justifyContent="center"
+      style={Kb.Styles.collapseStyles([
+        reallyShow ? styles.containerButton : styles.containerNoButton,
+        style,
+      ])}
+      gap="tiny"
+      gapStart={true}
+      gapEnd={true}
+    >
+      {reallyShow && (
+        <Kb.Button
+          label={`+${hiddenCount} more`}
+          onClick={smallTeamsExpanded ? loadMore : toggle}
+          small={true}
+          style={styles.button}
+          type="Dim"
+        >
+          {!!badgeCount && <Kb.Badge badgeNumber={badgeCount} />}
+        </Kb.Button>
+      )}
+      {!reallyShow && (
+        <Kb.Text type="BodySmallSemibold" style={styles.dividerText}>
+          Big teams
+        </Kb.Text>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      button: {
+        alignSelf: 'center',
+        bottom: Kb.Styles.globalMargins.tiny,
+        position: 'relative',
+        width: undefined,
+      },
+      containerButton: Kb.Styles.platformStyles({
+        common: {
+          height: RowSizes.dividerHeight(true),
+        },
+        isElectron: {backgroundColor: theme.blueGrey},
+        isMobile: {
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.tiny),
+        },
+      }),
+      containerNoButton: {
+        height: RowSizes.dividerHeight(false),
+      },
+      dividerText: {
+        alignSelf: 'flex-start',
+        ...Kb.Styles.marginH(Kb.Styles.globalMargins.tiny),
+      },
+    }) as const
+)
+
+export default TeamsDivider

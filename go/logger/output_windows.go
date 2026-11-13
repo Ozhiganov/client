@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build windows
+//go:build windows
 
 // Windows 10 has a new terminal that can do ANSI codes by itself, so all this
 // other stuff is legacy - EXCEPT that the colors are not right! If they ever
@@ -18,9 +18,9 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
-	"unsafe"
 )
 
 var (
@@ -72,7 +72,6 @@ const (
 	fgYellow    WORD = 0x0006
 	fgWhite     WORD = 0x0007
 	fgIntensity WORD = 0x0008
-	fgMask      WORD = 0x000F
 
 	bgBlack     WORD = 0x0000
 	bgBlue      WORD = 0x0010
@@ -83,12 +82,11 @@ const (
 	bgYellow    WORD = 0x0060
 	bgWhite     WORD = 0x0070
 	bgIntensity WORD = 0x0080
-	bgMask      WORD = 0x00F0
 )
 
 var codesWin = map[byte]WORD{
 	0:   fgWhite | bgBlack,       //	"reset":
-	1:   fgIntensity,             //CpBold          = CodePair{1, 22}
+	1:   fgIntensity,             // CpBold          = CodePair{1, 22}
 	22:  fgWhite,                 //	UnBold:        // Just assume this means reset to white fg
 	39:  fgWhite,                 //	"resetfg":
 	49:  fgWhite,                 //	"resetbg":        // Just assume this means reset to white fg
@@ -171,7 +169,7 @@ func (cw *ColorWriter) Write(p []byte) (n int, err error) {
 	cw.mutex.Lock()
 	defer cw.mutex.Unlock()
 
-	var totalWritten = len(p)
+	totalWritten := len(p)
 	ctlStart := []byte{0x1b, '['}
 
 	for nextIndex := 0; len(p) > 0; {
@@ -206,7 +204,6 @@ func (cw *ColorWriter) Write(p []byte) (n int, err error) {
 }
 
 func (cw *ColorWriter) parseColorControl(p []byte) []byte {
-
 	var controlIndex int
 	controlCode := p[controlIndex] - '0'
 	controlIndex++
@@ -238,14 +235,14 @@ func (cw *ColorWriter) parseColorControl(p []byte) []byte {
 		setConsoleTextAttribute(cw.fd, code)
 	}
 	if controlIndex+1 <= len(p) {
-		controlIndex += 1
+		controlIndex++
 	}
 
 	return p[controlIndex:]
 }
 
 // parseControlCode is for absorbing backspaces, which
-// caused junk tocome out on the console, and whichever
+// caused junk to come out on the console, and whichever
 // other control code we're probably unprepared for
 func (cw *ColorWriter) parseControlCode(p []byte) []byte {
 	if p[0] == 'D' {
@@ -284,7 +281,9 @@ func SaveConsoleMode() error {
 // RestoreConsoleMode restores the current text attributes from a global,
 // in case nonstandard colors are expected.
 func RestoreConsoleMode() {
-	setConsoleTextAttribute(os.Stdout.Fd(), consoleMode)
+	if consoleMode != 0 {
+		setConsoleTextAttribute(os.Stdout.Fd(), consoleMode)
+	}
 }
 
 // checkError evaluates the results of a Windows API call and returns the error if it failed.

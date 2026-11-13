@@ -1,0 +1,227 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as C from '@/constants'
+import * as T from '@/constants/types'
+import {useNavigation} from '@react-navigation/native'
+import {useRequestLogout} from './use-request-logout'
+import {useRandomPWState} from './use-random-pw'
+import {useRPCLoad} from '@/util/use-rpc-load'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {
+  error: string
+  hasPGPKeyOnServer?: boolean
+  onSave: (password: string) => void // will only be called if password.length > 8 & passwords match
+  saveLabel?: string
+  showTyping?: boolean
+  waitingForResponse?: boolean
+}
+
+const errorSavingFunc = (password: string, passwordConfirm: string): string => {
+  if (password && passwordConfirm && password !== passwordConfirm) {
+    return 'Passwords must match.'
+  }
+  return ''
+}
+
+export const UpdatePassword = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const [password, setPassword] = React.useState('')
+  const [passwordConfirm, setPasswordConfirm] = React.useState('')
+  const [showTyping, setShowTyping] = React.useState(!!props.showTyping)
+  const [errorSaving, setErrorSaving] = React.useState('')
+  const {onSave} = props
+
+  const handlePasswordChange = (password: string) => {
+    setPassword(password)
+    setErrorSaving(errorSavingFunc(password, passwordConfirm))
+  }
+
+  const handlePasswordConfirmChange = (passwordConfirm: string) => {
+    setPasswordConfirm(passwordConfirm)
+    setErrorSaving(errorSavingFunc(password, passwordConfirm))
+  }
+
+  const canSubmit = () => !errorSaving && password.length >= 8 && password === passwordConfirm
+
+  const keyboardType = showTyping && isAndroid ? 'visible-password' : 'default'
+  const notification = props.error
+    ? props.error
+    : props.hasPGPKeyOnServer
+      ? "Changing your password will delete your PGP key from Keybase, and you'll need to generate or upload one again."
+      : null
+
+  const hintType = errorSaving
+    ? 'BodySmallError'
+    : password.length >= 8 && passwordConfirm.length >= 8
+      ? 'BodySmallSuccess'
+      : 'BodySmall'
+  const hintText = errorSaving ? (
+    errorSaving
+  ) : password.length >= 8 && passwordConfirm.length >= 8 ? (
+    <Kb.Box2 direction="horizontal" gap="xtiny" style={styles.passwordFormat}>
+      <Kb.Icon type="iconfont-check" color={theme.green} sizeType="Small" />
+      <Kb.Text type="BodySmallSuccess">Passwords match.</Kb.Text>
+    </Kb.Box2>
+  ) : (
+    'Password must be at least 8 characters.'
+  )
+
+  return (
+    <Kb.ModalScreen
+      padding="none"
+      banner={
+        notification ? (
+          <Kb.Banner color="yellow">
+            <Kb.BannerParagraph bannerColor="yellow" content={notification} />
+          </Kb.Banner>
+        ) : null
+      }
+      footer={
+        <Kb.Button
+          fullWidth={true}
+          label={props.saveLabel || 'Save'}
+          disabled={!canSubmit()}
+          onClick={() => onSave(password)}
+          waiting={props.waitingForResponse}
+        />
+      }
+    >
+      <Kb.Box2
+        alignItems={Kb.Styles.isTablet ? undefined : 'center'}
+        direction="vertical"
+        fullWidth={true}
+        flex={1}
+        padding="small"
+        style={styles.container}
+      >
+        <Kb.Text type="Body" style={styles.bodyText} center={true}>
+          A password is required for you to sign out and sign back in.
+        </Kb.Text>
+        <Kb.RoundedBox side="top">
+          <Kb.Input3
+            placeholder="New password"
+            secureTextEntry={!showTyping}
+            keyboardType={keyboardType}
+            value={password}
+            onChangeText={handlePasswordChange}
+            hideBorder={true}
+            testID={TestIDs.SETTINGS_NEW_PASSWORD_INPUT}
+          />
+        </Kb.RoundedBox>
+        <Kb.RoundedBox side="bottom">
+          <Kb.Input3
+            placeholder="Confirm password"
+            secureTextEntry={!showTyping}
+            keyboardType={keyboardType}
+            value={passwordConfirm}
+            onChangeText={handlePasswordConfirmChange}
+            onEnterKeyDown={() => {
+              if (canSubmit()) {
+                onSave(password)
+              }
+            }}
+            hideBorder={true}
+            testID={TestIDs.SETTINGS_CONFIRM_PASSWORD_INPUT}
+          />
+        </Kb.RoundedBox>
+        {typeof hintText === 'string' ? (
+          <Kb.Text style={styles.passwordFormat} type={hintType}>
+            {hintText}
+          </Kb.Text>
+        ) : (
+          hintText
+        )}
+        <Kb.Checkbox
+          label="Show typing"
+          onCheck={() => setShowTyping(s => !s)}
+          checked={showTyping || !!props.showTyping}
+          style={styles.checkbox}
+        />
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      bodyText: {
+        paddingBottom: Kb.Styles.globalMargins.small,
+      },
+      checkbox: {
+        paddingBottom: Kb.Styles.globalMargins.tiny,
+        paddingRight: Kb.Styles.globalMargins.small,
+        paddingTop: Kb.Styles.globalMargins.small,
+        width: '100%',
+      },
+      container: {
+        backgroundColor: theme.blueGrey,
+      },
+      passwordFormat: {
+        alignSelf: 'flex-start',
+        marginTop: Kb.Styles.globalMargins.xtiny,
+      },
+    }) as const
+)
+
+export const useSubmitNewPassword = (thenLogout: boolean) => {
+  const [error, setError] = React.useState('')
+  const waitingForResponse = C.Waiting.useAnyWaiting(C.waitingKeySettingsGeneric)
+  const navigateUp = C.Router2.navigateUp
+  const requestLogout = useRequestLogout()
+  const submitNewPassword = C.useRPC(T.RPCGen.accountPassphraseChangeRpcPromise)
+
+  const onSave = (password: string) => {
+    setError('')
+    submitNewPassword(
+      [
+        {
+          force: true,
+          oldPassphrase: '',
+          passphrase: password,
+        },
+        C.waitingKeySettingsGeneric,
+      ],
+      () => {
+        if (thenLogout) {
+          requestLogout()
+        }
+        navigateUp()
+      },
+      err => {
+        setError(err.desc)
+      }
+    )
+  }
+
+  return {error, onSave, waitingForResponse}
+}
+
+const Container = () => {
+  const {randomPW} = useRandomPWState()
+  const navigation = useNavigation()
+  const saveLabel = randomPW ? 'Create password' : 'Save'
+  const {error, onSave, waitingForResponse} = useSubmitNewPassword(false)
+  const title = randomPW === undefined ? 'Password' : randomPW ? 'Set a password' : 'Change password'
+
+  React.useEffect(() => {
+    navigation.setOptions({title})
+  }, [navigation, title])
+
+  const {data: hasPGPKeyOnServer} = useRPCLoad(T.RPCGen.accountHasServerKeysRpcPromise, [undefined], {
+    map: ({hasServerKeys}) => hasServerKeys,
+  })
+
+  const props = {
+    error,
+    hasPGPKeyOnServer,
+    onSave,
+    saveLabel,
+    waitingForResponse,
+  }
+  return <UpdatePassword {...props} />
+}
+
+export default Container

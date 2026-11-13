@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build darwin
+//go:build darwin
 
 package launchd
 
@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/keybase/client/go/libkb"
 )
@@ -101,7 +102,7 @@ func (s Service) Start(wait time.Duration) error {
 	}
 
 	if wait > 0 {
-		status, waitErr := s.WaitForStatus(wait, 500*time.Millisecond)
+		status, waitErr := s.WaitForStatus(wait, 100*time.Millisecond)
 		if waitErr != nil {
 			return waitErr
 		}
@@ -117,10 +118,15 @@ func (s Service) Start(wait time.Duration) error {
 // HasPlist returns true if service has plist installed
 func (s Service) HasPlist() bool {
 	plistDest := s.plistDestination()
-	if _, err := os.Stat(plistDest); err == nil {
-		return true
+	if _, err := os.Stat(plistDest); os.IsNotExist(err) {
+		s.log.Info("HasPlist: %s does not exist", plistDest)
+		return false
+	} else if err != nil {
+		s.log.Info("HasPlist: %s stat error: %s", plistDest, err)
+		return false
 	}
-	return false
+
+	return true
 }
 
 func exitStatus(err error) int {
@@ -137,13 +143,13 @@ func exitStatus(err error) int {
 // If false, nil is returned it means there was nothing to stop.
 func (s Service) Stop(wait time.Duration) (bool, error) {
 	// We stop by removing the job. This works for non-demand and demand jobs.
-	output, err := exec.Command("/bin/launchctl", "remove", s.label).CombinedOutput()
+	output, err := exec.Command("/bin/launchctl", "remove", s.label).CombinedOutput() //nolint:gosec // G204: launchctl with service label from config
 	s.log.Debug("Output (launchctl remove): %s", string(output))
 	if err != nil {
 		exitStatus := exitStatus(err)
 		// Exit status 3 on remove means there was no job to remove
 		if exitStatus == 3 {
-			s.log.Debug("Nothing to stop (%s)", s.label)
+			s.log.Info("Nothing to stop (%s)", s.label)
 			return false, nil
 		}
 		return false, fmt.Errorf("Error removing via launchctl: %s", err)
@@ -188,18 +194,15 @@ func waitForStatus(wait time.Duration, delay time.Duration, fn loadStatusFn) (*S
 	defer ticker.Stop()
 	resultChan := make(chan serviceStatusResult, 1)
 	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				status, err := fn()
-				if err != nil {
-					resultChan <- serviceStatusResult{status: nil, err: err}
-					return
-				}
-				if status != nil && status.HasRun() {
-					resultChan <- serviceStatusResult{status: status, err: nil}
-					return
-				}
+		for range ticker.C {
+			status, err := fn()
+			if err != nil {
+				resultChan <- serviceStatusResult{status: nil, err: err}
+				return
+			}
+			if status != nil && status.HasRun() {
+				resultChan <- serviceStatusResult{status: status, err: nil}
+				return
 			}
 		}
 	}()
@@ -223,18 +226,15 @@ func waitForExit(wait time.Duration, delay time.Duration, fn loadStatusFn) error
 	defer ticker.Stop()
 	errChan := make(chan error, 1)
 	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				status, err := fn()
-				if err != nil {
-					errChan <- err
-					return
-				}
-				if status == nil || !status.IsRunning() {
-					errChan <- nil
-					return
-				}
+		for range ticker.C {
+			status, err := fn()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if status == nil || !status.IsRunning() {
+				errChan <- nil
+				return
 			}
 		}
 	}()
@@ -252,28 +252,88 @@ func (s Service) Install(p Plist, wait time.Duration) error {
 	return s.install(p, wait)
 }
 
-func (s Service) savePlist(p Plist) error {
-	plistDest := s.plistDestination()
-
-	if _, ferr := os.Stat(p.binPath); os.IsNotExist(ferr) {
-		return fmt.Errorf("%s doesn't exist", p.binPath)
+func (s Service) checkPlistPaths(p Plist) error {
+	if err := libkb.CanExec(p.binPath); err != nil {
+		s.log.Info("cannot exec binPath %s: %s", p.binPath, err)
+		return err
 	}
 
-	plist := p.plistXML()
+	if p.logPath != "" {
+		// make sure the log directory is writable
+		logDir := filepath.Dir(p.logPath)
+		fi, err := os.Stat(logDir)
+		if err != nil {
+			s.log.Info("log directory %q stat error: %s", logDir, err)
+			return err
+		}
+		if !fi.IsDir() {
+			s.log.Info("log directory %q is not a directory", logDir)
+			return fmt.Errorf("plist logPath error: not a directory %q (full logPath = %q)", logDir, p.logPath)
+		}
+
+		if !writable(logDir) {
+			s.log.Info("log directory %q is not writable by current user", logDir)
+			return fmt.Errorf("log directory %q is not writable by current user (full logPath = %q)", logDir, p.logPath)
+		}
+
+		if otherWritable(logDir) {
+			s.log.Info("warning: log directory %q is writable by anyone", logDir)
+		}
+
+		// log directory looks ok
+		s.log.Info("log directory %q is writable by current user", logDir)
+
+		// make sure the log file is writable if it exists
+		_, err = os.Stat(p.logPath)
+		if err == nil {
+			if !writable(p.logPath) {
+				s.log.Info("log path %q exists but isn't writable by current user", p.logPath)
+				return fmt.Errorf("log path %q exists but isn't writable by current user", p.logPath)
+			}
+			s.log.Info("log path %q exists and is writable by current user", p.logPath)
+		} else if os.IsNotExist(err) {
+			s.log.Info("log path file %q doesn't exist yet (should be ok)", p.logPath)
+		} else {
+			s.log.Info("unexpected stat error on %q: %s", p.logPath, err)
+			return err
+		}
+	}
 
 	// Plist directory (~/Library/LaunchAgents/) might not exist on clean OS installs
 	// See GH issue: https://github.com/keybase/client/pull/1399#issuecomment-164810645
-	if err := libkb.MakeParentDirs(plistDest); err != nil {
+	plistDest := s.plistDestination()
+	if err := libkb.MakeParentDirs(s.log, plistDest); err != nil {
+		s.log.Info("error making parent directories for %s: %s", plistDest, err)
 		return err
 	}
 
-	s.log.Info("Saving %s", plistDest)
-	file := libkb.NewFile(plistDest, []byte(plist), 0644)
-	if err := file.Save(s.log); err != nil {
-		return err
+	plistDir := filepath.Dir(plistDest)
+	if !writable(plistDir) {
+		s.log.Info("plist destination %q is not writable by current user", plistDir)
+		return fmt.Errorf("plist destination dir %q is not writable by current user (full filename = %q)", plistDir, plistDest)
 	}
+
+	if otherWritable(plistDir) {
+		s.log.Info("warning: plist destination %q is writable by anyone", plistDir)
+	}
+
+	s.log.Info("paths in plist look ok and have valid permissions")
 
 	return nil
+}
+
+func (s Service) savePlist(p Plist) error {
+	if err := s.checkPlistPaths(p); err != nil {
+		return err
+	}
+
+	plistDest := s.plistDestination()
+
+	plist := p.plistXML()
+
+	s.log.Info("Saving %s", plistDest)
+	file := libkb.NewFile(plistDest, []byte(plist), 0o644)
+	return file.Save(s.log)
 }
 
 func (s Service) install(p Plist, wait time.Duration) error {
@@ -309,7 +369,7 @@ func ListServices(filters []string) (services []Service, err error) {
 	if _, derr := os.Stat(launchAgentDir); os.IsNotExist(derr) {
 		return
 	}
-	files, err := ioutil.ReadDir(launchAgentDir)
+	files, err := os.ReadDir(launchAgentDir)
 	if err != nil {
 		return
 	}
@@ -514,14 +574,6 @@ func launchdHomeDir() string {
 	return currentUser.HomeDir
 }
 
-func ensureDirectoryExists(dir string) error {
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		err = os.MkdirAll(dir, 0700)
-		return err
-	}
-	return nil
-}
-
 // Check if plist matches plist at path
 func (p Plist) Check(path string) (bool, error) {
 	if p.binPath == "" {
@@ -533,7 +585,7 @@ func (p Plist) Check(path string) (bool, error) {
 		return false, nil
 	}
 
-	buf, err := ioutil.ReadFile(path)
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
 	}
@@ -544,6 +596,20 @@ func (p Plist) Check(path string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func (p Plist) Env() []string {
+	var env []string
+	for _, envVar := range p.envVars {
+		env = append(env, fmt.Sprintf("%s=%s", envVar.key, envVar.value))
+	}
+	return env
+}
+
+func (p Plist) FallbackCommand() *exec.Cmd {
+	cmd := exec.Command(p.binPath, p.args...) //nolint:gosec // G204: Binary path and args from plist config for launchd fallback
+	cmd.Env = append(os.Environ(), p.Env()...)
+	return cmd
 }
 
 // TODO Use go-plist library
@@ -613,13 +679,25 @@ func (p Plist) plistXML() string {
 
 // Log is the logging interface for this package
 type Log interface {
-	Debug(s string, args ...interface{})
-	Info(s string, args ...interface{})
-	Errorf(s string, args ...interface{})
+	Debug(s string, args ...any)
+	Info(s string, args ...any)
+	Errorf(s string, args ...any)
 }
 
 type emptyLog struct{}
 
-func (l emptyLog) Debug(s string, args ...interface{})  {}
-func (l emptyLog) Info(s string, args ...interface{})   {}
-func (l emptyLog) Errorf(s string, args ...interface{}) {}
+func (l emptyLog) Debug(s string, args ...any)  {}
+func (l emptyLog) Info(s string, args ...any)   {}
+func (l emptyLog) Errorf(s string, args ...any) {}
+
+func writable(path string) bool {
+	return unix.Access(path, unix.W_OK) == nil
+}
+
+func otherWritable(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & 0o002) != 0
+}

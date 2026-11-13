@@ -1,0 +1,221 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import {PerfProfiler} from '@/perf/react-profiler'
+import Banner from '../bottom-banner'
+import InputArea from '../input-area/container'
+import InvitationToBlock from '@/chat/blocking/invitation-to-block'
+import ListArea from '../list-area'
+import PinnedMessage, {usePinnedMessageShown} from '../pinned-message'
+import ThreadLoadStatus from '../load-status'
+import {useConversationThreadID, useThreadMeta} from '../thread-context'
+import {useConversationThreadCloseSearch, useConversationThreadToggleSearch} from '../thread-navigation'
+import {useThreadSearchRoute} from '../thread-search-route'
+import {indefiniteArticle} from '@/util/string'
+import {useConversationAttachmentActions} from '../attachment-actions'
+import {readImageFromPaste} from '@/util/clipboard.desktop'
+import ThreadSearch from '../search'
+import '../conversation.css'
+import {PortalHost} from '@/common-adapters/portal.native'
+import {useSafeAreaInsets, useSafeAreaFrame} from 'react-native-safe-area-context'
+import {ComposerProvider} from '../composer-viewport-context'
+import {composerStickyOffset} from '../composer-geometry'
+import {KeyboardStickyView, useReanimatedKeyboardAnimation} from 'react-native-keyboard-controller'
+import {HeaderHeightContext} from '@react-navigation/elements'
+import logger from '@/logger'
+
+const Offline = () => {
+  const styles = useStyles()
+  return (
+    <Kb.Banner color="grey" small={true} style={styles.offline}>
+      {"Couldn't load all chat messages due to network connectivity. Retrying..."}
+    </Kb.Banner>
+  )
+}
+
+const LoadingLine = () => {
+  const conversationIDKey = useConversationThreadID()
+  const showLoader = C.Waiting.useAnyWaiting([
+    C.waitingKeyChatThreadLoad(conversationIDKey),
+    C.waitingKeyChatInboxSyncStarted,
+  ])
+  return showLoader ? <Kb.LoadingLine /> : null
+}
+
+const DesktopConversation = function DesktopConversation() {
+  const desktopStyles = useDesktopStyles()
+  const conversationIDKey = useConversationThreadID()
+  const navigateAppend = C.Router2.navigateAppend
+  const onAttach = (paths: Array<string>) => {
+    const pathAndOutboxIDs = paths.map(p => ({path: p}))
+    navigateAppend({
+      name: 'chatAttachmentGetTitles',
+      params: {conversationIDKey, pathAndOutboxIDs},
+    })
+  }
+  const showThreadSearch = !!useThreadSearchRoute()
+  const pinnedMessageShown = usePinnedMessageShown()
+  const {cannotWrite, minWriterRole, offline: threadLoadedOffline} = useThreadMeta(
+    C.useShallow(m => ({cannotWrite: m.cannotWrite, minWriterRole: m.minWriterRole, offline: m.offline}))
+  )
+  const dragAndDropRejectReason = cannotWrite
+    ? `You must be at least ${indefiniteArticle(minWriterRole)} ${minWriterRole} to post.`
+    : undefined
+  const {pasteAttachment} = useConversationAttachmentActions()
+  const onPaste = (e: React.ClipboardEvent) => {
+    readImageFromPaste(e)
+      .then(clipboardData => {
+        if (clipboardData) {
+          pasteAttachment(clipboardData)
+        }
+      })
+      .catch(() => {})
+  }
+  const toggleThreadSearch = useConversationThreadToggleSearch()
+  const closeThreadSearch = useConversationThreadCloseSearch()
+  const onToggleThreadSearch = () => {
+    if (showThreadSearch) {
+      closeThreadSearch()
+    } else {
+      toggleThreadSearch()
+    }
+  }
+  Kb.useHotKey('mod+f', onToggleThreadSearch)
+
+  return (
+    <PerfProfiler id="Conversation">
+      <div
+        className="conversation"
+        style={desktopStyles.container}
+        onPaste={onPaste}
+        key={conversationIDKey}
+      >
+        <Kb.DragAndDrop
+          onAttach={cannotWrite ? undefined : onAttach}
+          fullHeight={true}
+          fullWidth={true}
+          rejectReason={dragAndDropRejectReason}
+        >
+          {threadLoadedOffline && <Offline />}
+          <Kb.Box2 direction="vertical" fullWidth={true} fullHeight={true} flex={1} relative={true}>
+            <ListArea />
+            <Kb.Box2 direction="vertical" fullWidth={true} style={desktopStyles.overlayTop}>
+              <ThreadLoadStatus />
+              {pinnedMessageShown && <PinnedMessage />}
+            </Kb.Box2>
+            {showThreadSearch && <ThreadSearch style={desktopStyles.threadSearchStyle} />}
+            <LoadingLine />
+          </Kb.Box2>
+          <InvitationToBlock />
+          <Banner />
+          <InputArea />
+        </Kb.DragAndDrop>
+      </div>
+    </PerfProfiler>
+  )
+}
+
+const NativeConversation = function NativeConversation() {
+  const styles = useStyles()
+  type LayoutEvent = {nativeEvent: {layout: {height: number}}}
+
+  const [measuredHeight, setMeasuredHeight] = React.useState(0)
+  // measure the fixed-height outer container, not the flex list area: the list
+  // shrinks as the input expands, so measuring it makes the expand animation
+  // chase a moving target
+  const onContentLayout = (e: LayoutEvent) => {
+    setMeasuredHeight(e.nativeEvent.layout.height)
+  }
+
+  const conversationIDKey = useConversationThreadID()
+  logger.info(`Conversation: rendering convID: ${conversationIDKey}`)
+
+  const insets = useSafeAreaInsets()
+  // the navigator reports the header's real measured height (top inset included); guessing it
+  // sizes this box wrong, which drags the composer off the bottom of its screen slot and leaves
+  // a gap under the suggestion popup (that popup anchors to the window, not to this box)
+  const headerHeight = React.useContext(HeaderHeightContext) ?? insets.top + (Kb.Styles.isTablet ? 115 : 44)
+  const windowHeight = useSafeAreaFrame().height
+  const bottomInset = insets.bottom
+  const {height: keyboardHeight, progress: keyboardProgress} = useReanimatedKeyboardAnimation()
+  const stickyOffset = React.useMemo(() => composerStickyOffset(bottomInset), [bottomInset])
+  const height = windowHeight - headerHeight
+
+  const safeStyle = {height, maxHeight: height, minHeight: height}
+
+  const threadLoadedOffline = useThreadMeta(m => m.offline)
+  const pinnedMessageShown = usePinnedMessageShown()
+
+  return (
+    <PerfProfiler id="Conversation">
+      <ComposerProvider
+        bottomInset={bottomInset}
+        keyboardHeight={keyboardHeight}
+        keyboardProgress={keyboardProgress}
+        measuredHeight={measuredHeight}
+      >
+        <Kb.Box2
+          direction="vertical"
+          fullWidth={true}
+          fullHeight={true}
+          style={safeStyle}
+          relative={true}
+          onLayout={onContentLayout}
+        >
+          {threadLoadedOffline && <Offline />}
+          <Kb.Box2
+            direction="vertical"
+            flex={1}
+            fullWidth={true}
+            key={conversationIDKey}
+            relative={true}
+            style={styles.whiteBackground}
+          >
+            <ThreadLoadStatus />
+            {pinnedMessageShown && <PinnedMessage />}
+            <ListArea />
+            <LoadingLine />
+          </Kb.Box2>
+          <KeyboardStickyView offset={stickyOffset}>
+            <Kb.Box2 direction="vertical" fullWidth={true} style={styles.whiteBackground}>
+              <InvitationToBlock />
+              <Banner />
+              <InputArea />
+            </Kb.Box2>
+          </KeyboardStickyView>
+          <PortalHost name="convOverlay" />
+        </Kb.Box2>
+      </ComposerProvider>
+    </PerfProfiler>
+  )
+}
+
+const useDesktopStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      container: {
+        ...Kb.Styles.globalStyles.flexBoxColumn,
+        flex: 1,
+        position: 'relative',
+      },
+      overlayTop: {
+        left: 0,
+        position: 'absolute' as const,
+        top: 0,
+      },
+      threadSearchStyle: {
+        position: 'absolute' as const,
+        top: 0,
+      },
+    }) as const
+)
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      offline: {padding: Kb.Styles.globalMargins.xxtiny},
+      whiteBackground: {backgroundColor: theme.white},
+    }) as const
+)
+
+export default isMobile ? NativeConversation : DesktopConversation

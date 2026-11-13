@@ -1,0 +1,2176 @@
+/** @jest-environment jsdom */
+/// <reference types="jest" />
+import * as Common from '@/constants/chat/common'
+import * as Message from '@/constants/chat/message'
+import * as Meta from '@/constants/chat/meta'
+import * as T from '@/constants/types'
+import HiddenString from '@/util/hidden-string'
+import {act, cleanup, renderHook} from '@testing-library/react'
+import type * as React from 'react'
+import {metasReceived, participantInfoReceived} from '@/chat/inbox/metadata'
+import {routeChatNotification} from '@/chat/notification-router'
+import {deliverThreadNotifications} from '@/chat/notification-registry'
+import {useConfigState} from '@/stores/config'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useShellState} from '@/stores/shell'
+import {resetAllStores} from '@/util/zustand'
+import {navigationWrapper} from '@/test/navigation'
+import {
+  ConversationThreadProvider,
+  LiveConversationThreadProvider,
+  useConversationThreadActions,
+  useConversationThreadJumpToRecent,
+  useConversationThreadLoadMoreMessages,
+  useConversationThreadLoadMessagesCentered,
+  useConversationThreadLoadOlderMessagesDueToScroll,
+  useConversationThreadMarkThreadAsRead,
+  useConversationThreadMessage,
+  useConversationThreadNotifications,
+  useConversationThreadSelector,
+  useConversationThreadStore,
+} from './thread-context'
+import {ConversationThreadLoadStatusProvider} from './thread-load-status-context'
+import {toggleReaction} from './message-commands'
+import {useConversationParticipants} from './data-hooks'
+import {microtasks} from '@/test/flush'
+
+const convID = T.Chat.conversationIDToKey(new Uint8Array([1, 2, 3, 4]))
+const emptyStringSet = new Set<string>()
+
+const textAt = (n: number) =>
+  Message.makeMessageText({
+    author: 'alice',
+    conversationIDKey: convID,
+    id: T.Chat.numberToMessageID(n),
+    ordinal: T.Chat.numberToOrdinal(n),
+    text: new HiddenString(`message ${n}`),
+    timestamp: 100,
+  })
+
+const makeTextMessage = () =>
+  Message.makeMessageText({
+    author: 'alice',
+    conversationIDKey: convID,
+    id: T.Chat.numberToMessageID(301),
+    ordinal: T.Chat.numberToOrdinal(301),
+    outboxID: T.Chat.stringToOutboxID('outbox-1'),
+    text: new HiddenString('stale message'),
+    timestamp: 100,
+  })
+
+const makeAttachmentMessage = (override?: Partial<T.Chat.MessageAttachment>) =>
+  Message.makeMessageAttachment({
+    author: 'alice',
+    conversationIDKey: convID,
+    id: T.Chat.numberToMessageID(701),
+    ordinal: T.Chat.numberToOrdinal(701),
+    outboxID: T.Chat.stringToOutboxID('attachment-outbox'),
+    timestamp: 100,
+    title: 'attachment',
+    transferProgress: 0,
+    ...override,
+  })
+
+const makeValidTextUIMessage = (
+  serverMsgID: T.Chat.MessageID,
+  text: string,
+  outboxID = ''
+): T.RPCChat.UIMessage => ({
+  state: T.RPCChat.MessageUnboxedState.valid,
+  valid: {
+    atMentions: null,
+    bodySummary: text,
+    botUsername: '',
+    channelMention: T.RPCChat.ChannelMention.none,
+    channelNameMentions: null,
+    ctime: 200,
+    decoratedTextBody: null,
+    etime: 0,
+    explodedBy: null,
+    hasPairwiseMacs: false,
+    isCollapsed: false,
+    isDeleteable: true,
+    isEditable: true,
+    isEphemeral: false,
+    isEphemeralExpired: false,
+    messageBody: {
+      messageType: T.RPCChat.MessageType.text,
+      text: {
+        body: text,
+        payments: null,
+        replyTo: null,
+        replyToUID: null,
+        teamMentions: null,
+        userMentions: null,
+      },
+    },
+    messageID: T.Chat.messageIDToNumber(serverMsgID),
+    outboxID,
+    paymentInfos: null,
+    pinnedMessageID: null,
+    reactions: {},
+    replyTo: null,
+    requestInfo: null,
+    senderDeviceID: new Uint8Array([1]),
+    senderDeviceName: 'bob-device',
+    senderDeviceRevokedAt: null,
+    senderDeviceType: 'desktop',
+    senderUID: new Uint8Array([2]),
+    senderUsername: 'bob',
+    superseded: false,
+    unfurls: null,
+  },
+})
+
+const makeIncomingTextMessage = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  serverMsgID: T.Chat.MessageID,
+  text: string
+): T.RPCChat.IncomingMessage => ({
+  conv: null,
+  convID: T.Chat.keyToConversationID(conversationIDKey),
+  desktopNotificationSnippet: '',
+  displayDesktopNotification: false,
+  message: makeValidTextUIMessage(serverMsgID, text),
+  modifiedMessage: null,
+  pagination: null,
+})
+
+const makeIncomingOutboxReaction = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  outboxID: Uint8Array,
+  targetMsgID: T.Chat.MessageID,
+  body: string,
+  decorated = body
+): T.RPCChat.IncomingMessage => ({
+  conv: null,
+  convID: T.Chat.keyToConversationID(conversationIDKey),
+  desktopNotificationSnippet: '',
+  displayDesktopNotification: false,
+  message: {
+    outbox: {
+      body,
+      ctime: 200,
+      decoratedTextBody: decorated,
+      filename: '',
+      isEphemeral: false,
+      messageType: T.RPCChat.MessageType.reaction,
+      ordinal: T.Chat.messageIDToNumber(targetMsgID) + 0.001,
+      outboxID: T.Chat.rpcOutboxIDToOutboxID(outboxID),
+      preview: null,
+      replyTo: null,
+      state: {sending: 0, state: T.RPCChat.OutboxStateType.sending},
+      supersedes: T.Chat.messageIDToNumber(targetMsgID),
+      title: '',
+    },
+    state: T.RPCChat.MessageUnboxedState.outbox,
+  },
+  modifiedMessage: null,
+  pagination: null,
+})
+
+const makeFailedOutboxRecord = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  outboxID: T.Chat.OutboxID
+): T.RPCChat.OutboxRecord =>
+  ({
+    Msg: {},
+    convID: T.Chat.keyToConversationID(conversationIDKey),
+    ctime: 0,
+    identifyBehavior: T.RPCGen.TLFIdentifyBehavior.chatGui,
+    ordinal: 0,
+    outboxID: T.Chat.outboxIDToRpcOutboxID(outboxID),
+    state: {
+      error: {
+        message: 'network fail',
+        typ: T.RPCChat.OutboxErrorType.misc,
+      },
+      state: T.RPCChat.OutboxStateType.error,
+    },
+  }) as T.RPCChat.OutboxRecord
+
+const makeUIPaymentInfo = (): T.RPCChat.UIPaymentInfo =>
+  ({
+    accountID: 'account-id',
+    amountDescription: '1 XLM',
+    delta: T.RPCStellar.BalanceDelta.none,
+    fromUsername: 'alice',
+    issuerDescription: 'Lumens',
+    note: 'payment note',
+    paymentID: 'payment-1',
+    showCancel: false,
+    sourceAmount: '1',
+    sourceAsset: {
+      code: 'XLM',
+      issuer: '',
+      issuerName: 'Lumens',
+      verifiedDomain: '',
+    } as T.RPCStellar.Asset,
+    status: T.RPCStellar.PaymentStatus.completed,
+    statusDescription: 'Completed',
+    statusDetail: '',
+    toUsername: 'bob',
+    worth: '$1.00',
+    worthAtSendTime: '$1.00',
+  }) as T.RPCChat.UIPaymentInfo
+
+const makeUIRequestInfo = (): T.RPCChat.UIRequestInfo => ({
+  amount: '1',
+  amountDescription: '1 USD',
+  asset: null,
+  currency: 'USD',
+  status: T.RPCStellar.RequestStatus.ok,
+  worthAtRequestTime: '$1.00',
+})
+
+// the thread is the conversation on desktop's chat root
+let Nav: ReturnType<typeof navigationWrapper>['wrapper']
+
+const wrapper = ({children}: {children: React.ReactNode}) => (
+  <Nav>
+    <ConversationThreadProvider id={convID}>{children}</ConversationThreadProvider>
+  </Nav>
+)
+
+const nestedSameThreadWrapper = ({children}: {children: React.ReactNode}) => (
+  <Nav>
+    <ConversationThreadProvider id={convID}>
+      <ConversationThreadProvider id={convID}>{children}</ConversationThreadProvider>
+    </ConversationThreadProvider>
+  </Nav>
+)
+
+const liveThreadWrapper = ({children}: {children: React.ReactNode}) => (
+  <Nav>
+    <LiveConversationThreadProvider id={convID}>{children}</LiveConversationThreadProvider>
+  </Nav>
+)
+
+const separatePlainThreadWrapper = ({children}: {children: React.ReactNode}) => (
+  <Nav>
+    <ConversationThreadProvider id={convID}>{children}</ConversationThreadProvider>
+  </Nav>
+)
+
+beforeEach(() => {
+  Nav = navigationWrapper({params: {conversationIDKey: convID}, route: 'chatRoot'}).wrapper
+  useConfigState.setState({loggedIn: true})
+  useCurrentUserState.getState().dispatch.setBootstrap({
+    deviceID: 'device-id',
+    deviceName: 'test-device',
+    uid: 'uid',
+    username: 'alice',
+  })
+  // A conversation the reader has open is localized. readMsgID -1 - the makeConversationMeta
+  // default - means "not known yet", which suppresses mark-read so the true read position survives
+  // long enough for the orange line to be resolved against it.
+  metasReceived(
+    [
+      {
+        ...Meta.makeConversationMeta(),
+        conversationIDKey: convID,
+        readMsgID: T.Chat.numberToMessageID(0),
+      },
+    ],
+    undefined,
+    {force: true}
+  )
+})
+
+afterEach(() => {
+  cleanup()
+  jest.restoreAllMocks()
+  resetAllStores()
+})
+
+test('same-conversation nested providers reuse the outer live thread state', () => {
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(301)),
+    }),
+    {wrapper: nestedSameThreadWrapper}
+  )
+
+  act(() => {
+    result.current.actions.addMessages([makeTextMessage()])
+  })
+
+  expect(result.current.message?.id).toBe(T.Chat.numberToMessageID(301))
+})
+
+test('separate providers do not share thread state', () => {
+  const live = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(301)),
+    }),
+    {wrapper: liveThreadWrapper}
+  )
+  act(() => {
+    live.result.current.actions.addMessages([makeTextMessage()])
+  })
+  expect(live.result.current.message?.id).toBe(T.Chat.numberToMessageID(301))
+
+  const plain = renderHook(() => useConversationThreadMessage(T.Chat.numberToOrdinal(301)), {
+    wrapper: separatePlainThreadWrapper,
+  })
+  expect(plain.result.current).toBeUndefined()
+})
+
+test('mounted thread syncs participant updates received outside its provider', () => {
+  const {result} = renderHook(() => useConversationParticipants(convID), {wrapper})
+  const participantInfo = {
+    all: ['alice', 'helperbot'],
+    contactName: new Map<string, string>(),
+    name: ['alice'],
+  }
+
+  act(() => {
+    participantInfoReceived(convID, participantInfo)
+  })
+
+  expect(result.current.all).toEqual(['alice', 'helperbot'])
+  expect(result.current.name).toEqual(['alice'])
+})
+
+test('centered load clears stale thread state and requests a centered load', async () => {
+  const loadThread = jest
+    .spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener')
+    .mockResolvedValue({offline: false})
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMessagesCentered: useConversationThreadLoadMessagesCentered(),
+      messageOrdinals: useConversationThreadSelector(s => s.messageOrdinals),
+      staleMessage: useConversationThreadMessage(T.Chat.numberToOrdinal(301)),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.addMessages([makeTextMessage()])
+  })
+  expect(result.current.staleMessage?.id).toBe(T.Chat.numberToMessageID(301))
+
+  act(() => {
+    result.current.loadMessagesCentered(T.Chat.numberToMessageID(999), 'flash')
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(result.current.staleMessage).toBeUndefined()
+  expect(result.current.messageOrdinals).toBeUndefined()
+  expect(loadThread).toHaveBeenCalledWith(
+    expect.objectContaining({
+      params: expect.objectContaining({
+        query: expect.objectContaining({
+          messageIDControl: expect.objectContaining({
+            mode: T.RPCChat.MessageIDControlMode.centered,
+            pivot: T.Chat.numberToMessageID(999),
+          }),
+        }),
+      }),
+    })
+  )
+})
+
+test('jumpToRecent reloads recent messages through the mounted thread action', async () => {
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const onThreadLoadStatus = jest.fn()
+  const msgID = T.Chat.numberToMessageID(202)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadStatus']?.({
+      status: {typ: T.RPCChat.UIChatThreadStatusTyp.server},
+    })
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(msgID, 'recent')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadJumpToRecent(), {wrapper})
+
+  act(() => {
+    result.current({onThreadLoadStatus})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(onThreadLoadStatus).toHaveBeenCalledWith(convID, T.RPCChat.UIChatThreadStatusTyp.server)
+  expect(markAsRead).toHaveBeenCalledWith({
+    conversationID: T.Chat.keyToConversationID(convID),
+    forceUnread: false,
+    msgID,
+  })
+})
+
+test('mark-read disabled latest load does not arm active or explicit mark read', async () => {
+  useConfigState.setState({loggedIn: true})
+  useShellState.getState().dispatch.setActive(false)
+  jest
+    .spyOn(Common, 'isUserActivelyLookingAtThisThread')
+    .mockImplementation(() => useShellState.getState().active)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const msgID = T.Chat.numberToMessageID(203)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(msgID, 'search latest')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      markThreadAsRead: useConversationThreadMarkThreadAsRead(),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.loadMoreMessages({allowMarkAsRead: false, reason: 'focused'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+
+  act(() => {
+    useShellState.getState().dispatch.setActive(true)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+
+  act(() => {
+    result.current.markThreadAsRead()
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test('scrollback loads older messages without marking the thread read', async () => {
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(T.Chat.numberToMessageID(201), 'older')],
+        pagination: {last: false, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadOlderMessagesDueToScroll: useConversationThreadLoadOlderMessagesDueToScroll(),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [makeTextMessage()],
+      moreToLoad: true,
+      scrollDirection: 'back',
+    })
+  })
+
+  act(() => {
+    result.current.loadOlderMessagesDueToScroll(1)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test('mounted thread listener applies messagesUpdated for the active conversation', () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  const firstMsgID = T.Chat.numberToMessageID(401)
+  const {result} = renderHook(
+    () => ({
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(401)),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.messagesUpdated,
+            messagesUpdated: {
+              convID: T.Chat.keyToConversationID(convID),
+              updates: [makeValidTextUIMessage(firstMsgID, 'updated')],
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.ordinals).toEqual([T.Chat.numberToOrdinal(401)])
+  expect(result.current.message?.id).toBe(firstMsgID)
+})
+
+// The full jump -> scroll-to-bottom -> stale-reload chain behind normal/container.tsx's
+// allowMarkReadOnLoad. Jumping to a highlighted message mounts the thread with
+// skipThreadLoadOnSelection (the centered load replaces the select-on-mount load) and blocks
+// mark-read. The block is NOT permanent: applyThreadLoad releases it as soon as the user scrolls
+// to the latest message ('forward' with no moreToLoad). The stale reload that follows -
+// ChatThreadsStale fires on every mobile background -> foreground - must then be free to mark the
+// thread read. reloadStaleThread reads allowMarkReadOnLoad through useEffectEvent, i.e. the latest
+// render's value, so a caller that derived it from the one-shot highlight and froze it at `false`
+// would leave the conversation badged unread for as long as the thread stayed mounted.
+const staleThreadUpdate = {
+  payload: {
+    params: {
+      uid: '',
+      updates: [
+        {convID: T.Chat.keyToConversationID(convID), updateType: T.RPCChat.StaleUpdateType.newactivity},
+      ],
+    },
+  },
+  type: 'chat.1.NotifyChat.ChatThreadsStale',
+} as never
+
+const renderJumpedThenScrolledToBottom = (allowMarkReadOnLoad: boolean) => {
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(T.Chat.numberToMessageID(203), 'latest')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadActions(), {
+    wrapper: ({children}: {children: React.ReactNode}) => (
+      <Nav>
+        <ConversationThreadProvider id={convID}>
+          <ConversationThreadLoadStatusProvider
+            allowMarkReadOnLoad={allowMarkReadOnLoad}
+            id={convID}
+            skipThreadLoadOnSelection={true}
+          >
+            {children}
+          </ConversationThreadLoadStatusProvider>
+        </ConversationThreadProvider>
+      </Nav>
+    ),
+  })
+  // jumping to a highlighted message blocks mark-read
+  act(() => {
+    result.current.setMarkReadBlocked(true)
+  })
+  // ...then the user scrolls all the way forward to the latest message, releasing the block
+  act(() => {
+    result.current.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [makeTextMessage()],
+      moreToLoad: false,
+      scrollDirection: 'forward',
+    })
+  })
+  return markAsRead
+}
+
+test('a stale reload after a jump and a scroll to the bottom marks the thread read', async () => {
+  const markAsRead = renderJumpedThenScrolledToBottom(true)
+
+  act(() => {
+    routeChatNotification(staleThreadUpdate)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(markAsRead).toHaveBeenCalledTimes(1)
+})
+
+// The counterfactual: exactly what deriving allowMarkReadOnLoad from the one-shot highlight did.
+test('a stale reload that disallows mark read leaves the thread unread even once the block is gone', async () => {
+  const markAsRead = renderJumpedThenScrolledToBottom(false)
+
+  act(() => {
+    routeChatNotification(staleThreadUpdate)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test('mounted thread listener applies incoming messages for the active conversation', async () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  useConfigState.setState({loggedIn: true})
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const loadedMsgID = T.Chat.numberToMessageID(600)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(loadedMsgID, 'loaded')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const firstMsgID = T.Chat.numberToMessageID(601)
+  const {result} = renderHook(
+    () => ({
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(601)),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'focused'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  markAsRead.mockClear()
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.incomingMessage,
+            incomingMessage: makeIncomingTextMessage(convID, firstMsgID, 'incoming'),
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.ordinals).toEqual([
+    T.Chat.numberToOrdinal(600),
+    T.Chat.numberToOrdinal(601),
+  ])
+  expect(result.current.message?.id).toBe(firstMsgID)
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).toHaveBeenCalledTimes(1)
+  expect(markAsRead).toHaveBeenCalledWith({
+    conversationID: T.Chat.keyToConversationID(convID),
+    forceUnread: false,
+    msgID: firstMsgID,
+  })
+})
+
+test('mounted thread listener applies incoming messages while inactive without marking read', async () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(false)
+  useConfigState.setState({loggedIn: true})
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const firstMsgID = T.Chat.numberToMessageID(602)
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(602)),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [],
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.incomingMessage,
+            incomingMessage: makeIncomingTextMessage(convID, firstMsgID, 'inactive incoming'),
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.ordinals).toEqual([T.Chat.numberToOrdinal(602)])
+  expect(result.current.message?.id).toBe(firstMsgID)
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test('an unlocalized conversation defers mark read until localization lands', async () => {
+  // The post-nuke case. Mark-read reads the newest message out of the window and needs no meta, so
+  // without this it wins the race against localization and destroys the read position before
+  // useOrangeLine can ask for the unreadline against it - the thread then shows no unread divider.
+  useConfigState.setState({loggedIn: true})
+  useShellState.getState().dispatch.setActive(true)
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockImplementation(() => true)
+  metasReceived(
+    [{...Meta.makeConversationMeta(), conversationIDKey: convID}],
+    undefined,
+    {force: true}
+  )
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const msgID = T.Chat.numberToMessageID(605)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(msgID, 'loaded unlocalized')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadLoadMoreMessages(), {wrapper})
+
+  act(() => {
+    result.current({reason: 'tab selected'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+
+  // Localization lands carrying the read position that was there all along.
+  act(() => {
+    metasReceived(
+      [
+        {
+          ...Meta.makeConversationMeta(),
+          conversationIDKey: convID,
+          readMsgID: T.Chat.numberToMessageID(600),
+        },
+      ],
+      undefined,
+      {force: true}
+    )
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).toHaveBeenCalledWith({
+    conversationID: T.Chat.keyToConversationID(convID),
+    forceUnread: false,
+    msgID,
+  })
+})
+
+test('active change marks read after an eligible mounted thread load', async () => {
+  useConfigState.setState({loggedIn: true})
+  useShellState.getState().dispatch.setActive(false)
+  jest
+    .spyOn(Common, 'isUserActivelyLookingAtThisThread')
+    .mockImplementation(() => useShellState.getState().active)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const msgID = T.Chat.numberToMessageID(603)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(msgID, 'loaded inactive')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadLoadMoreMessages(), {wrapper})
+
+  act(() => {
+    result.current({reason: 'tab selected'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+
+  act(() => {
+    useShellState.getState().dispatch.setActive(true)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).toHaveBeenCalledWith({
+    conversationID: T.Chat.keyToConversationID(convID),
+    forceUnread: false,
+    msgID,
+  })
+})
+
+test('a thread still on screen after an account switch does not mark read for the next account', async () => {
+  useConfigState.setState({loggedIn: true})
+  useShellState.getState().dispatch.setActive(false)
+  jest
+    .spyOn(Common, 'isUserActivelyLookingAtThisThread')
+    .mockImplementation(() => useShellState.getState().active)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(T.Chat.numberToMessageID(603), 'loaded inactive')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadLoadMoreMessages(), {wrapper})
+  act(() => {
+    result.current({reason: 'tab selected'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  act(() => {
+    useCurrentUserState.getState().dispatch.setBootstrap({
+      deviceID: 'device-id-2',
+      deviceName: 'test-device-2',
+      uid: 'uid-2',
+      username: 'testuser-mac',
+    })
+    useShellState.getState().dispatch.setActive(true)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test("a screen's thread notifications stop once the thread retires, until it is built for the next account", () => {
+  const heard: Array<string> = []
+  renderHook(
+    () =>
+      useConversationThreadNotifications(notification => {
+        heard.push(notification.type)
+      }),
+    {wrapper}
+  )
+  const commandMarkdown = () =>
+    deliverThreadNotifications([{conversationIDKey: convID, notification: {md: undefined, type: 'commandMarkdown'}}], 'test')
+  act(commandMarkdown)
+  act(() => {
+    // the next account signs in; until React renders again the screen is still registered
+    useCurrentUserState.getState().dispatch.setBootstrap({
+      deviceID: 'device-id-2',
+      deviceName: 'test-device-2',
+      uid: 'uid-2',
+      username: 'testuser-mac',
+    })
+    commandMarkdown()
+  })
+  expect(heard).toEqual(['commandMarkdown'])
+  act(commandMarkdown)
+  expect(heard).toEqual(['commandMarkdown', 'commandMarkdown'])
+})
+
+test('active change does not mark read after a centered thread load', async () => {
+  useConfigState.setState({loggedIn: true})
+  useShellState.getState().dispatch.setActive(false)
+  jest
+    .spyOn(Common, 'isUserActivelyLookingAtThisThread')
+    .mockImplementation(() => useShellState.getState().active)
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const msgID = T.Chat.numberToMessageID(604)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(msgID, 'centered inactive')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(() => useConversationThreadLoadMessagesCentered(), {wrapper})
+
+  act(() => {
+    result.current(msgID, 'flash')
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+
+  act(() => {
+    useShellState.getState().dispatch.setActive(true)
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).not.toHaveBeenCalled()
+})
+
+test('mounted thread listener applies failed outbox messages for the active conversation', () => {
+  const pendingOrdinal = T.Chat.numberToOrdinal(801)
+  const pendingOutboxID = T.Chat.stringToOutboxID('0a0b')
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      message: useConversationThreadMessage(pendingOrdinal),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.addMessages([
+      Message.makeMessageText({
+        author: 'alice',
+        conversationIDKey: convID,
+        ordinal: pendingOrdinal,
+        outboxID: pendingOutboxID,
+        submitState: 'pending',
+        text: new HiddenString('pending'),
+        timestamp: 300,
+      }),
+    ])
+  })
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.failedMessage,
+            failedMessage: {
+              conv: null,
+              isEphemeralPurge: false,
+              outboxRecords: [makeFailedOutboxRecord(convID, pendingOutboxID)],
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.message?.submitState).toBe('failed')
+  expect(result.current.message?.errorReason).toBe('network fail')
+})
+
+test('mounted thread listener ignores messagesUpdated for other conversations', () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  const {result} = renderHook(
+    () => useConversationThreadMessage(T.Chat.numberToOrdinal(501)),
+    {wrapper}
+  )
+  const otherConvID = T.Chat.conversationIDToKey(new Uint8Array([9, 8, 7, 6]))
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.messagesUpdated,
+            messagesUpdated: {
+              convID: T.Chat.keyToConversationID(otherConvID),
+              updates: [makeValidTextUIMessage(T.Chat.numberToMessageID(501), 'ignored')],
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current).toBeUndefined()
+})
+
+test('mounted thread listener ignores incoming messages for other conversations', () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  const {result} = renderHook(
+    () => useConversationThreadMessage(T.Chat.numberToOrdinal(701)),
+    {wrapper}
+  )
+  const otherConvID = T.Chat.conversationIDToKey(new Uint8Array([9, 8, 7, 6]))
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.incomingMessage,
+            incomingMessage: makeIncomingTextMessage(
+              otherConvID,
+              T.Chat.numberToMessageID(701),
+              'ignored'
+            ),
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current).toBeUndefined()
+})
+
+test('mounted thread listener applies reaction updates for the active conversation', async () => {
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  useConfigState.setState({loggedIn: true})
+  const markAsRead = jest
+    .spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise')
+    .mockResolvedValue({offline: false})
+  const targetMsgID = T.Chat.numberToMessageID(301)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(targetMsgID, 'loaded')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      message: useConversationThreadMessage(T.Chat.numberToOrdinal(301)),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'focused'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+  markAsRead.mockClear()
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.reactionUpdate,
+            reactionUpdate: {
+              convID: T.Chat.keyToConversationID(convID),
+              reactionUpdates: [
+                {
+                  reactions: {
+                    reactions: {
+                      ':+1:': {
+                        decorated: ':+1:',
+                        users: {
+                          bob: {
+                            ctime: 5,
+                            reactionMsgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(99)),
+                          },
+                        },
+                      },
+                    },
+                  },
+                  targetMsgID: T.Chat.messageIDToNumber(targetMsgID),
+                },
+              ],
+              userReacjis: {skinTone: T.RPCGen.ReacjiSkinTone.none, topReacjis: null},
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(Message.getReactionOrder(result.current.message?.reactions ?? new Map())).toEqual([':+1:'])
+  await act(async () => {
+    await microtasks()
+  })
+  expect(markAsRead).toHaveBeenCalledWith({
+    conversationID: T.Chat.keyToConversationID(convID),
+    forceUnread: false,
+    msgID: targetMsgID,
+  })
+})
+
+test('loaded focus refresh does not overwrite newer streamed reaction updates', async () => {
+  const targetMsgID = T.Chat.numberToMessageID(301)
+  const targetOrdinal = T.Chat.numberToOrdinal(301)
+  let incomingCallMap:
+    | Parameters<typeof T.RPCChat.localGetThreadNonblockRpcListener>[0]['incomingCallMap']
+    | undefined
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    incomingCallMap = p.incomingCallMap
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      message: useConversationThreadMessage(targetOrdinal),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: true,
+      messages: [makeTextMessage()],
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'tab selected'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(incomingCallMap).toBeDefined()
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.reactionUpdate,
+            reactionUpdate: {
+              convID: T.Chat.keyToConversationID(convID),
+              reactionUpdates: [
+                {
+                  reactions: {
+                    reactions: {
+                      ':+1:': {
+                        decorated: ':+1:',
+                        users: {
+                          alice: {
+                            ctime: 300,
+                            reactionMsgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(99)),
+                          },
+                        },
+                      },
+                    },
+                  },
+                  targetMsgID: T.Chat.messageIDToNumber(targetMsgID),
+                },
+              ],
+              userReacjis: {skinTone: T.RPCGen.ReacjiSkinTone.none, topReacjis: null},
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.message?.reactions?.get(':+1:')?.users.map(u => u.username)).toEqual(['alice'])
+
+  act(() => {
+    incomingCallMap?.['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(targetMsgID, 'stale server copy')],
+        pagination: {last: true, next: '', num: 20, previous: ''},
+      }),
+    })
+  })
+
+  expect(result.current.message?.reactions?.get(':+1:')?.users.map(u => u.username)).toEqual(['alice'])
+})
+
+test('toggleMessageReaction overlays locally without mutating server reactions', async () => {
+  const targetMsgID = T.Chat.numberToMessageID(301)
+  const targetOrdinal = T.Chat.numberToOrdinal(301)
+  const postReaction = jest
+    .spyOn(T.RPCChat, 'localPostReactionNonblockRpcPromise')
+    .mockImplementation(async p => {
+      const outboxID = await Promise.resolve(p.outboxID ?? new Uint8Array())
+      return {
+        identifyFailures: null,
+        outboxID,
+        rateLimits: null,
+      }
+    })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      message: useConversationThreadMessage(targetOrdinal),
+      store: useConversationThreadStore(),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [makeTextMessage()],
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    toggleReaction({conversationIDKey: convID, ordinal: targetOrdinal, thread: result.current.actions}, ':+1:')
+  })
+
+  expect(result.current.message?.reactions?.get(':+1:')?.users.map(u => u.username)).toEqual(['alice'])
+  expect(result.current.store.getState().messageMap.get(targetOrdinal)?.reactions).toBeUndefined()
+  await act(async () => {
+    await microtasks()
+  })
+
+  const outboxID = postReaction.mock.calls[0]?.[0].outboxID
+  expect(outboxID).toBeDefined()
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.incomingMessage,
+            incomingMessage: makeIncomingOutboxReaction(
+              convID,
+              outboxID!,
+              targetMsgID,
+              ':+1:',
+              'decorated-plus-one'
+            ),
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.message?.reactions?.get(':+1:')?.users.map(u => u.username)).toEqual(['alice'])
+  expect(result.current.message?.reactions?.get(':+1:')?.decorated).toBe('decorated-plus-one')
+  expect(result.current.store.getState().messageMap.get(targetOrdinal)?.reactions).toBeUndefined()
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          activity: {
+            activityType: T.RPCChat.ChatActivityType.reactionUpdate,
+            reactionUpdate: {
+              convID: T.Chat.keyToConversationID(convID),
+              reactionUpdates: [
+                {
+                  reactions: {
+                    reactions: {
+                      ':+1:': {
+                        decorated: 'server-plus-one',
+                        users: {
+                          alice: {
+                            ctime: 300,
+                            reactionMsgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(99)),
+                          },
+                        },
+                      },
+                    },
+                  },
+                  targetMsgID: T.Chat.messageIDToNumber(targetMsgID),
+                },
+              ],
+              userReacjis: {skinTone: T.RPCGen.ReacjiSkinTone.none, topReacjis: null},
+            },
+          },
+        },
+      },
+      type: 'chat.1.NotifyChat.NewChatActivity',
+    } as never)
+  })
+
+  expect(result.current.store.getState().optimisticReactionMap.size).toBe(0)
+  expect(result.current.store.getState().messageMap.get(targetOrdinal)?.reactions?.get(':+1:')).toEqual({
+    decorated: 'server-plus-one',
+    users: [{timestamp: 300, username: 'alice'}],
+  })
+})
+
+test('mounted thread listener applies request and payment decorators for the active conversation', () => {
+  const {result} = renderHook(
+    () => ({
+      accountsInfoMap: useConversationThreadSelector(s => s.accountsInfoMap),
+      paymentInfo: useConversationThreadSelector(s => s.paymentStatusMap.get('payment-1')),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          convID: T.Chat.keyToConversationID(convID),
+          info: makeUIRequestInfo(),
+          msgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(901)),
+          uid: new Uint8Array([1]),
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatRequestInfo',
+    } as never)
+    routeChatNotification({
+      payload: {
+        params: {
+          convID: T.Chat.keyToConversationID(convID),
+          info: makeUIPaymentInfo(),
+          msgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(902)),
+          uid: new Uint8Array([1]),
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatPaymentInfo',
+    } as never)
+  })
+
+  expect(result.current.accountsInfoMap.get(T.Chat.numberToMessageID(901))?.type).toBe('requestInfo')
+  expect(result.current.accountsInfoMap.get(T.Chat.numberToMessageID(902))?.type).toBe('paymentInfo')
+  expect(result.current.paymentInfo?.status).toBe('completed')
+})
+
+test('mounted thread listener applies unfurl prompts and coin flip status for the active conversation', () => {
+  const gameID = 'flip-1'
+  const {result} = renderHook(
+    () => ({
+      flipStatus: useConversationThreadSelector(s => s.flipStatusMap.get(gameID)),
+      promptDomains: useConversationThreadSelector(
+        s => s.unfurlPrompt.get(T.Chat.numberToMessageID(903)) ?? emptyStringSet
+      ),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          convID: T.Chat.keyToConversationID(convID),
+          domain: 'keybase.io',
+          msgID: T.Chat.messageIDToNumber(T.Chat.numberToMessageID(903)),
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatPromptUnfurl',
+    } as never)
+    routeChatNotification({
+      payload: {
+        params: {
+          statuses: [
+            {
+              commitmentVisualization: '',
+              convID,
+              errorInfo: null,
+              gameID,
+              participants: [],
+              phase: T.RPCChat.UICoinFlipPhase.commitment,
+              progressText: 'Collecting commitments',
+              resultInfo: null,
+              resultText: '',
+              revealVisualization: '',
+            },
+          ],
+        },
+      },
+      type: 'chat.1.chatUi.chatCoinFlipStatus',
+    } as never)
+  })
+
+  expect([...result.current.promptDomains]).toEqual(['keybase.io'])
+  expect(result.current.flipStatus?.gameID).toBe(gameID)
+})
+
+test('mounted thread listener applies typing updates for the active conversation', () => {
+  const {result} = renderHook(() => useConversationThreadSelector(s => s.typing), {wrapper})
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          typingUpdates: [
+            {
+              convID: T.Chat.keyToConversationID(convID),
+              typers: [{deviceID: 'device-id', uid: 'uid', username: 'bob'}],
+            },
+          ],
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatTypingUpdate',
+    } as never)
+  })
+
+  expect([...result.current]).toEqual(['bob'])
+})
+
+test('mounted thread listener applies attachment download and upload progress', () => {
+  const downloadMessage = makeAttachmentMessage({
+    id: T.Chat.numberToMessageID(701),
+    ordinal: T.Chat.numberToOrdinal(701),
+  })
+  const uploadOutboxID = T.Chat.stringToOutboxID('0c0d')
+  const uploadRpcOutboxID = T.Chat.outboxIDToRpcOutboxID(uploadOutboxID)
+  const uploadMessage = makeAttachmentMessage({
+    id: T.Chat.numberToMessageID(0),
+    ordinal: T.Chat.numberToOrdinal(702),
+    outboxID: uploadOutboxID,
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      downloadMessage: useConversationThreadMessage(downloadMessage.ordinal),
+      uploadMessage: useConversationThreadMessage(uploadMessage.ordinal),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.addMessages([downloadMessage, uploadMessage])
+  })
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          bytesComplete: 25,
+          bytesTotal: 100,
+          convID: T.Chat.keyToConversationID(convID),
+          msgID: T.Chat.messageIDToNumber(downloadMessage.id),
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatAttachmentDownloadProgress',
+    } as never)
+    routeChatNotification({
+      payload: {
+        params: {
+          bytesComplete: 30,
+          bytesTotal: 60,
+          convID: T.Chat.keyToConversationID(convID),
+          outboxID: uploadRpcOutboxID,
+          uid: 'uid',
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatAttachmentUploadProgress',
+    } as never)
+  })
+
+  expect(
+    result.current.downloadMessage?.type === 'attachment'
+      ? result.current.downloadMessage.transferProgress
+      : undefined
+  ).toBe(0.25)
+  expect(
+    result.current.downloadMessage?.type === 'attachment'
+      ? result.current.downloadMessage.transferState
+      : undefined
+  ).toBe('downloading')
+  expect(
+    result.current.uploadMessage?.type === 'attachment'
+      ? result.current.uploadMessage.transferProgress
+      : undefined
+  ).toBe(0.5)
+  expect(
+    result.current.uploadMessage?.type === 'attachment' ? result.current.uploadMessage.transferState : undefined
+  ).toBe('uploading')
+
+  act(() => {
+    routeChatNotification({
+      payload: {
+        params: {
+          convID: T.Chat.keyToConversationID(convID),
+          msgID: T.Chat.messageIDToNumber(downloadMessage.id),
+        },
+      },
+      type: 'chat.1.NotifyChat.ChatAttachmentDownloadComplete',
+    } as never)
+  })
+
+  expect(
+    result.current.downloadMessage?.type === 'attachment'
+      ? result.current.downloadMessage.transferState
+      : undefined
+  ).toBeUndefined()
+})
+
+test('a warm-cache load prunes against both passes, not either one alone', async () => {
+  // Regression: once the service has sent a cached thread it switches the full response to
+  // INCREMENTAL, so the full pass only carries what changed. Treating either pass on its own as
+  // authoritative deleted real messages that were still in the thread. The two together are the
+  // window - INCREMENTAL walks it and omits only what the cached pass already carried - so the
+  // range spans both, and everything inside it that either pass carried survives.
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise').mockResolvedValue({offline: false})
+  const ids = [301, 302, 303, 304].map(T.Chat.numberToMessageID)
+  const threadJSON = (msgIDs: ReadonlyArray<T.Chat.MessageID>) =>
+    JSON.stringify({
+      messages: msgIDs.map(id => makeValidTextUIMessage(id, `m${id}`)),
+      pagination: {last: true, next: '', num: 100, previous: ''},
+    })
+
+  // The cache holds the older three; only 304 changed, so that is all the full pass carries. The
+  // span is what makes this the dangerous shape: a range of [301..304] computed from the full pass
+  // alone covers 302 and 303, which are absent from it and would be pruned.
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadCached']?.({thread: threadJSON(ids.slice(0, 3))})
+    await Promise.resolve()
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({thread: threadJSON([ids[3]!])})
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  // Seed a settled four-message window the way a whole-window full pass would.
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: ids.map(id =>
+        Message.makeMessageText({
+          author: 'alice',
+          conversationIDKey: convID,
+          id,
+          ordinal: T.Chat.numberToOrdinal(T.Chat.messageIDToNumber(id)),
+          outboxID: undefined,
+          text: new HiddenString(`m${id}`),
+          timestamp: 100,
+        })
+      ),
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.ordinals).toEqual([301, 302, 303, 304])
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'test'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(result.current.ordinals).toEqual([301, 302, 303, 304])
+})
+
+test('a warm-cache load does not prune a message sitting on its outbox ordinal', async () => {
+  // A message you sent keeps the fractional ordinal it had in the outbox, so the ordinal it parses
+  // with - its server one - is not the ordinal it occupies. The prune walks the window, so what
+  // the passes delivered has to be recorded in the window's terms too; recording the parsed
+  // ordinal deletes the row it was meant to protect.
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise').mockResolvedValue({offline: false})
+  const outboxID = T.Chat.stringToOutboxID('sent-1')
+  const sentOrdinal = T.Chat.numberToOrdinal(302.001)
+
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadCached']?.({
+      thread: JSON.stringify({
+        messages: [
+          makeValidTextUIMessage(T.Chat.numberToMessageID(301), 'm301'),
+          makeValidTextUIMessage(T.Chat.numberToMessageID(302), 'm302'),
+          makeValidTextUIMessage(T.Chat.numberToMessageID(303), 'mine', 'sent-1'),
+        ],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(T.Chat.numberToMessageID(301), 'm301 edited')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  // The window as it stands after the send settled: the message is at its outbox ordinal, indexed
+  // under the server ID the service will send it back as.
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [
+        Message.makeMessageText({
+          author: 'alice',
+          conversationIDKey: convID,
+          id: T.Chat.numberToMessageID(301),
+          ordinal: T.Chat.numberToOrdinal(301),
+          outboxID: undefined,
+          text: new HiddenString('m301'),
+          timestamp: 100,
+        }),
+        Message.makeMessageText({
+          author: 'alice',
+          conversationIDKey: convID,
+          id: T.Chat.numberToMessageID(302),
+          ordinal: T.Chat.numberToOrdinal(302),
+          outboxID: undefined,
+          text: new HiddenString('m302'),
+          timestamp: 100,
+        }),
+        Message.makeMessageText({
+          author: 'testuser',
+          conversationIDKey: convID,
+          id: T.Chat.numberToMessageID(303),
+          ordinal: sentOrdinal,
+          outboxID,
+          text: new HiddenString('mine'),
+          timestamp: 100,
+        }),
+      ],
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.ordinals).toEqual([301, 302, sentOrdinal])
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'test'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(result.current.ordinals).toEqual([301, 302, sentOrdinal])
+})
+
+test('a full pass that changed nothing still reconciles the window', async () => {
+  // The ordinary warm reload: the cached pass is the window and the INCREMENTAL full pass behind it
+  // carries nothing at all, because nothing changed. That is still an authoritative answer about
+  // the span, so a row the service no longer has is still a ghost - skipping the prune for want of
+  // messages to add leaves it on screen until the conversation is reopened.
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise').mockResolvedValue({offline: false})
+  const ids = [301, 302, 303].map(T.Chat.numberToMessageID)
+
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadCached']?.({
+      thread: JSON.stringify({
+        messages: [ids[0]!, ids[2]!].map(id => makeValidTextUIMessage(id, `m${id}`)),
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({messages: null, pagination: {last: true, next: '', num: 100, previous: ''}}),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: ids.map(id =>
+        Message.makeMessageText({
+          author: 'alice',
+          conversationIDKey: convID,
+          id,
+          ordinal: T.Chat.numberToOrdinal(T.Chat.messageIDToNumber(id)),
+          outboxID: undefined,
+          text: new HiddenString(`m${id}`),
+          timestamp: 100,
+        })
+      ),
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.ordinals).toEqual([301, 302, 303])
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'test'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(result.current.ordinals).toEqual([301, 303])
+})
+
+test('a warm-cache load still prunes a row neither pass carries', async () => {
+  // The other half of the same rule: a row inside the range that neither pass returned is a ghost -
+  // a cache repair left it behind, or it was deleted while we were away - and reconciling it away
+  // is what the range is for. Gating on a full pass with no cached one before it would have given
+  // this up for every conversation the cache is warm for.
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise').mockResolvedValue({offline: false})
+  const ids = [301, 302, 303, 304].map(T.Chat.numberToMessageID)
+  const threadJSON = (msgIDs: ReadonlyArray<T.Chat.MessageID>) =>
+    JSON.stringify({
+      messages: msgIDs.map(id => makeValidTextUIMessage(id, `m${id}`)),
+      pagination: {last: true, next: '', num: 100, previous: ''},
+    })
+
+  // 303 is in neither pass, and it sits inside the span the two of them cover.
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadCached']?.({thread: threadJSON([ids[0]!, ids[1]!])})
+    await Promise.resolve()
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({thread: threadJSON([ids[3]!])})
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      loadMoreMessages: useConversationThreadLoadMoreMessages(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: ids.map(id =>
+        Message.makeMessageText({
+          author: 'alice',
+          conversationIDKey: convID,
+          id,
+          ordinal: T.Chat.numberToOrdinal(T.Chat.messageIDToNumber(id)),
+          outboxID: undefined,
+          text: new HiddenString(`m${id}`),
+          timestamp: 100,
+        })
+      ),
+      moreToLoad: false,
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.ordinals).toEqual([301, 302, 303, 304])
+
+  act(() => {
+    result.current.loadMoreMessages({reason: 'test'})
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  expect(result.current.ordinals).toEqual([301, 302, 304])
+})
+
+// The window invariant, at the callsite that enforces it. The four unit tests in
+// thread-message-state.test.tsx pass `dropNewBelowWindow` themselves; only this proves addMessages
+// actually sets it, and that thread loads are still allowed to extend the window downward.
+test('a notification may not strand a new ordinal below the loaded window', () => {
+  const {result} = renderHook(() => ({actions: useConversationThreadActions()}), {wrapper})
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(7152), textAt(7153)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  // A MessagesUpdated push re-unboxing the ancient METADATA message. It must not become the new
+  // floor: messageOrdinals is the list's data array, so an item at index 0 far below the window
+  // makes back-paging stop being a prepend and kills scrollback.
+  act(() => {
+    result.current.actions.addMessages([textAt(1)], {liveUpdate: true})
+  })
+  expect(result.current.actions.getSnapshot().messageOrdinals).toEqual([
+    T.Chat.numberToOrdinal(7152),
+    T.Chat.numberToOrdinal(7153),
+  ])
+
+  // A notification updating something inside the window still applies.
+  act(() => {
+    result.current.actions.addMessages([textAt(7152)], {liveUpdate: true})
+  })
+  expect(result.current.actions.getSnapshot().messageOrdinals).toEqual([
+    T.Chat.numberToOrdinal(7152),
+    T.Chat.numberToOrdinal(7153),
+  ])
+
+  // And a thread load - the only thing allowed to - still extends the window downward.
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(7052)],
+      moreToLoad: true,
+      scrollDirection: 'back',
+    })
+  })
+  expect(result.current.actions.getSnapshot().messageOrdinals?.[0]).toEqual(
+    T.Chat.numberToOrdinal(7052)
+  )
+})
+
+test('jumpToRecent drops the old window instead of merging a disjoint one into it', async () => {
+  // The newest window has nothing to do with wherever the reader had scrolled back to, so merging
+  // the two leaves a hole in messageOrdinals between them - which is the same stranded-index-0
+  // shape that kills scrollback. A centered jump already clears first; this must too.
+  useConfigState.setState({loggedIn: true})
+  jest.spyOn(Common, 'isUserActivelyLookingAtThisThread').mockReturnValue(true)
+  jest.spyOn(T.RPCChat, 'localMarkAsReadLocalRpcPromise').mockResolvedValue({offline: false})
+  const recent = T.Chat.numberToMessageID(9001)
+  jest.spyOn(T.RPCChat, 'localGetThreadNonblockRpcListener').mockImplementation(async p => {
+    p.incomingCallMap['chat.1.chatUi.chatThreadFull']?.({
+      thread: JSON.stringify({
+        messages: [makeValidTextUIMessage(recent, 'newest')],
+        pagination: {last: true, next: '', num: 100, previous: ''},
+      }),
+    })
+    await Promise.resolve()
+    return {offline: false}
+  })
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      jumpToRecent: useConversationThreadJumpToRecent(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  // The reader is deep in old history.
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(101), textAt(102)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    result.current.jumpToRecent()
+  })
+  await act(async () => {
+    await microtasks()
+  })
+
+  // Only the newest window survives. If the old one were merged in, ordinals would read
+  // [101, 102, 9001] with a 8899-wide hole.
+  expect(result.current.ordinals).toEqual([T.Chat.numberToOrdinal(9001)])
+})
+
+test('only the load that claimed the window gate may drop it', () => {
+  // clearVersion cannot separate two loads of the same conversation - the load generation only
+  // moves on a conversation change or unmount, so both call themselves current. The reader taps a
+  // search result, messagesClear issues the centered reload, and a ChatThreadsStale notification
+  // then fires a second load at the same generation. If that one settles first - no thread, an
+  // error - it would take the gate down while the reload is still in flight, and a push landing in
+  // what is left of the gap strands exactly as it did before the gate existed.
+  const {result} = renderHook(() => ({actions: useConversationThreadActions()}), {wrapper})
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(7152), textAt(7153)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+  act(() => {
+    result.current.actions.messagesClear()
+  })
+
+  // The reload the clear issued claims the gate; the stale-thread load that follows loses the race.
+  act(() => {
+    result.current.actions.claimWindowGate(1)
+    result.current.actions.claimWindowGate(2)
+  })
+  act(() => {
+    result.current.actions.clearWindowGate(2)
+  })
+  expect(result.current.actions.getSnapshot().windowCleared).toBe(true)
+
+  act(() => {
+    result.current.actions.clearWindowGate(1)
+  })
+  expect(result.current.actions.getSnapshot().windowCleared).toBe(false)
+})
+
+test('a stale reload does not merge the newest page into a centered window', () => {
+  // The reader taps a search result and sits on the window around it, with more to load forward.
+  // A ChatThreadsStale reload fetches the newest page, which is nowhere near that window: merging
+  // the two leaves ordinals with a hole through the middle and then calls the result the latest
+  // message, which is the gap this invariant is about.
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  const textAt = (ord: number) =>
+    Message.makeMessageText({
+      author: 'alice',
+      conversationIDKey: convID,
+      id: T.Chat.numberToMessageID(ord),
+      ordinal: T.Chat.numberToOrdinal(ord),
+      outboxID: undefined,
+      text: new HiddenString(`m${ord}`),
+      timestamp: 100,
+    })
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: true,
+      enableActiveMarkRead: false,
+      messages: [textAt(7000), textAt(7001)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.actions.getSnapshot().moreToLoadForward).toBe(true)
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(9900), textAt(9901)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  expect(result.current.ordinals).toEqual([7000, 7001])
+  // ...and the window still knows it has not reached the latest message.
+  expect(result.current.actions.getSnapshot().moreToLoadForward).toBe(true)
+})
+
+test('a newest page that reaches the window is still merged', () => {
+  // The other side of the rule. A reader near the bottom gets a page that overlaps what they hold,
+  // so there is no hole to open and the refresh must land.
+  const {result} = renderHook(
+    () => ({
+      actions: useConversationThreadActions(),
+      ordinals: useConversationThreadSelector(s => s.messageOrdinals),
+    }),
+    {wrapper}
+  )
+
+  const textAt = (ord: number) =>
+    Message.makeMessageText({
+      author: 'alice',
+      conversationIDKey: convID,
+      id: T.Chat.numberToMessageID(ord),
+      ordinal: T.Chat.numberToOrdinal(ord),
+      outboxID: undefined,
+      text: new HiddenString(`m${ord}`),
+      timestamp: 100,
+    })
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: true,
+      enableActiveMarkRead: false,
+      messages: [textAt(9900), textAt(9901)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(9901), textAt(9902)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  expect(result.current.ordinals).toEqual([9900, 9901, 9902])
+})
+
+test('an empty pass leaves the thread unloaded rather than loaded and empty', () => {
+  // addMessagesToThreadState always leaves a messageOrdinals array behind, and the top-of-thread
+  // block reads `messageOrdinals !== undefined` as "this conversation has loaded at least once".
+  // A cold open answers with an empty cached pass first, so handing that pass to the store renders
+  // the top of the conversation against an empty thread, which then swaps when the page lands.
+  const {result} = renderHook(() => ({actions: useConversationThreadActions()}), {wrapper})
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [],
+      moreToLoad: true,
+      reconcile: {carried: new Set(), prune: false},
+      scrollDirection: 'none',
+    })
+  })
+  expect(result.current.actions.getSnapshot().messageOrdinals).toBeUndefined()
+})
+
+test('an empty pass during a jump-to-recent gap leaves the gate up', () => {
+  // A cold cache sends a cached pass carrying no messages ahead of the full response, and it
+  // reaches applyThreadLoad like any other. Dropping the gate on it reopens the gap: a
+  // notification landing before the real page becomes the sole ordinal, and the page that follows
+  // is disjoint from it.
+  const {result} = renderHook(() => ({actions: useConversationThreadActions()}), {wrapper})
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(7152), textAt(7153)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+  act(() => {
+    result.current.actions.messagesClear()
+  })
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+  act(() => {
+    result.current.actions.addMessages([textAt(7155)], {liveUpdate: true})
+  })
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(9001)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  expect(result.current.actions.getSnapshot().messageOrdinals).toEqual([T.Chat.numberToOrdinal(9001)])
+})
+
+test('a notification during a jump-to-recent gap cannot become the new window', () => {
+  // jumpToRecent and a centered jump both clear before reloading, so for one RPC round trip the
+  // window is empty. The notification most likely to land in that gap is the post-send
+  // ResolveSkippedUnboxeds push from the load already in flight - the very one carrying the ancient
+  // setChannelname at ID 1. Without the gap being marked it installs itself at index 0 and the
+  // thread is stranded again, which is the bug this branch exists to fix.
+  //
+  // A push between the old window and the page that is coming strands the same way: jump-to-recent
+  // reloads the newest page, which for a reader parked far back starts thousands of ordinals above
+  // where they were, so "newer than what we dropped" says nothing about whether it belongs.
+  const {result} = renderHook(
+    () => ({actions: useConversationThreadActions()}),
+    {wrapper}
+  )
+
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(7152), textAt(7153)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  act(() => {
+    result.current.actions.messagesClear()
+  })
+  act(() => {
+    result.current.actions.addMessages([textAt(1), textAt(7155)], {liveUpdate: true})
+  })
+  act(() => {
+    result.current.actions.applyThreadLoad({
+      centered: false,
+      enableActiveMarkRead: false,
+      messages: [textAt(9001)],
+      moreToLoad: true,
+      scrollDirection: 'none',
+    })
+  })
+
+  expect(result.current.actions.getSnapshot().messageOrdinals).toEqual([
+    T.Chat.numberToOrdinal(9001),
+  ])
+})

@@ -1,0 +1,298 @@
+/** @jest-environment jsdom */
+/// <reference types="jest" />
+import * as Chat from '@/constants/chat'
+import * as T from '@/constants/types'
+import type * as React from 'react'
+import {act, cleanup, renderHook} from '@testing-library/react'
+import {resetAllStores} from '@/util/zustand'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useConfigState} from '@/stores/config'
+import {LoadedTeamsListProvider} from '@/teams/use-teams-list'
+import {useInputIntentState} from '../../input-intent-store'
+import {installFakeEngine} from '@/test/fake-engine'
+import {flush} from '@/test/flush'
+import {navigationWrapper, type NavigationRecorder} from '@/test/navigation'
+import {answerTeamMembers, memberDetails} from '@/test/team-members'
+import {useModeration, useStorelessItems} from './hooks'
+
+const conversationIDKey = T.Chat.stringToConversationIDKey('conv1')
+const you = 'testuser'
+const them = 'testuser-mac'
+
+let nav: NavigationRecorder
+
+// the popup, opened over the conversation (or over `route`, a modal above it)
+const inConversation = (route = 'chatRoot') => {
+  const {wrapper, ...recorder} = navigationWrapper({params: {conversationIDKey}, route})
+  nav = recorder
+  return wrapper
+}
+
+const moderation = (p: {author: string; isTeam: boolean; numPart: number}) =>
+  renderHook(() => useModeration(p.author, conversationIDKey, p.isTeam, p.numPart), {
+    wrapper: inConversation(),
+  }).result.current
+
+const titles = (items: ReadonlyArray<{title: string}>) => items.map(i => i.title)
+
+beforeEach(() => {
+  useCurrentUserState.getState().dispatch.setBootstrap({
+    deviceID: 'device-id',
+    deviceName: 'device-name',
+    uid: 'uid',
+    username: you,
+  })
+})
+
+afterEach(() => {
+  cleanup()
+  act(() => {
+    resetAllStores()
+  })
+  global.isIOS = false
+})
+
+test('you cannot moderate yourself', () => {
+  const {itemBlock, itemFilter, itemFlag, itemReport} = moderation({
+    author: you,
+    isTeam: false,
+    numPart: 2,
+  })
+  expect([...itemBlock, ...itemFilter, ...itemFlag, ...itemReport]).toEqual([])
+})
+
+test('there is nobody to moderate on an authorless message', () => {
+  expect(moderation({author: '', isTeam: false, numPart: 2}).itemBlock).toEqual([])
+})
+
+test('team messages offer a report instead of a block', () => {
+  expect(titles(moderation({author: them, isTeam: true, numPart: 5}).itemBlock)).toEqual(['Report user'])
+})
+
+test('non team messages offer a block', () => {
+  expect(titles(moderation({author: them, isTeam: false, numPart: 2}).itemBlock)).toEqual(['Block user'])
+})
+
+test('content moderation is iOS only', () => {
+  const desktop = moderation({author: them, isTeam: false, numPart: 2})
+  expect([...desktop.itemFilter, ...desktop.itemFlag, ...desktop.itemReport]).toEqual([])
+
+  global.isIOS = true
+  const ios = moderation({author: them, isTeam: false, numPart: 2})
+  expect(titles(ios.itemFilter)).toEqual(['Filter user'])
+  expect(titles(ios.itemFlag)).toEqual(['Flag content'])
+  expect(titles(ios.itemReport)).toEqual(['Report user'])
+})
+
+test('iOS team messages drop the separate report entry, since the block item already reports', () => {
+  global.isIOS = true
+  const {itemBlock, itemReport} = moderation({author: them, isTeam: true, numPart: 5})
+  expect(titles(itemBlock)).toEqual(['Report user'])
+  expect(itemReport).toEqual([])
+})
+
+describe('opening the blocking modal', () => {
+  test('a one on one conversation gets the single user context', () => {
+    const {onClick} = moderation({author: them, isTeam: false, numPart: 2}).itemBlock[0]
+    act(() => onClick())
+    expect(nav.visibleScreen()).toMatchObject({
+      name: 'chatBlockingModal',
+      params: {
+        blockUserByDefault: true,
+        context: 'message-popup-single',
+        conversationIDKey,
+        username: them,
+      },
+    })
+  })
+
+  test('a group conversation gets the plain context', () => {
+    const {onClick} = moderation({author: them, isTeam: false, numPart: 3}).itemBlock[0]
+    act(() => onClick())
+    expect(nav.visibleScreen()).toMatchObject({name: 'chatBlockingModal', params: {context: 'message-popup'}})
+  })
+
+  test('teams never use the single user context', () => {
+    const {onClick} = moderation({author: them, isTeam: true, numPart: 2}).itemBlock[0]
+    act(() => onClick())
+    expect(nav.visibleScreen()).toMatchObject({name: 'chatBlockingModal', params: {context: 'message-popup'}})
+  })
+
+  test('flagging asks the modal to preselect both flag and report', () => {
+    global.isIOS = true
+    const {onClick} = moderation({author: them, isTeam: false, numPart: 2}).itemFlag[0]
+    act(() => onClick())
+    expect(nav.visibleScreen()).toMatchObject({
+      name: 'chatBlockingModal',
+      params: {flagUserByDefault: true, reportsUserByDefault: true},
+    })
+  })
+})
+
+describe('delete and kick for a team admin', () => {
+  const teamID: T.Teams.TeamID = 'team-id'
+
+  // You admin the team and the author is in it, as the service reports both
+  const items = async (isDeleteable: boolean) => {
+    useConfigState.getState().dispatch.setLoggedIn(true)
+    const fake = installFakeEngine()
+    fake.answer('keybase.1.teams.getTeamRoleMap', () => ({
+      teams: {[teamID]: {implicitRole: T.RPCGen.TeamRole.none, role: T.RPCGen.TeamRole.admin}},
+      version: 1,
+    }))
+    fake.answer('keybase.1.teams.teamListUnverified', () => ({teams: []}))
+    answerTeamMembers(fake, {[teamID]: [memberDetails(them, T.RPCGen.TeamRole.writer)]})
+    const message = Chat.makeMessageText({
+      author: them,
+      conversationIDKey,
+      id: T.Chat.numberToMessageID(1),
+      isDeleteable,
+      ordinal: T.Chat.numberToOrdinal(1),
+    })
+    const meta: T.Chat.ConversationMeta = {
+      ...Chat.makeConversationMeta(),
+      channelname: 'general',
+      conversationIDKey,
+      teamID,
+      teamType: 'big',
+      teamname: 'keybase',
+    }
+    const Nav = inConversation()
+    const wrapper = ({children}: {children: React.ReactNode}) => (
+      <Nav>
+        <LoadedTeamsListProvider>{children}</LoadedTeamsListProvider>
+      </Nav>
+    )
+    const {result} = renderHook(
+      () =>
+        useStorelessItems({
+          conversationIDKey,
+          message,
+          meta,
+          onHidden: () => {},
+          participantInfo: {all: [you, them], contactName: new Map(), name: []},
+        }),
+      {wrapper}
+    )
+    // nothing to moderate with until the role and the members load
+    expect(result.current.itemKick).toEqual([])
+    await flush()
+    return result.current
+  }
+
+  test('a deletable message offers both delete and kick', async () => {
+    const {itemDelete, itemKick} = await items(true)
+    expect(titles(itemDelete)).toEqual(['Delete'])
+    expect(titles(itemKick)).toEqual(['Kick user'])
+  })
+
+  test('a message the server says is not deletable still offers kick', async () => {
+    // kicking is about the author, deleting is about the message
+    const {itemDelete, itemKick} = await items(false)
+    expect(itemDelete).toEqual([])
+    expect(titles(itemKick)).toEqual(['Kick user'])
+  })
+})
+
+// Edit and Reply are the two items that put something in the composer. Reached from the
+// attachment viewer the popup sits under a modal route, so without this the intent lands
+// behind a modal the user cannot see past - the state is right and looks broken.
+describe('composer items dismiss a covering modal', () => {
+  // the popup is under the attachment viewer, a modal above the conversation
+  const yourEditableMessage = () => {
+    const message = Chat.makeMessageText({
+      author: you,
+      conversationIDKey,
+      id: T.Chat.numberToMessageID(1),
+      ordinal: T.Chat.numberToOrdinal(1),
+    })
+    const meta: T.Chat.ConversationMeta = {
+      ...Chat.makeConversationMeta(),
+      conversationIDKey,
+      teamType: 'adhoc',
+    }
+    return renderHook(
+      () =>
+        useStorelessItems({
+          conversationIDKey,
+          message,
+          meta,
+          onHidden: () => {},
+          participantInfo: {all: [you, them], contactName: new Map(), name: []},
+        }),
+      {wrapper: inConversation('chatAttachmentFullscreen')}
+    ).result.current
+  }
+
+  test('Edit clears modals so the composer it just filled is visible', () => {
+    const {itemEdit} = yourEditableMessage()
+    expect(titles(itemEdit)).toEqual(['Edit'])
+    expect(nav.visibleScreen()?.name).toBe('chatAttachmentFullscreen')
+    act(() => itemEdit[0].onClick())
+    expect(nav.visibleScreen()?.name).toBe('chatRoot')
+    expect(useInputIntentState.getState().intents.get(conversationIDKey)).toEqual({
+      ordinal: T.Chat.numberToOrdinal(1),
+      type: 'setEditing',
+    })
+  })
+
+  // the reply focuses the composer, which is only reliable on iOS once no modal is presented
+  test('Reply clears modals first, then replies', () => {
+    const {itemReply} = yourEditableMessage()
+    expect(titles(itemReply)).toEqual(['Reply'])
+    // what the app had dispatched to navigation when the reply reached the composer's mailbox
+    let dispatchedBeforeReply: Array<string> | undefined
+    const unsubscribe = useInputIntentState.subscribe(s => {
+      if (s.intents.get(conversationIDKey)?.type === 'setReplyTo') {
+        dispatchedBeforeReply ??= nav.types()
+      }
+    })
+
+    act(() => itemReply[0].onClick())
+    unsubscribe()
+
+    expect(dispatchedBeforeReply?.length).toBeGreaterThan(0)
+    expect(nav.visibleScreen()?.name).toBe('chatRoot')
+  })
+})
+
+// Where the user can't post, nothing can be sent, so the menu offers no edit or reply to send
+describe('composer items where the user cannot post', () => {
+  const itemsFor = (cannotWrite: boolean) => {
+    const message = Chat.makeMessageText({
+      author: you,
+      conversationIDKey,
+      id: T.Chat.numberToMessageID(1),
+      ordinal: T.Chat.numberToOrdinal(1),
+    })
+    const meta: T.Chat.ConversationMeta = {
+      ...Chat.makeConversationMeta(),
+      cannotWrite,
+      conversationIDKey,
+      teamType: 'adhoc',
+    }
+    return renderHook(
+      () =>
+        useStorelessItems({
+          conversationIDKey,
+          message,
+          meta,
+          onHidden: () => {},
+          participantInfo: {all: [you, them], contactName: new Map(), name: []},
+        }),
+      {wrapper: inConversation()}
+    ).result.current
+  }
+
+  test('Edit and Reply are not offered', () => {
+    const {itemEdit, itemReply} = itemsFor(true)
+    expect(itemEdit).toEqual([])
+    expect(itemReply).toEqual([])
+  })
+
+  test('Edit and Reply are offered where the user can post', () => {
+    const {itemEdit, itemReply} = itemsFor(false)
+    expect(titles(itemEdit)).toEqual(['Edit'])
+    expect(titles(itemReply)).toEqual(['Reply'])
+  })
+})

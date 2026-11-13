@@ -1,0 +1,175 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Styles from '@/styles'
+import LoadingStateView from './loading-state-view'
+import memoize from 'lodash/memoize'
+import {openURL} from '@/util/misc'
+import {View as NativeView} from 'react-native'
+import {WebView as NativeWebView} from 'react-native-webview'
+
+export type WebViewInjections = {
+  javaScript?: string
+  css?: string
+}
+
+export type WebViewProps = {
+  allowUniversalAccessFromFileURLs?: boolean
+  allowFileAccessFromFileURLs?: boolean
+  allowFileAccess?: boolean
+  originWhitelist?: Array<string>
+  renderLoading?: () => React.ReactElement
+  url: string
+  pinnedURLMode?: boolean
+  injections?: WebViewInjections
+  style?: object
+  showLoadingStateUntilLoaded?: boolean
+  onError?: (err: string) => void
+  // mobile: on the view once its page has loaded
+  testID?: string
+}
+
+type ElectronWebviewTag = {
+  insertCSS: (css: string) => Promise<void>
+  executeJavaScript: (js: string) => Promise<void>
+  addEventListener: (event: string, handler: (e: {errorDescription?: string}) => void) => void
+  removeEventListener: (event: string, handler: (e: {errorDescription?: string}) => void) => void
+}
+
+const escape = (str?: string): string => (str ? str.replace(/\\/g, '\\\\').replace(/`/g, '\\`') : '')
+
+const combineJavaScriptAndCSS = (injections?: WebViewInjections) =>
+  !injections
+    ? ''
+    : `
+(function() {
+  const style = document.createElement('style')
+  document.body.appendChild(style)
+  style.type = 'text/css'
+  style.appendChild(document.createTextNode(\`${escape(injections.css)}\`))
+})();
+
+(function() { ${escape(injections.javaScript)} })();
+`
+
+const WebView = (props: WebViewProps) => {
+  const styles = useStyles()
+  const {onError, injections} = props
+  const webviewRef = React.useRef<ElectronWebviewTag | null>(null)
+
+  React.useEffect(() => {
+    if (isMobile) return
+    const css = injections?.css || ''
+    const javaScript = injections?.javaScript || ''
+    const ref = webviewRef.current
+
+    const onDomReady = () => {
+      if (!ref) return
+      if (css) {
+        ref.insertCSS(css).catch(() => {})
+      }
+      if (javaScript) {
+        ref.executeJavaScript(javaScript).catch(() => {})
+      }
+      ref.removeEventListener('dom-ready', onDomReady)
+    }
+    ref?.addEventListener('dom-ready', onDomReady)
+    if (onError) {
+      const handleError = (e: {errorDescription?: string}) => {
+        onError(e.errorDescription ?? '')
+        ref?.removeEventListener('did-fail-load', handleError)
+      }
+      ref?.addEventListener('did-fail-load', handleError)
+    }
+  }, [injections, onError])
+
+  const {allowFileAccessFromFileURLs, allowFileAccess, originWhitelist} = props
+  const {allowUniversalAccessFromFileURLs, url, renderLoading} = props
+  const {showLoadingStateUntilLoaded, testID} = props
+  const [loading, _setLoading] = React.useState(true)
+  const [progress, setProgress] = React.useState(0)
+  const isLoaded = showLoadingStateUntilLoaded ? !loading : true
+  // only for the testID: it marks a page that finished loading without an error
+  const [loadFailed, setLoadFailed] = React.useState(false)
+  const [opacity, setOpacity] = React.useState(isLoaded ? 1 : 0)
+
+  const setLoading = (l: boolean) => {
+    _setLoading(l)
+    setOpacity(l ? 0 : 1)
+  }
+
+  const [forceReload, setForceReload] = React.useState(1)
+  // stable fn: an inline closure re-runs the focus effect every render while
+  // focused, and the setState here re-renders -> infinite loop on mobile
+  const [onFocusReload] = React.useState(() => () => {
+    if (isMobile) {
+      setForceReload(a => a + 1)
+    }
+  })
+  C.Router2.useSafeFocusEffect(onFocusReload)
+
+  if (!isMobile) {
+    return (
+      <webview
+        ref={webviewRef as React.Ref<HTMLElement>}
+        style={props.style as React.CSSProperties}
+        src={props.url}
+      />
+    )
+  }
+
+  return (
+    <>
+      <NativeView style={{...Styles.size('100%'), opacity}} testID={loading || loadFailed ? undefined : testID}>
+        <NativeWebView
+          key={String(forceReload)}
+          allowUniversalAccessFromFileURLs={allowUniversalAccessFromFileURLs}
+          originWhitelist={originWhitelist}
+          allowFileAccess={allowFileAccess}
+          allowFileAccessFromFileURLs={allowFileAccessFromFileURLs}
+          allowsInlineMediaPlayback={true}
+          source={{uri: url}}
+          injectedJavaScript={memoize(combineJavaScriptAndCSS)(props.injections)}
+          style={[
+            Styles.collapseStyles([
+              props.style,
+              props.showLoadingStateUntilLoaded && loading && styles.absolute,
+            ]),
+          ]}
+          onLoadStart={() => {
+            setLoadFailed(false)
+            setLoading(true)
+          }}
+          onLoadEnd={() => setLoading(false)}
+          onLoadProgress={({nativeEvent}) => setProgress(nativeEvent.progress)}
+          onError={event => {
+            setLoadFailed(true)
+            onError?.(event.nativeEvent.description)
+          }}
+          onMessage={() => {}}
+          startInLoadingState={!!renderLoading}
+          renderLoading={renderLoading}
+          onShouldStartLoadWithRequest={
+            props.pinnedURLMode
+              ? (request: {url: string; navigationType: string}) => {
+                  if (request.url === url) {
+                    return true
+                  }
+                  if (request.navigationType === 'click') {
+                    void openURL(request.url)
+                  }
+                  return false
+                }
+              : undefined
+          }
+        />
+      </NativeView>
+      {showLoadingStateUntilLoaded ? <LoadingStateView loading={loading} progress={progress} /> : null}
+    </>
+  )
+}
+
+const useStyles = Styles.createStyleHook(() => ({
+  absolute: {position: 'absolute'},
+}))
+
+export default WebView

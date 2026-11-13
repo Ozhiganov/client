@@ -1,0 +1,146 @@
+import * as Teams from '@/constants/teams'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {pluralize} from '@/util/string'
+import {useCurrentUserState} from '@/stores/current-user'
+import * as C from '@/constants'
+import {newTeamWizardToAddMembersWizard, type NewTeamWizard} from './state'
+import {useNavigation} from '@react-navigation/native'
+import {useLoadedTeam} from '@/teams/team/use-loaded-team'
+
+type Props = {
+  wizard: NewTeamWizard
+}
+
+const AddSubteamMembers = ({wizard: wizardState}: Props) => {
+  const styles = useStyles()
+  const navigation = useNavigation('teamWizardSubteamMembers')
+  const [selectedMembers, setSelectedMembers] = React.useState(new Set<string>())
+  const [filter, setFilter] = React.useState('')
+  const filterL = filter.toLowerCase()
+  const navigateAppend = C.Router2.navigateAppend
+  const onContinue = React.useCallback(() => {
+    const wizard = newTeamWizardToAddMembersWizard(wizardState, {
+      addingMembers: [...selectedMembers].map(assertion => ({assertion, role: 'writer'})),
+    })
+    navigation.setParams({wizard: wizardState})
+    navigateAppend({
+      name: selectedMembers.size ? 'teamAddToTeamConfirm' : 'teamAddToTeamFromWhere',
+      params: {wizard},
+    })
+  }, [navigateAppend, navigation, selectedMembers, wizardState])
+
+  const yourUsername = useCurrentUserState(s => s.username)
+  const parentTeamID = wizardState.parentTeamID ?? T.Teams.noTeamID
+  const {
+    teamDetails: {members: parentMembersMap},
+    teamMeta: {teamname: parentTeamName},
+  } = useLoadedTeam(parentTeamID)
+  const parentMembers = [...parentMembersMap.values()].filter(
+    m => !Teams.isBot(m.type) && m.username !== yourUsername
+  )
+  const filteredMembers = filter
+    ? parentMembers.filter(
+        m => m.username.toLowerCase().includes(filterL) || m.fullName.toLowerCase().includes(filterL)
+      )
+    : parentMembers
+  const allSelected = parentMembers.length === selectedMembers.size
+  const onSelectAll = () => setSelectedMembers(new Set(parentMembers.map(m => m.username)))
+  const onSelectNone = () => setSelectedMembers(new Set())
+
+  const continueLabel = selectedMembers.size
+    ? `Continue with ${selectedMembers.size} ${pluralize('member', selectedMembers.size)}`
+    : 'Continue without members'
+  const doneLabel = selectedMembers.size ? 'Done' : 'Skip'
+
+  const renderItem = (_: number, m: T.Teams.MemberInfo) => {
+    const selected = selectedMembers.has(m.username)
+    const onSelect = () => {
+      // TODO: ensure performance (see Y2K-1666)
+      if (!selected) {
+        selectedMembers.add(m.username)
+      } else {
+        selectedMembers.delete(m.username)
+      }
+      setSelectedMembers(new Set([...selectedMembers]))
+    }
+
+    return (
+      <Kb.ListItem
+        type="Small"
+        icon={<Kb.Avatar username={m.username} size={32} />}
+        body={
+          <Kb.Box2 alignSelf="center" direction="vertical">
+            <Kb.ConnectedUsernames type="BodySemibold" usernames={[m.username]} />
+            <Kb.Text type="BodySmall" lineClamp={1}>
+              {m.fullName}
+            </Kb.Text>
+          </Kb.Box2>
+        }
+        action={<Kb.CheckCircle checked={selectedMembers.has(m.username)} onCheck={onSelect} />}
+        firstItem={true}
+        key={m.username}
+        onClick={() => onSelect()}
+      />
+    )
+  }
+
+  Kb.useModalHeaderAction({
+    label: doneLabel,
+    onAction: onContinue,
+    title: doneLabel,
+  })
+
+  return (
+    <Kb.ModalScreen
+      scroll={false}
+      padding="none"
+      footer={isMobile ? undefined : <Kb.Button label={continueLabel} onClick={onContinue} fullWidth={true} />}
+    >
+      <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.searchContainer}>
+        <Kb.SearchFilter
+          size="full-width"
+          onChange={setFilter}
+          value={filter}
+          placeholderText={`Search ${parentMembers.length} members`}
+          icon="iconfont-search"
+          style={styles.search}
+        />
+      </Kb.Box2>
+      {/* TODO: once it's easier to make a single different-height header, make this part of the list2 */}
+      <Kb.Box2 direction="horizontal" style={styles.header} fullWidth={true} alignItems="center" justifyContent="space-between">
+        <Kb.Text type="BodySmallSemibold" lineClamp={1} style={styles.flexShrink}>
+          Members of {parentTeamName}
+        </Kb.Text>
+        <Kb.Text type="BodyPrimaryLink" onClick={allSelected ? onSelectNone : onSelectAll}>
+          Select {allSelected ? 'none' : 'all'}
+        </Kb.Text>
+      </Kb.Box2>
+      <Kb.BoxGrow>
+        <Kb.List
+          keyProperty="username"
+          items={filteredMembers}
+          renderItem={renderItem}
+          itemHeight={{sizeType: 'Small', type: 'fixedListItemAuto'}}
+        />
+      </Kb.BoxGrow>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  flexShrink: {flexShrink: 1},
+  header: {
+    backgroundColor: theme.blueGrey,
+    height: Kb.Styles.globalMargins.mediumLarge,
+    paddingLeft: Kb.Styles.globalMargins.tiny,
+    paddingRight: Kb.Styles.globalMargins.small,
+  },
+  search: {
+    borderRadius: Kb.Styles.borderRadius,
+  },
+  searchContainer: Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.xsmall),
+}))
+
+export default AddSubteamMembers

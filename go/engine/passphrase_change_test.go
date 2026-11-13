@@ -9,32 +9,39 @@ import (
 
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
 )
 
+func withNewProvisionalLoginForFakeUser(m libkb.MetaContext, u *FakeUser) libkb.MetaContext {
+	m = m.WithNewProvisionalLoginContextForUserVersionAndUsername(u.UserVersion(), libkb.NewNormalizedUsername(u.Username))
+	return m
+}
+
+func tryPassphrase(tc libkb.TestContext, u *FakeUser, pp string) error {
+	m := NewMetaContextForTest(tc)
+	m = withNewProvisionalLoginForFakeUser(m, u)
+	_, err := libkb.VerifyPassphraseGetStreamInLoginContext(m, pp)
+	return err
+}
+
 func verifyPassphraseChange(tc libkb.TestContext, u *FakeUser, newPassphrase string) {
-	_, err := tc.G.LoginState().VerifyPlaintextPassphrase(newPassphrase)
-	if err != nil {
-		tc.T.Fatal(err)
-	}
-
-	_, err = tc.G.LoginState().VerifyPlaintextPassphrase(u.Passphrase)
-	if err == nil {
-		tc.T.Fatal("old passphrase passed verification")
-	}
-
+	err := tryPassphrase(tc, u, newPassphrase)
+	require.NoError(tc.T, err, "verified new passphrase works")
+	err = tryPassphrase(tc, u, u.Passphrase)
+	require.Error(tc.T, err, "verified old passphrase fails")
 	if testing.Verbose() {
 		fmt.Printf("browser test -- username:  %s    password:  %s\n", u.Username, newPassphrase)
 	}
 }
 
 func assertLoadSecretKeys(tc libkb.TestContext, u *FakeUser, msg string) {
+	tc.G.Log.Debug("In assertLoadSecretKeys")
+
 	me, err := libkb.LoadMe(libkb.NewLoadUserArg(tc.G))
-	if err != nil {
-		tc.T.Fatalf("%s: %s", msg, err)
-	}
-	if me == nil {
-		tc.T.Fatalf("%s: nil LoadMe result", msg)
-	}
+	require.NoError(tc.T, err,
+		"%s: %s", msg, err)
+	require.NotNil(tc.T, me,
+		"%s: nil LoadMe result", msg)
 	skarg := libkb.SecretKeyArg{
 		Me:      me,
 		KeyType: libkb.DeviceSigningKeyType,
@@ -44,29 +51,32 @@ func assertLoadSecretKeys(tc libkb.TestContext, u *FakeUser, msg string) {
 		SecretUI: u.NewSecretUI(),
 		Reason:   "testing sig",
 	}
-	sigKey, err := tc.G.Keyrings.GetSecretKeyWithPrompt(parg)
-	if err != nil {
-		tc.T.Fatalf("%s: %s", msg, err)
-	}
-	if sigKey == nil {
-		tc.T.Fatalf("%s: got nil signing key", msg)
-	}
+	m := NewMetaContextForTest(tc)
+	m = withNewProvisionalLoginForFakeUser(m, u)
+
+	tc.G.Log.Debug("doing a silent passphrase login for session token")
+	err = libkb.PassphraseLoginNoPrompt(m, u.Username, u.Passphrase)
+	require.NoError(tc.T, err)
+
+	tc.G.Log.Debug("Calling GetSecretKeyWithPrompt (for signing)")
+	sigKey, err := tc.G.Keyrings.GetSecretKeyWithPrompt(m, parg)
+	require.NoError(tc.T, err,
+		"%s: %s", msg, err)
+	require.NotNil(tc.T, sigKey,
+		"%s: got nil signing key", msg)
 
 	parg.Ska.KeyType = libkb.DeviceEncryptionKeyType
-	encKey, err := tc.G.Keyrings.GetSecretKeyWithPrompt(parg)
-	if err != nil {
-		tc.T.Fatalf("%s: %s", msg, err)
-	}
-	if encKey == nil {
-		tc.T.Fatalf("%s: got nil encryption key", msg)
-	}
+	tc.G.Log.Debug("Calling GetSecretKeyWithPrompt (for encryption)")
+	encKey, err := tc.G.Keyrings.GetSecretKeyWithPrompt(m, parg)
+	require.NoError(tc.T, err,
+		"%s: %s", msg, err)
+	require.NotNil(tc.T, encKey,
+		"%s: got nil encryption key", msg)
 }
 
 func assertLoadPGPKeys(tc libkb.TestContext, u *FakeUser) {
 	me, err := libkb.LoadMe(libkb.NewLoadUserArg(tc.G))
-	if err != nil {
-		tc.T.Fatal(err)
-	}
+	require.NoError(tc.T, err)
 
 	ska := libkb.SecretKeyArg{
 		Me:      me,
@@ -77,10 +87,9 @@ func assertLoadPGPKeys(tc libkb.TestContext, u *FakeUser) {
 		SecretUI: u.NewSecretUI(),
 		Reason:   "pgp test",
 	}
-	key, err := tc.G.Keyrings.GetSecretKeyWithPrompt(parg)
-	if err != nil {
-		tc.T.Fatal(err)
-	}
+	m := NewMetaContextForTest(tc)
+	key, err := tc.G.Keyrings.GetSecretKeyWithPrompt(m, parg)
+	require.NoError(tc.T, err)
 
 	var ok bool
 	_, ok = key.(*libkb.PGPKeyBundle)
@@ -103,12 +112,13 @@ func TestPassphraseChangeKnown(t *testing.T) {
 	}
 
 	// using an empty secret ui to make sure existing pp doesn't come from ui prompt:
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: &libkb.TestSecretUI{},
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -117,28 +127,29 @@ func TestPassphraseChangeKnown(t *testing.T) {
 	assertLoadSecretKeys(tc, u, "passphrase change known")
 }
 
-// Test error when trying to change passphrase to shorter than 12
+// Test error when trying to change passphrase to shorter than 6
 // chars long.
 func TestPassphraseChangeShort(t *testing.T) {
 	tc := SetupEngineTest(t, "PassphraseChange")
 	defer tc.Cleanup()
 
 	u := CreateAndSignupFakeUser(tc, "login")
-	newPassphrase := "password"
+	newPassphrase := "pass"
 	arg := &keybase1.PassphraseChangeArg{
 		OldPassphrase: u.Passphrase,
 		Passphrase:    newPassphrase,
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: &libkb.TestSecretUI{},
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	err := RunEngine(eng, ctx)
-	if err == nil {
-		t.Fatal("expected error with new short passphrase")
-	}
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
+	require.Error(t, err,
+		"expected error with new short passphrase")
 	if _, ok := err.(libkb.PassphraseError); !ok {
-		t.Fatalf("expected libkb.PassphraseError, got %T", err)
+		require.True(t, ok,
+			"expected libkb.PassphraseError, got %T", err)
 	}
 }
 
@@ -152,26 +163,25 @@ func TestPassphraseChangeKnownPrompt(t *testing.T) {
 
 	// clear the passphrase stream cache to force a prompt
 	// for the existing passphrase.
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	clearCaches(tc.G)
 
 	// Test changing passphrase 3 times; so that old passphrase
 	// cache is properly busted.
 	newPassphrase := "password1234"
 	numChanges := 3
-	for i := 0; i < numChanges; i++ {
+	for i := range numChanges {
 
 		arg := &keybase1.PassphraseChangeArg{
 			Passphrase: newPassphrase,
 		}
 		secui := u.NewSecretUI()
-		ctx := &Context{
+		uis := libkb.UIs{
 			SecretUI: secui,
 		}
-		eng := NewPassphraseChange(arg, tc.G)
-		if err := RunEngine(eng, ctx); err != nil {
-			t.Fatal(err)
+		eng := NewPassphraseChange(tc.G, arg)
+		m := NewMetaContextForTest(tc).WithUIs(uis)
+		if err := RunEngine2(m, eng); err != nil {
+			require.NoError(t, err)
 		}
 
 		// We only call this the last time through, since internally,
@@ -182,9 +192,7 @@ func TestPassphraseChangeKnownPrompt(t *testing.T) {
 			verifyPassphraseChange(tc, u, newPassphrase)
 		}
 
-		if !secui.CalledGetPassphrase {
-			t.Errorf("get passphrase not called")
-		}
+		require.True(t, secui.CalledGetPassphrase, "get passphrase not called")
 
 		u.Passphrase = newPassphrase
 		assertLoadSecretKeys(tc, u, "passphrase change known prompt")
@@ -199,29 +207,29 @@ func TestPassphraseChangeKnownPromptRepeatOld(t *testing.T) {
 	defer tc.Cleanup()
 
 	u := CreateAndSignupFakeUser(tc, "login")
+	m := NewMetaContextForTest(tc)
 
 	// clear the passphrase stream cache to force a prompt
 	// for the existing passphrase.
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	m.ActiveDevice().ClearCaches()
 
 	// Test changing passphrase 3 times; so that old passphrase
 	// cache is properly busted.
 	newPassphrase := "password1234"
 	numChanges := 3
-	for i := 0; i < numChanges; i++ {
+	for i := range numChanges {
 
 		arg := &keybase1.PassphraseChangeArg{
 			Passphrase: newPassphrase,
 		}
 		secui := u.NewSecretUI()
-		ctx := &Context{
+		uis := libkb.UIs{
 			SecretUI: secui,
 		}
-		eng := NewPassphraseChange(arg, tc.G)
-		if err := RunEngine(eng, ctx); err != nil {
-			t.Fatal(err)
+		eng := NewPassphraseChange(tc.G, arg)
+		m = m.WithUIs(uis)
+		if err := RunEngine2(m, eng); err != nil {
+			require.NoError(t, err)
 		}
 
 		// We only call this the last time through, since internally,
@@ -229,15 +237,12 @@ func TestPassphraseChangeKnownPromptRepeatOld(t *testing.T) {
 		// the bug fix that we're actually trying to test by doing multiple
 		// passphrase changes.
 		if i == numChanges-1 {
-			_, err := tc.G.LoginState().VerifyPlaintextPassphrase(newPassphrase)
-			if err != nil {
-				t.Fatal(err)
-			}
+			m := NewMetaContextForTest(tc)
+			_, err := libkb.VerifyPassphraseForLoggedInUser(m, newPassphrase)
+			require.NoError(t, err)
 		}
 
-		if !secui.CalledGetPassphrase {
-			t.Errorf("get passphrase not called")
-		}
+		require.True(t, secui.CalledGetPassphrase, "get passphrase not called")
 
 		u.Passphrase = newPassphrase
 		assertLoadSecretKeys(tc, u, "passphrase change known prompt")
@@ -255,21 +260,22 @@ func TestPassphraseChangeAfterPubkeyLogin(t *testing.T) {
 	Logout(tc)
 
 	secui := u.NewSecretUI()
-	u.LoginWithSecretUI(secui, tc.G)
-	if !secui.CalledGetPassphrase {
-		t.Errorf("get keybase passphrase not called")
+	if err := u.LoginWithSecretUI(secui, tc.G); err != nil {
+		require.NoError(t, err)
 	}
+	require.True(t, secui.CalledGetPassphrase, "get keybase passphrase not called")
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: secui,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -289,19 +295,18 @@ func TestPassphraseChangeKnownNotSupplied(t *testing.T) {
 		Passphrase: newPassphrase,
 	}
 	secui := &libkb.TestSecretUI{}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: secui,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
 
-	if secui.CalledGetPassphrase {
-		t.Errorf("get kb passphrase called")
-	}
+	require.False(t, secui.CalledGetPassphrase, "get kb passphrase called")
 
 	u.Passphrase = newPassphrase
 	assertLoadSecretKeys(tc, u, "passphrase change known, not supplied")
@@ -325,12 +330,13 @@ func TestPassphraseChangeUnknown(t *testing.T) {
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: &libkb.TestSecretUI{},
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -350,28 +356,26 @@ func TestPassphraseChangeUnknownNoPSCache(t *testing.T) {
 		arg.SkipPaper = true
 	}
 
-	u, _ := CreateAndSignupFakeUserCustomArg(tc, "paper", f)
+	u, _, _ := CreateAndSignupFakeUserCustomArg(tc, "paper", f)
 
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-		a.ClearCachedSecretKeys()
-	}, "clear stream cache")
+	tc.SimulateServiceRestart()
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: &libkb.TestSecretUI{},
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	err := RunEngine(eng, ctx)
-	if err == nil {
-		t.Fatal("passphrase change should have failed")
-	}
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
+	require.Error(t, err,
+		"passphrase change should have failed")
 	if _, ok := err.(libkb.NoPaperKeysError); !ok {
-		t.Fatalf("unexpected error: %s (%T)", err, err)
+		require.True(t, ok,
+			"unexpected error: %s (%T)", err, err)
 	}
 
 	assertLoadSecretKeys(tc, u, "passphrase change unknown, no ps cache")
@@ -386,30 +390,29 @@ func TestPassphraseChangeUnknownBackupKey(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "login")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: &libkb.TestSecretUI{},
 	}
 	beng := NewPaperKey(tc.G)
-	if err := RunEngine(beng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, beng); err != nil {
+		require.NoError(t, err)
 	}
 	backupPassphrase := beng.Passphrase()
-	ctx.SecretUI = &libkb.TestSecretUI{Passphrase: backupPassphrase}
+	m = m.WithSecretUI(&libkb.TestSecretUI{Passphrase: backupPassphrase})
 
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	m.ActiveDevice().ClearCaches()
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -428,17 +431,18 @@ func TestPassphraseChangeLoggedOutBackupKey(t *testing.T) {
 
 	assertLoadSecretKeys(tc, u, "logged out w/ backup key, before passphrase change")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: &libkb.TestSecretUI{},
 	}
 	beng := NewPaperKey(tc.G)
-	if err := RunEngine(beng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, beng); err != nil {
+		require.NoError(t, err)
 	}
 	backupPassphrase := beng.Passphrase()
-	ctx.SecretUI = &libkb.TestSecretUI{Passphrase: backupPassphrase}
+	m = m.WithSecretUI(&libkb.TestSecretUI{Passphrase: backupPassphrase})
 
 	Logout(tc)
 
@@ -447,9 +451,9 @@ func TestPassphraseChangeLoggedOutBackupKey(t *testing.T) {
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -462,7 +466,6 @@ func TestPassphraseChangeLoggedOutBackupKey(t *testing.T) {
 // and is logged out, but has a backup key (generated by a secret from
 // the secret store).
 func TestPassphraseChangeLoggedOutBackupKeySecretStore(t *testing.T) {
-
 	tc := SetupEngineTest(t, "PassphraseChange")
 	defer tc.Cleanup()
 
@@ -475,25 +478,25 @@ func TestPassphraseChangeLoggedOutBackupKeySecretStore(t *testing.T) {
 	// this call will cause the login state to be reloaded.
 	assertLoadSecretKeys(tc, u, "logged out w/ backup key, before passphrase change")
 
-	tc.ResetLoginState()
+	tc.SimulateServiceRestart()
 
 	secretUI := libkb.TestSecretUI{}
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: &secretUI,
 	}
 	beng := NewPaperKey(tc.G)
-	if err := RunEngine(beng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, beng); err != nil {
+		require.NoError(t, err)
 	}
 
-	if secretUI.CalledGetPassphrase {
-		t.Fatal("GetPassphrase() unexpectedly called")
-	}
+	require.False(t, secretUI.CalledGetPassphrase,
+		"GetPassphrase() unexpectedly called")
 
 	backupPassphrase := beng.Passphrase()
-	ctx.SecretUI = &libkb.TestSecretUI{Passphrase: backupPassphrase}
+	m = m.WithSecretUI(&libkb.TestSecretUI{Passphrase: backupPassphrase})
 
 	Logout(tc)
 
@@ -502,9 +505,9 @@ func TestPassphraseChangeLoggedOutBackupKeySecretStore(t *testing.T) {
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -523,28 +526,25 @@ func TestPassphraseChangePGPUsage(t *testing.T) {
 
 	// clear the passphrase stream cache to force a prompt
 	// for the existing passphrase.
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	clearCaches(tc.G)
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 	}
 	secui := u.NewSecretUI()
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: secui,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
 
-	if !secui.CalledGetPassphrase {
-		t.Errorf("get kb passphrase not called")
-	}
+	require.True(t, secui.CalledGetPassphrase, "get kb passphrase not called")
 
 	u.Passphrase = newPassphrase
 	assertLoadSecretKeys(tc, u, "passphrase change pgp")
@@ -561,28 +561,25 @@ func TestPassphraseChangePGP3Sec(t *testing.T) {
 
 	// clear the passphrase stream cache to force a prompt
 	// for the existing passphrase.
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	clearCaches(tc.G)
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 	}
 	secui := u.NewSecretUI()
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: secui,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
 
-	if !secui.CalledGetPassphrase {
-		t.Errorf("get kb passphrase not called")
-	}
+	require.True(t, secui.CalledGetPassphrase, "get kb passphrase not called")
 
 	u.Passphrase = newPassphrase
 	assertLoadSecretKeys(tc, u, "passphrase change pgp")
@@ -601,18 +598,18 @@ func TestPassphraseChangeLoggedOutBackupKeyPlusPGP(t *testing.T) {
 
 	assertLoadSecretKeys(tc, u, "logged out w/ backup key, before passphrase change")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: &libkb.TestSecretUI{},
 	}
 	beng := NewPaperKey(tc.G)
-	if err := RunEngine(beng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, beng); err != nil {
+		require.NoError(t, err)
 	}
 	backupPassphrase := beng.Passphrase()
-	ctx.SecretUI = &libkb.TestSecretUI{Passphrase: backupPassphrase}
-
+	m = m.WithSecretUI(&libkb.TestSecretUI{Passphrase: backupPassphrase})
 	Logout(tc)
 
 	newPassphrase := "password1234"
@@ -620,9 +617,9 @@ func TestPassphraseChangeLoggedOutBackupKeyPlusPGP(t *testing.T) {
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -635,7 +632,6 @@ func TestPassphraseChangeLoggedOutBackupKeyPlusPGP(t *testing.T) {
 // and is logged out, but has a backup key (generated by a secret from
 // the secret store).  And test using an lksec pgp key after the change.
 func TestPassphraseChangeLoggedOutBackupKeySecretStorePGP(t *testing.T) {
-
 	tc := SetupEngineTest(t, "PassphraseChange")
 	defer tc.Cleanup()
 
@@ -652,40 +648,40 @@ func TestPassphraseChangeLoggedOutBackupKeySecretStorePGP(t *testing.T) {
 		},
 		PushSecret: true,
 	}
-	arg.Gen.MakeAllIds()
-	ctx := &Context{
+	err := arg.Gen.MakeAllIDs(tc.G)
+	require.NoError(t, err)
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 	}
-	eng := NewPGPKeyImportEngine(arg)
-	err := RunEngine(eng, ctx)
-	if err != nil {
-		tc.T.Fatal(err)
-	}
+	eng := NewPGPKeyImportEngine(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err = RunEngine2(m, eng)
+	require.NoError(tc.T, err)
 
 	// This needs to happen *before* resetting the login state, as
 	// this call will cause the login state to be reloaded.
 	assertLoadSecretKeys(tc, u, "logged out w/ backup key, before passphrase change")
 
-	tc.ResetLoginState()
+	tc.SimulateServiceRestart()
 
 	secretUI := libkb.TestSecretUI{}
-	ctx = &Context{
+	uis = libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: &secretUI,
 	}
 	beng := NewPaperKey(tc.G)
-	if err := RunEngine(beng, ctx); err != nil {
-		t.Fatal(err)
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, beng); err != nil {
+		require.NoError(t, err)
 	}
 
-	if secretUI.CalledGetPassphrase {
-		t.Fatal("GetPassphrase() unexpectedly called")
-	}
+	require.False(t, secretUI.CalledGetPassphrase,
+		"GetPassphrase() unexpectedly called")
 
 	backupPassphrase := beng.Passphrase()
-	ctx.SecretUI = &libkb.TestSecretUI{Passphrase: backupPassphrase}
+	m = m.WithSecretUI(&libkb.TestSecretUI{Passphrase: backupPassphrase})
 
 	Logout(tc)
 
@@ -694,9 +690,9 @@ func TestPassphraseChangeLoggedOutBackupKeySecretStorePGP(t *testing.T) {
 		Passphrase: newPassphrase,
 		Force:      true,
 	}
-	pceng := NewPassphraseChange(pcarg, tc.G)
-	if err := RunEngine(pceng, ctx); err != nil {
-		t.Fatal(err)
+	pceng := NewPassphraseChange(tc.G, pcarg)
+	if err := RunEngine2(m, pceng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
@@ -723,68 +719,56 @@ func TestPassphraseChangePGP3SecMultiple(t *testing.T) {
 		NoSave:     true,
 		AllowMulti: true,
 	}
-	parg.Gen.MakeAllIds()
-	pctx := &Context{
+	err := parg.Gen.MakeAllIDs(tc.G)
+	require.NoError(t, err)
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 	}
-	peng := NewPGPKeyImportEngine(parg)
-	err := RunEngine(peng, pctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	peng := NewPGPKeyImportEngine(tc.G, parg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err = RunEngine2(m, peng)
+	require.NoError(t, err)
 
 	// clear the passphrase stream cache to force a prompt
 	// for the existing passphrase.
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	clearCaches(tc.G)
 
 	newPassphrase := "password1234"
 	arg := &keybase1.PassphraseChangeArg{
 		Passphrase: newPassphrase,
 	}
 	secui := u.NewSecretUI()
-	ctx := &Context{
+	uis = libkb.UIs{
 		SecretUI: secui,
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	verifyPassphraseChange(tc, u, newPassphrase)
 
-	if !secui.CalledGetPassphrase {
-		t.Errorf("get kb passphrase not called")
-	}
+	require.True(t, secui.CalledGetPassphrase, "get kb passphrase not called")
 
 	u.Passphrase = newPassphrase
 	assertLoadSecretKeys(tc, u, "passphrase change pgp")
 	assertLoadPGPKeys(tc, u)
 
 	me, err := libkb.LoadMe(libkb.NewLoadUserForceArg(tc.G))
-	if err != nil {
-		t.Fatal(err)
-	}
-	syncKeys, err := me.AllSyncedSecretKeys(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(syncKeys) != 2 {
-		t.Errorf("num pgp sync keys: %d, expected 2", len(syncKeys))
-	}
+	require.NoError(t, err)
+	syncKeys, err := me.AllSyncedSecretKeys(m)
+	require.NoError(t, err)
+	require.Len(t, syncKeys, 2, "num pgp sync keys: %d, expected 2", len(syncKeys))
 	for _, key := range syncKeys {
 		parg := libkb.SecretKeyPromptArg{
 			SecretUI: u.NewSecretUI(),
 		}
-		unlocked, err := key.PromptAndUnlock(parg, nil, me)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if unlocked == nil {
-			t.Fatal("failed to unlock key")
-		}
+		unlocked, err := key.PromptAndUnlock(m, parg, nil, me)
+		require.NoError(t, err)
+		require.NotNil(t, unlocked,
+			"failed to unlock key")
 	}
 }
 
@@ -797,19 +781,16 @@ func TestPassphraseGenerationStored(t *testing.T) {
 	defer tc.Cleanup()
 
 	u := CreateAndSignupFakeUser(tc, "login")
+	mctx := tc.MetaContext()
 
 	// All of the keys initially created with the user should be stored as
 	// passphrase generation 1.
-	skbKeyringFile, err := libkb.LoadSKBKeyring(u.NormalizedUsername(), tc.G)
-	if err != nil {
-		t.Fatal(err)
-	}
+	skbKeyringFile, err := libkb.LoadSKBKeyring(mctx, u.NormalizedUsername())
+	require.NoError(t, err)
 	initialGenerationOneCount := 0
 	for _, block := range skbKeyringFile.Blocks {
-		if block.Priv.PassphraseGeneration != 1 {
-			t.Fatalf("Expected all encrypted keys to be ppgen 1. Found %d.",
-				block.Priv.PassphraseGeneration)
-		}
+		require.Equal(t, 1, block.Priv.PassphraseGeneration, "Expected all encrypted keys to be ppgen 1. Found %d.",
+			block.Priv.PassphraseGeneration)
 		initialGenerationOneCount++
 	}
 
@@ -821,13 +802,14 @@ func TestPassphraseGenerationStored(t *testing.T) {
 		OldPassphrase: u.Passphrase,
 		Passphrase:    newPassphrase,
 	}
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 	}
-	eng := NewPassphraseChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPassphraseChange(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 	u.Passphrase = newPassphrase
 
@@ -840,41 +822,36 @@ func TestPassphraseGenerationStored(t *testing.T) {
 			SubkeyBits:  768,
 		},
 	}
-	pgpArg.Gen.MakeAllIds()
-	pgpEng := NewPGPKeyImportEngine(pgpArg)
-	pgpCtx := &Context{
+	err = pgpArg.Gen.MakeAllIDs(tc.G)
+	require.NoError(t, err)
+	pgpEng := NewPGPKeyImportEngine(tc.G, pgpArg)
+	uis = libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 	}
-	err = RunEngine(pgpEng, pgpCtx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	err = RunEngine2(m, pgpEng)
+	require.NoError(t, err)
 
 	//
 	// Finally, check that the new key (and only the new key) is marked as ppgen 2.
 	//
-	finalSKBKeyringFile, err := libkb.LoadSKBKeyring(u.NormalizedUsername(), tc.G)
-	if err != nil {
-		t.Fatal(err)
-	}
+	finalSKBKeyringFile, err := libkb.LoadSKBKeyring(mctx, u.NormalizedUsername())
+	require.NoError(t, err)
 	finalGenOneCount := 0
 	finalGenTwoCount := 0
 	for _, block := range finalSKBKeyringFile.Blocks {
-		if block.Priv.PassphraseGeneration == 1 {
+		switch block.Priv.PassphraseGeneration {
+		case 1:
 			finalGenOneCount++
-		} else if block.Priv.PassphraseGeneration == 2 {
+		case 2:
 			finalGenTwoCount++
-		} else {
-			t.Fatalf("Expected all encrypted keys to be ppgen 1 or 2. Found %d.",
-				block.Priv.PassphraseGeneration)
+		default:
+			require.FailNow(t, fmt.Sprintf("Expected all encrypted keys to be ppgen 1 or 2. Found %d.",
+				block.Priv.PassphraseGeneration))
 		}
 	}
-	if finalGenOneCount != initialGenerationOneCount {
-		t.Fatalf("Expected initial count of ppgen 1 keys (%d) to equal final count (%d).",
-			initialGenerationOneCount, finalGenOneCount)
-	}
-	if finalGenTwoCount != 1 {
-		t.Fatalf("Expected one key in ppgen 2. Found %d keys.", finalGenTwoCount)
-	}
+	require.Equal(t, initialGenerationOneCount, finalGenOneCount, "Expected initial count of ppgen 1 keys (%d) to equal final count (%d).",
+		initialGenerationOneCount, finalGenOneCount)
+	require.Equal(t, 1, finalGenTwoCount, "Expected one key in ppgen 2. Found %d keys.", finalGenTwoCount)
 }

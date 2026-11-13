@@ -4,18 +4,17 @@
 package client
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/keybase/cli"
+	"github.com/keybase/client/go/chatrender"
 	"github.com/keybase/client/go/libcmdline"
 	"github.com/keybase/client/go/libkb"
 )
 
 type cmdChatList struct {
 	libkb.Contextified
-
-	fetcher chatCLIInboxFetcher
-
+	fetcher        chatCLIInboxFetcher
 	showDeviceName bool
 }
 
@@ -27,6 +26,8 @@ func newCmdChatList(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Comm
 		ArgumentHelp: "",
 		Action: func(c *cli.Context) {
 			cl.ChooseCommand(&cmdChatList{Contextified: libkb.NewContextified(g)}, "list", c)
+			cl.SetNoStandalone()
+			cl.SetLogForward(libcmdline.LogForwardNone)
 		},
 		Flags: getInboxFetcherActivitySortedFlags(),
 	}
@@ -38,10 +39,9 @@ func (c *cmdChatList) Run() error {
 		return err
 	}
 
-	if !c.fetcher.async {
-		if err = conversationListView(conversations).show(c.G(), string(c.G().Env.GetUsername()), c.showDeviceName); err != nil {
-			return err
-		}
+	if err = chatrender.ConversationListView(conversations).Show(c.G(), c.G().Env.GetUsername().String(),
+		c.showDeviceName); err != nil {
+		return err
 	}
 
 	// TODO: print summary of inbox. e.g.

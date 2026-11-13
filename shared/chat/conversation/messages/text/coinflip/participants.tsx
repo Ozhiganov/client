@@ -1,0 +1,82 @@
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type Props = {
+  attachTo?: React.RefObject<Kb.MeasureRef | null>
+  onHidden: () => void
+  participants?: ReadonlyArray<T.RPCChat.UICoinFlipParticipant>
+  visible: boolean
+}
+
+const items: Kb.MenuItems = []
+
+const CoinFlipParticipants = (props: Props) => {
+  const styles = useStyles()
+  const {attachTo, onHidden, participants, visible} = props
+  const howThisWorksUrlProps = Kb.useClickURL('https://keybase.io/coin-flip')
+  const header = (
+    <Kb.Box2 direction="vertical" fullWidth={true} testID={TestIDs.CHAT_COINFLIP_PARTICIPANT_LIST}>
+      <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} style={styles.container}>
+        <Kb.Text type="BodySmall">{participants?.length ?? 0} participants</Kb.Text>
+      </Kb.Box2>
+      <Kb.Divider />
+      <Kb.ScrollView style={styles.partContainer}>
+        {participants?.map(p => (
+          <Kb.NameWithIcon
+            colorBroken={true}
+            colorFollowing={true}
+            key={`${p.username}${p.deviceName}`}
+            horizontal={true}
+            onClick="profile"
+            withProfileCardPopup={false}
+            username={p.username}
+            metaOne={p.deviceName}
+            containerStyle={styles.participants}
+          />
+        )) ?? null}
+      </Kb.ScrollView>
+      <Kb.Divider />
+      <Kb.Box2 alignSelf="center" direction="vertical" style={styles.container} centerChildren={true}>
+        <Kb.Text type="BodySmallPrimaryLink" {...howThisWorksUrlProps}>
+          How this works
+        </Kb.Text>
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+
+  return (
+    <Kb.FloatingMenu
+      attachTo={attachTo}
+      closeOnSelect={true}
+      header={header}
+      items={items}
+      onHidden={onHidden}
+      visible={visible}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      container: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.tiny),
+        },
+        isMobile: {
+          paddingBottom: Kb.Styles.globalMargins.xtiny,
+          paddingTop: Kb.Styles.globalMargins.xsmall,
+        },
+      }),
+      partContainer: {
+        maxHeight: 200,
+        ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+      },
+      participants: {
+        ...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny),
+      },
+    }) as const
+)
+
+export default CoinFlipParticipants

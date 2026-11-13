@@ -4,31 +4,30 @@
 package install
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
-	"time"
 
-	"github.com/blang/semver"
-	"github.com/kardianos/osext"
+	"github.com/blang/semver/v4"
 	"github.com/keybase/client/go/libkb"
-	"github.com/keybase/client/go/logger"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
-	"github.com/keybase/go-updater/process"
+	"github.com/keybase/client/go/utils"
 )
 
 // Log is the logging interface for this package
 type Log interface {
-	Debug(s string, args ...interface{})
-	Info(s string, args ...interface{})
-	Warning(s string, args ...interface{})
-	Errorf(s string, args ...interface{})
+	Debug(s string, args ...any)
+	Info(s string, args ...any)
+	Warning(s string, args ...any)
+	Errorf(s string, args ...any)
 }
 
-// Context is the enviroment for this package
+// Context is the environment for this package
 type Context interface {
 	GetConfigDir() string
 	GetCacheDir() string
@@ -60,12 +59,16 @@ const (
 	ComponentNameHelper ComponentName = "helper"
 	// ComponentNameMountDir is the mount directory
 	ComponentNameMountDir ComponentName = "mountdir"
+	// ComponentNameCLIPaths is for /etc/paths.d/Keybase
+	ComponentNameCLIPaths ComponentName = "clipaths"
+	// ComponentNameRedirector is the KBFS redirector
+	ComponentNameRedirector ComponentName = "redirector"
 	// ComponentNameUnknown is placeholder for unknown components
 	ComponentNameUnknown ComponentName = "unknown"
 )
 
 // ComponentNames are all the valid component names
-var ComponentNames = []ComponentName{ComponentNameCLI, ComponentNameService, ComponentNameKBFS, ComponentNameUpdater, ComponentNameFuse, ComponentNameHelper, ComponentNameApp}
+var ComponentNames = []ComponentName{ComponentNameCLI, ComponentNameService, ComponentNameKBFS, ComponentNameUpdater, ComponentNameFuse, ComponentNameHelper, ComponentNameApp, ComponentNameRedirector, ComponentNameCLIPaths}
 
 // String returns string for ComponentName
 func (c ComponentName) String() string {
@@ -89,6 +92,10 @@ func (c ComponentName) Description() string {
 		return "Fuse"
 	case ComponentNameHelper:
 		return "Privileged Helper Tool"
+	case ComponentNameCLIPaths:
+		return "Command Line (privileged)"
+	case ComponentNameRedirector:
+		return "Redirector (privileged)"
 	}
 	return "Unknown"
 }
@@ -110,6 +117,10 @@ func ComponentNameFromString(s string) ComponentName {
 		return ComponentNameFuse
 	case string(ComponentNameHelper):
 		return ComponentNameHelper
+	case string(ComponentNameCLIPaths):
+		return ComponentNameCLIPaths
+	case string(ComponentNameRedirector):
+		return ComponentNameRedirector
 	}
 	return ComponentNameUnknown
 }
@@ -118,7 +129,8 @@ func ComponentNameFromString(s string) ComponentName {
 func ResolveInstallStatus(version string, bundleVersion string, lastExitStatus string, log Log) (installStatus keybase1.InstallStatus, installAction keybase1.InstallAction, status keybase1.Status) {
 	installStatus = keybase1.InstallStatus_UNKNOWN
 	installAction = keybase1.InstallAction_UNKNOWN
-	if version != "" && bundleVersion != "" {
+	switch {
+	case version != "" && bundleVersion != "":
 		sv, err := semver.Make(version)
 		if err != nil {
 			installStatus = keybase1.InstallStatus_ERROR
@@ -127,28 +139,29 @@ func ResolveInstallStatus(version string, bundleVersion string, lastExitStatus s
 			return
 		}
 		bsv, err := semver.Make(bundleVersion)
-		// Invalid bundle bersion
+		// Invalid bundle version
 		if err != nil {
 			installStatus = keybase1.InstallStatus_ERROR
 			installAction = keybase1.InstallAction_NONE
 			status = keybase1.StatusFromCode(keybase1.StatusCode_SCInvalidVersionError, err.Error())
 			return
 		}
-		if bsv.GT(sv) {
+		switch {
+		case bsv.GT(sv):
 			installStatus = keybase1.InstallStatus_INSTALLED
 			installAction = keybase1.InstallAction_UPGRADE
-		} else if bsv.EQ(sv) {
+		case bsv.EQ(sv):
 			installStatus = keybase1.InstallStatus_INSTALLED
 			installAction = keybase1.InstallAction_NONE
-		} else if bsv.LT(sv) {
+		case bsv.LT(sv):
 			// It's ok if we have a bundled version less than what was installed
 			log.Warning("Bundle version (%s) is less than installed version (%s)", bundleVersion, version)
 			installStatus = keybase1.InstallStatus_INSTALLED
 			installAction = keybase1.InstallAction_NONE
 		}
-	} else if version != "" && bundleVersion == "" {
+	case version != "" && bundleVersion == "":
 		installStatus = keybase1.InstallStatus_INSTALLED
-	} else if version == "" && bundleVersion != "" {
+	case version == "" && bundleVersion != "":
 		installStatus = keybase1.InstallStatus_NOT_INSTALLED
 		installAction = keybase1.InstallAction_INSTALL
 	}
@@ -179,19 +192,7 @@ func KBFSBundleVersion(context Context, binPath string) (string, error) {
 	return kbfsVersion, nil
 }
 
-func createCommandLine(binPath string, linkPath string, log Log) error {
-	if _, err := os.Lstat(linkPath); err == nil {
-		err := os.Remove(linkPath)
-		if err != nil {
-			return err
-		}
-	}
-
-	log.Info("Linking %s to %s", linkPath, binPath)
-	return os.Symlink(binPath, linkPath)
-}
-
-func defaultLinkPath() (string, error) {
+func defaultLinkPath() (string, error) { //nolint
 	if runtime.GOOS == "windows" {
 		return "", fmt.Errorf("Unsupported on Windows")
 	}
@@ -203,12 +204,7 @@ func defaultLinkPath() (string, error) {
 	return linkPath, nil
 }
 
-func uninstallCommandLine(log Log) error {
-	linkPath, err := defaultLinkPath()
-	if err != nil {
-		return nil
-	}
-
+func uninstallLink(linkPath string, log Log) error { //nolint
 	log.Debug("Link path: %s", linkPath)
 	fi, err := os.Lstat(linkPath)
 	if os.IsNotExist(err) {
@@ -230,12 +226,13 @@ func chooseBinPath(bp string) (string, error) {
 	return BinPath()
 }
 
-// BinPath returns path to the keybase executable
+// BinPath returns path to the keybase executable. If the executable path is a
+// symlink, the target path is returned.
 func BinPath() (string, error) {
-	return osext.Executable()
+	return utils.BinPath()
 }
 
-func binName() (string, error) {
+func binName() (string, error) { //nolint
 	path, err := BinPath()
 	if err != nil {
 		return "", err
@@ -250,7 +247,9 @@ func UpdaterBinPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	//nolint:staticcheck // SA4023: err always/never nil depending on GOOS
 	name, err := updaterBinName()
+	//nolint:staticcheck // SA4023: err always/never nil depending on GOOS
 	if err != nil {
 		return "", err
 	}
@@ -258,7 +257,7 @@ func UpdaterBinPath() (string, error) {
 }
 
 // kbfsBinPathDefault returns the default path to the KBFS executable.
-// If binPath (directory) is specifed, it will override the default (which is in
+// If binPath (directory) is specified, it will override the default (which is in
 // the same directory where the keybase executable is).
 func kbfsBinPathDefault(runMode libkb.RunMode, binPath string) (string, error) {
 	path, err := chooseBinPath(binPath)
@@ -268,14 +267,68 @@ func kbfsBinPathDefault(runMode libkb.RunMode, binPath string) (string, error) {
 	return filepath.Join(filepath.Dir(path), kbfsBinName()), nil
 }
 
-// TerminateApp will stop the Keybase (UI) app
-func TerminateApp(context Context, log Log) error {
-	appExecName := "Keybase"
-	logf := logger.NewLoggerf(log)
-	log.Info("Stopping Keybase app")
-	appPIDs := process.TerminateAll(process.NewMatcher(appExecName, process.ExecutableEqual, logf), 5*time.Second, logf)
-	if len(appPIDs) > 0 {
-		log.Info("Terminated %s %v", appExecName, appPIDs)
+type CommonLsofResult struct {
+	PID     string
+	Command string
+}
+
+func fileContainsWord(filePath, searchWord string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
 	}
-	return nil
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	var lineCount int
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), searchWord) {
+			return true
+		}
+		if lineCount >= 400 {
+			// if we haven't seen it yet, we won't
+			return false
+		}
+		lineCount++
+	}
+	return false
+}
+
+type fileWithPath struct {
+	os.FileInfo
+	Path string
+}
+
+func LastModifiedMatchingFile(filePattern string, fileContentMatch string) (filePath *string, err error) {
+	// find all paths that match the pattern
+	allFiles, err := filepath.Glob(filePattern)
+	if err != nil {
+		return nil, err
+	}
+	// loop through those file paths and get file info on each one
+	var fileObjects []fileWithPath
+	for _, path := range allFiles {
+		fileInfo, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		fileObjects = append(fileObjects, fileWithPath{
+			FileInfo: fileInfo,
+			Path:     path,
+		})
+	}
+	// sort them by most recently modified
+	sort.Slice(fileObjects, func(i, j int) bool {
+		return fileObjects[i].ModTime().Unix() > fileObjects[j].ModTime().Unix()
+	})
+	// loop through and return the first one that matches for content
+	for idx, f := range fileObjects {
+		if idx >= 200 {
+			// we've looked at a lot of files and couldn't find one that's relevant, just bail.
+			return nil, nil
+		}
+		if fileContainsWord(f.Path, fileContentMatch) {
+			return &f.Path, nil
+		}
+	}
+	return nil, nil
 }

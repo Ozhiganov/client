@@ -1,0 +1,12 @@
+.teamRow {
+  .fade {
+    opacity: 0;
+    transition: opacity 0.1s ease-out;
+  }
+  &:hover {
+    background-color: var(--color-blueLighter2);
+    .fade {
+      opacity: 1;
+    }
+  }
+}

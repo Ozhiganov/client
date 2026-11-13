@@ -2,41 +2,30 @@
 
 set -e -u -o pipefail # Fail on error
 
-dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$dir"
+# shellcheck source=packaging/lib.sh
+source "$dir/../lib.sh"
 
 build_dir=${BUILD_DIR:-/tmp/keybase}
 gopath=${GOPATH:-}
-package="github.com/keybase/go-updater/service"
+package="github.com/keybase/client/go/updater/service"
 dest="$build_dir/updater"
+arch=${ARCH:-"amd64"}
 
-src_dir="$gopath/src/$package"
+src_dir=${UPDATER_DIR:-"$gopath/src/$package"}
 cd "$src_dir"
 
 mkdir -p "$build_dir"
 
-ldflags=""
+echo "------------------ Building updater go ------------------"
+echo "Building $build_dir/updater with $(go version) on arch: $arch"
+GOARCH="$arch" go build -o "$dest" "$package"
+echo "------------------ Building updater go ------------------"
 
-if [ "$PLATFORM" = "darwin" ]; then
-  # To get codesign to work you have to use -ldflags "-s ...", see https://github.com/golang/go/issues/11887
-  ldflags="-s $ldflags"
+kb_sign_binary "$dest"
+
+if [ ! "$PLATFORM" = "darwin-arm64" ]; then # we can't run the arm64 binary on the amd64 build machine!
+	updater_version=$("$build_dir"/updater -version)
+	echo "Updater version: $updater_version"
 fi
-
-echo "Building $build_dir/updater"
-GO15VENDOREXPERIMENT=1 go build -a -ldflags "$ldflags" -o "$dest" "$package"
-
-if [ "$PLATFORM" = "darwin" ]; then
-  echo "Signing binary..."
-  code_sign_identity="Developer ID Application: Keybase, Inc. (99229SGT5K)"
-  codesign --verbose --force --deep --sign "$code_sign_identity" "$dest"
-elif [ "$PLATFORM" = "linux" ]; then
-  echo "No codesigning for linux"
-elif [ "$PLATFORM" = "windows" ]; then
-  echo "No codesigning for windows"
-else
-  echo "Invalid PLATFORM"
-  exit 1
-fi
-
-updater_version=`"$build_dir"/updater -version`
-echo "Updater version: $updater_version"

@@ -1,0 +1,61 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+// expo-camera resolves to an empty nulled module on desktop; only used in the
+// isMobile QRScannerMobile below.
+import {CameraView, useCameraPermissions} from 'expo-camera'
+
+type Props = {
+  onBarCodeRead: (code: string) => void
+  notAuthorizedView: React.ReactElement | null
+  style: Kb.Styles.StylesCrossPlatform
+}
+
+const QRScannerMobile = (p: Props): React.ReactElement | null => {
+  const styles = useStyles()
+  const {notAuthorizedView, onBarCodeRead, style} = p
+
+  const [scanned, setScanned] = React.useState(false)
+  const [permission, requestPermission] = useCameraPermissions!()
+
+  React.useEffect(() => {
+    if (!permission) {
+      requestPermission()
+        .then(() => {})
+        .catch(() => {})
+    }
+  }, [permission, requestPermission])
+
+  if (!permission) {
+    return (
+      <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.collapseStyles([style, styles.gettingPermissions])} />
+    )
+  }
+  if (!permission.granted) {
+    return notAuthorizedView || null
+  }
+
+  return (
+    <CameraView
+      barcodeScannerSettings={{barcodeTypes: ['qr']}}
+      onBarcodeScanned={({data}) => {
+        if (scanned) return
+        setScanned(true)
+        onBarCodeRead(data)
+      }}
+      style={style}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  gettingPermissions: {
+    backgroundColor: theme.greyLight,
+  },
+}))
+
+const QRScanner = (p: Props): React.ReactElement | null => {
+  if (!isMobile) return null
+  return <QRScannerMobile {...p} />
+}
+
+export default QRScanner

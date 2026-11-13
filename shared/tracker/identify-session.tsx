@@ -1,0 +1,518 @@
+import * as C from '@/constants'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {isQuietCancel, RPCError} from '@/util/errors'
+import {generateGUIID, ignorePromise} from '@/constants/utils'
+import {getVisibleScreen, navigateAppend, navigateUp} from '@/constants/router'
+import {produce} from 'immer'
+import {registerExternalResetter} from '@/util/zustand'
+import {subscribeToEngineAction} from '@/engine/action-listener'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useUsersState} from '@/stores/users'
+import {
+  identifyResultToDetailsState,
+  makeDetails,
+  noNonUserDetails,
+  updateTrackerDetailsBlocked,
+  updateTrackerDetailsReset,
+  updateTrackerDetailsResult,
+  updateTrackerDetailsRow,
+  updateTrackerDetailsSummary,
+  updateTrackerDetailsUserCard,
+} from './model'
+
+// One identify per user, shared by every surface showing that user. An
+// Identify3 with ignoreCache re-fetches every proof from the third party host,
+// so N surfaces each running their own identify is N times the load on those
+// hosts (and the service serializes them per uid, so they also run back to
+// back). Instead a single session per username owns the identify, accumulates
+// every identify3Ui event for it, and fans the result out to its subscribers -
+// including ones that join after the identify already started.
+type Session = {
+  details: T.Tracker.Details
+  generation: number
+  ignoreCache: boolean
+  inFlight: boolean
+  nonUserDetails: T.Tracker.NonUserDetails
+  // The own user changed while this identify was running, so its result may predate the change
+  rerunWhenDone: boolean
+  startedAt: number
+  username: string
+}
+
+export type IdentifyLoadOptions = {
+  // Join an identify that is already running only if it started at or after
+  // this timestamp, mirroring the singleflight in go/libkb/proof_cache.go.
+  // 0: any in-flight identify is good enough (mount, focus).
+  // Date.now(): only one started in reaction to the same event (notifications).
+  // Infinity: never join, always a fresh identify (explicit user reload).
+  freshAfter: number
+  ignoreCache: boolean
+  // Skip entirely if an identify at least this strong finished less than this
+  // long ago. Only the mount path sets it: reopening a profile you just looked
+  // at should not re-run every proof check. An explicit reload leaves it unset.
+  maxAgeMs?: number
+}
+
+// Every map here is keyed on the username, and callers do not agree on its case:
+// a profile opens with whatever the link or the row carried, while the shared
+// mutual-teams cache next to it lowercases. Two spellings of one person would
+// otherwise mean two sessions and two identifies - exactly what this file
+// exists to prevent. Assertions are case insensitive, so the canonical form is
+// safe to send to the service as well.
+const canonicalUsername = (username: string) => username.toLowerCase()
+
+const sessions = new Map<string, Session>()
+// Survives the session being dropped when it goes idle: closing a profile and
+// reopening it should still count as "we just checked this user". The entry holds
+// the session it vouches for, so a reopen that skips the identify because of it
+// brings back that session's result (followers and following included, even if
+// they landed after the drop) instead of a blank one.
+const lastCompleted = new Map<string, {at: number; ignoreCache: boolean; session: Session}>()
+// An entry is only ever read against the caller's maxAgeMs, and the longest one
+// any caller passes is the profile screen's 30s recheck window. Past this age it
+// can never suppress an identify again. There is no timer: an expired entry, and
+// the session it holds, is released the next time any username is looked up
+// (a getter, a subscribe, a load), an identify finishes, or a block notification
+// arrives - and none of those read or update it first.
+const lastCompletedTTLMs = 5 * 60_000
+
+const pruneLastCompleted = () => {
+  const now = Date.now()
+  for (const [username, done] of lastCompleted) {
+    if (now - done.at >= lastCompletedTTLMs) {
+      lastCompleted.delete(username)
+    }
+  }
+}
+const recentSession = (username: string) => {
+  pruneLastCompleted()
+  return lastCompleted.get(username)?.session
+}
+
+// Kept outside of Session so a subscriber stays attached to its username even
+// if the session object behind it is replaced.
+const subscribersByUsername = new Map<string, Set<() => void>>()
+
+const notify = (username: string) => {
+  const subscribers = subscribersByUsername.get(username)
+  if (!subscribers?.size) {
+    return
+  }
+  for (const cb of [...subscribers]) {
+    cb()
+  }
+}
+
+const setDetails = (s: Session, next: T.Tracker.Details) => {
+  if (next === s.details) {
+    return
+  }
+  s.details = next
+  notify(s.username)
+}
+
+const makeSession = (username: string): Session => ({
+  details: makeDetails(username),
+  generation: 0,
+  ignoreCache: false,
+  inFlight: false,
+  nonUserDetails: noNonUserDetails,
+  rerunWhenDone: false,
+  startedAt: 0,
+  username,
+})
+
+// the single place a raw username becomes a key; every s.username below is
+// therefore already canonical
+const ensureSession = (rawUsername: string) => {
+  const username = canonicalUsername(rawUsername)
+  const existing = sessions.get(username)
+  if (existing) {
+    return existing
+  }
+  const s = recentSession(username) ?? makeSession(username)
+  sessions.set(username, s)
+  return s
+}
+
+const dropSessionIfIdle = (s: Session) => {
+  if (s.inFlight || subscribersByUsername.get(s.username)?.size) {
+    return
+  }
+  if (sessions.get(s.username) === s) {
+    sessions.delete(s.username)
+  }
+}
+
+const sessionForGuiID = (guiID: string) => {
+  for (const s of sessions.values()) {
+    if (s.details.guiID === guiID) {
+      return s
+    }
+  }
+  return undefined
+}
+
+const loadNonUserDetails = async (s: Session, generation: number) => {
+  const assertion = s.username
+  try {
+    const res = await T.RPCGen.userSearchGetNonUserDetailsRpcPromise({assertion})
+    if (s.generation !== generation || !res.isNonUser) {
+      return
+    }
+    const common = {
+      assertionKey: res.assertionKey,
+      assertionValue: res.assertionValue,
+      description: res.description,
+      siteIcon: res.siteIcon || [],
+      siteIconDarkmode: res.siteIconDarkmode || [],
+      siteIconFull: res.siteIconFull || [],
+      siteIconFullDarkmode: res.siteIconFullDarkmode || [],
+      siteURL: '',
+    }
+    if (res.service) {
+      s.nonUserDetails = {...noNonUserDetails, ...common, ...res.service}
+      notify(s.username)
+    } else {
+      const {formatPhoneNumberInternational} = await import('@/util/phone-numbers')
+      const formattedName =
+        res.assertionKey === 'phone' ? formatPhoneNumberInternational('+' + res.assertionValue) : undefined
+      const fullName = res.contact?.contactName ?? ''
+      if (s.generation !== generation) {
+        return
+      }
+      s.nonUserDetails = {...noNonUserDetails, ...common, formattedName, fullName}
+      notify(s.username)
+    }
+  } catch (error) {
+    if (error instanceof RPCError) {
+      logger.warn(`Error loading non user profile: ${error.message}`)
+    }
+  } finally {
+    dropSessionIfIdle(s)
+  }
+}
+
+export const loadNonUserProfile = (username: string) => {
+  if (!username) {
+    return
+  }
+  const s = ensureSession(username)
+  ignorePromise(loadNonUserDetails(s, s.generation))
+}
+
+const isProfileOnScreen = (username: string) => {
+  const screen = getVisibleScreen(true)
+  const params = screen?.params as {username?: string} | undefined
+  return screen?.name === 'profile' && canonicalUsername(params?.username ?? '') === username
+}
+
+const runIdentify = async (s: Session, generation: number, guiID: string, ignoreCache: boolean) => {
+  try {
+    await T.RPCGen.identify3Identify3RpcListener({
+      // The identify3Ui events are handled by the engine action subscriptions below
+      globalFallthrough: ['keybase.1.identify3Ui.'],
+      incomingCallMap: {},
+      params: {assertion: s.username, guiID, ignoreCache},
+      waitingKey: C.waitingKeyTrackerProfileLoad,
+    })
+  } catch (error) {
+    // A cancel (an account switch, the session going away) is no failure of this user's identify
+    if (!(error instanceof RPCError) || s.generation !== generation || isQuietCancel(error)) {
+      return
+    }
+    if (error.code === T.RPCGen.StatusCode.scresolutionfailed) {
+      setDetails(
+        s,
+        produce(s.details, draft => {
+          draft.state = 'notAUserYet'
+        })
+      )
+      loadNonUserProfile(s.username)
+    } else if (error.code === T.RPCGen.StatusCode.scnotfound) {
+      setDetails(s, updateTrackerDetailsResult(s.details, 'error', `${s.username} does not exist.`))
+      // A profile link to a user that does not exist. Hover cards and lists identify too, and the
+      // user may have left the profile, so only the profile screen itself is replaced.
+      if (isProfileOnScreen(s.username)) {
+        navigateUp()
+        navigateAppend({
+          name: 'keybaseLinkError',
+          params: {
+            error: `You followed a profile link for a user (${s.username}) that does not exist.`,
+          },
+        })
+      }
+    }
+    logger.error(`Error loading profile: ${error.message}`)
+  } finally {
+    if (s.generation === generation) {
+      s.inFlight = false
+      pruneLastCompleted()
+      // Only an identify that reached a result vouches for the session. One that
+      // failed (network error, cancel) leaves it in 'checking', and an earlier
+      // entry for it would otherwise bring that back on a reopen and skip the
+      // identify that should replace it. Nor does one the user changed under.
+      const {state} = s.details
+      if (state === 'checking' || state === 'unknown' || s.rerunWhenDone) {
+        lastCompleted.delete(s.username)
+      } else {
+        lastCompleted.set(s.username, {at: Date.now(), ignoreCache: s.ignoreCache, session: s})
+      }
+      dropSessionIfIdle(s)
+      // Not once the session is gone: nobody shows it any more, or a store reset (account switch)
+      // dropped it and its user is no longer the own user.
+      if (s.rerunWhenDone && sessions.get(s.username) === s) {
+        // as strong as the identify it replaces: a forced remote check stays forced
+        loadProfileIdentify(s.username, {freshAfter: Infinity, ignoreCache: s.ignoreCache})
+      }
+    }
+  }
+}
+
+const loadFollowers = async (s: Session, generation: number) => {
+  try {
+    const fs = await T.RPCGen.userListTrackersUnverifiedRpcPromise(
+      {assertion: s.username},
+      C.waitingKeyTrackerProfileLoad
+    )
+    if (s.generation !== generation) {
+      return
+    }
+    setDetails(
+      s,
+      produce(s.details, draft => {
+        draft.followers = new Set((fs.users ?? []).map(f => f.username))
+        draft.followersCount = fs.users?.length ?? 0
+      })
+    )
+    if (fs.users) {
+      useUsersState
+        .getState()
+        .dispatch.updates(fs.users.map(u => ({info: {fullname: u.fullName}, name: u.username})))
+    }
+  } catch (error) {
+    if (error instanceof RPCError) {
+      logger.error(`Error loading follower info: ${error.message}`)
+    }
+  }
+}
+
+const loadFollowing = async (s: Session, generation: number) => {
+  try {
+    const fs = await T.RPCGen.userListTrackingRpcPromise(
+      {assertion: s.username, filter: ''},
+      C.waitingKeyTrackerProfileLoad
+    )
+    if (s.generation !== generation) {
+      return
+    }
+    setDetails(
+      s,
+      produce(s.details, draft => {
+        draft.following = new Set((fs.users ?? []).map(f => f.username))
+        draft.followingCount = fs.users?.length ?? 0
+      })
+    )
+    if (fs.users) {
+      useUsersState
+        .getState()
+        .dispatch.updates(fs.users.map(u => ({info: {fullname: u.fullName}, name: u.username})))
+    }
+  } catch (error) {
+    if (error instanceof RPCError) {
+      logger.error(`Error loading following info: ${error.message}`)
+    }
+  }
+}
+
+export const loadProfileIdentify = (rawUsername: string, options: IdentifyLoadOptions) => {
+  if (!rawUsername) {
+    return
+  }
+  // lastCompleted below is keyed the same way the session map is
+  const username = canonicalUsername(rawUsername)
+  ensureEngineSubscriptions()
+  const {freshAfter, ignoreCache} = options
+  const s = ensureSession(username)
+  // A weaker in-flight identify (one that was allowed to use the proof cache)
+  // cannot stand in for a caller that asked for a forced remote check.
+  const strongEnough = s.ignoreCache || !ignoreCache
+  if (s.inFlight && strongEnough && s.startedAt >= freshAfter) {
+    return
+  }
+  // A recent finished identify counts too, so long as it was at least as strong
+  // as what is being asked for now.
+  const {maxAgeMs} = options
+  const done = lastCompleted.get(username)
+  if (maxAgeMs !== undefined && done && (done.ignoreCache || !ignoreCache) && Date.now() - done.at < maxAgeMs) {
+    return
+  }
+
+  const guiID = generateGUIID()
+  const generation = ++s.generation
+  s.ignoreCache = ignoreCache
+  s.inFlight = true
+  s.rerunWhenDone = false
+  s.startedAt = Date.now()
+  setDetails(
+    s,
+    produce(s.details, draft => {
+      // Rows and the proof count are accumulated per identify, so a proof that
+      // is gone now would otherwise outlive it. The user card, followers and
+      // following are each replaced whole when they land, so they stay shown.
+      draft.assertions = new Map()
+      draft.numAssertionsExpected = undefined
+      draft.guiID = guiID
+      if (!draft.resetBrokeTrack) {
+        draft.reason = ''
+      }
+      draft.state = 'checking'
+    })
+  )
+  ignorePromise(runIdentify(s, generation, guiID, ignoreCache))
+  ignorePromise(loadFollowers(s, generation))
+  ignorePromise(loadFollowing(s, generation))
+}
+
+// Registered once, for the lifetime of the module: each listener looks its session up when an
+// action arrives, and a store reset clears the sessions, not the subscriptions.
+let engineSubscribed = false
+const ensureEngineSubscriptions = () => {
+  if (engineSubscribed) {
+    return
+  }
+  engineSubscribed = true
+
+  subscribeToEngineAction('keybase.1.identify3Ui.identify3Result', action => {
+    const {guiID, result} = action.payload.params
+    const s = sessionForGuiID(guiID)
+    // the result of an identify the own user changed under is replaced by its rerun's, so it is not
+    // shown as settled meanwhile
+    if (!s || s.rerunWhenDone) {
+      return
+    }
+    setDetails(s, updateTrackerDetailsResult(s.details, identifyResultToDetailsState(result)))
+  })
+
+  subscribeToEngineAction('keybase.1.identify3Ui.identify3UpdateRow', action => {
+    const {row} = action.payload.params
+    const s = sessionForGuiID(row.guiID)
+    if (!s) {
+      return
+    }
+    setDetails(s, updateTrackerDetailsRow(s.details, row))
+  })
+
+  subscribeToEngineAction('keybase.1.identify3Ui.identify3UserReset', action => {
+    const s = sessionForGuiID(action.payload.params.guiID)
+    if (!s) {
+      return
+    }
+    setDetails(s, updateTrackerDetailsReset(s.details))
+  })
+
+  subscribeToEngineAction('keybase.1.identify3Ui.identify3UpdateUserCard', action => {
+    const {guiID, card} = action.payload.params
+    const s = sessionForGuiID(guiID)
+    if (!s) {
+      return
+    }
+    setDetails(s, updateTrackerDetailsUserCard(s.details, card))
+    useUsersState.getState().dispatch.updates([{info: {fullname: card.fullName}, name: s.username}])
+  })
+
+  subscribeToEngineAction('keybase.1.identify3Ui.identify3Summary', action => {
+    const {summary} = action.payload.params
+    const s = sessionForGuiID(summary.guiID)
+    if (!s) {
+      return
+    }
+    setDetails(s, updateTrackerDetailsSummary(s.details, summary))
+  })
+
+  subscribeToEngineAction('keybase.1.NotifyTracking.notifyUserBlocked', action => {
+    pruneLastCompleted()
+    const all = new Set([...sessions.values(), ...[...lastCompleted.values()].map(done => done.session)])
+    for (const s of all) {
+      setDetails(s, updateTrackerDetailsBlocked(s.details, action.payload.params.b))
+    }
+  })
+
+  subscribeToEngineAction('keybase.1.NotifyTracking.trackingChanged', action => {
+    const username = canonicalUsername(action.payload.params.username)
+    // a closed profile's result is stale now too, so a reopen must not reuse it
+    lastCompleted.delete(username)
+    const s = sessions.get(username)
+    if (!s?.details.guiID) {
+      return
+    }
+    loadProfileIdentify(s.username, {freshAfter: Date.now(), ignoreCache: true})
+  })
+
+  subscribeToEngineAction('keybase.1.NotifyUsers.userChanged', action => {
+    const {uid, username: rawUsername} = useCurrentUserState.getState()
+    const username = rawUsername ? canonicalUsername(rawUsername) : ''
+    if (!username || uid !== action.payload.params.uid) {
+      return
+    }
+    lastCompleted.delete(username)
+    const s = sessions.get(username)
+    if (!s) {
+      return
+    }
+    // After an account switch the service sends a burst of these (one per self load that found its
+    // cache stale). Restarting on each one queues an identify per notice behind the service's per-uid
+    // lock and keeps the profile checking until the last; one identify after the running one is enough.
+    if (s.inFlight) {
+      s.rerunWhenDone = true
+      // its result may already have landed, before the RPC returns
+      if (s.details.state !== 'checking') {
+        setDetails(
+          s,
+          produce(s.details, draft => {
+            draft.state = 'checking'
+          })
+        )
+      }
+      return
+    }
+    loadProfileIdentify(username, {freshAfter: Date.now(), ignoreCache: false})
+  })
+}
+
+export const subscribeToProfile = (rawUsername: string, cb: () => void) => {
+  const username = canonicalUsername(rawUsername)
+  ensureSession(username)
+  let subscribers = subscribersByUsername.get(username)
+  if (!subscribers) {
+    subscribers = new Set()
+    subscribersByUsername.set(username, subscribers)
+  }
+  subscribers.add(cb)
+  return () => {
+    subscribers.delete(cb)
+    if (!subscribers.size) {
+      subscribersByUsername.delete(username)
+    }
+    const s = sessions.get(username)
+    if (s) {
+      dropSessionIfIdle(s)
+    }
+  }
+}
+
+// A reopened profile's first render comes before its subscribe brings the
+// recent session back, so the getters read it from there as well.
+const findSession = (rawUsername: string) => {
+  const username = canonicalUsername(rawUsername)
+  const recent = recentSession(username)
+  return sessions.get(username) ?? recent
+}
+export const getProfileDetails = (username: string) => findSession(username)?.details
+export const getProfileNonUserDetails = (username: string) => findSession(username)?.nonUserDetails
+
+registerExternalResetter('tracker-identify-sessions', () => {
+  sessions.clear()
+  lastCompleted.clear()
+})

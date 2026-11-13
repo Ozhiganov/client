@@ -3,24 +3,26 @@
 
 package engine
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestSigsList(t *testing.T) {
 	tc := SetupEngineTest(t, "sigslist")
 	defer tc.Cleanup()
 
-	ctx := &Context{}
 	args := SigsListArgs{Username: "t_alice"}
-	eng := NewSigsList(args, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewSigsList(tc.G, args)
+	m := NewMetaContextForTest(tc)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	s := eng.Sigs()
-	if len(s) != 3 {
-		t.Errorf("t_alice sig count: %d, expected 3", len(s))
-		for _, s := range eng.Sigs() {
-			t.Logf("sig: %+v\n", s)
-		}
+	require.Len(t, s, 3, "t_alice sig count: %d, expected 3", len(s))
+	for _, s := range eng.Sigs() {
+		t.Logf("sig: %+v\n", s)
 	}
 }

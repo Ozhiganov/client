@@ -1,0 +1,268 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import * as T from '@/constants/types'
+import {useNavigation} from '@react-navigation/native'
+import {Avatars, TeamAvatar} from '@/chat/avatars'
+import logger from '@/logger'
+import {useConversationMessage} from './data-hooks'
+import {getChatRpc} from './chat-rpc'
+import type {RPCError} from '@/util/errors'
+import {registerExternalResetter} from '@/util/zustand'
+
+type Props = {conversationIDKey?: T.Chat.ConversationIDKey; messageID: T.Chat.MessageID}
+
+type PickerState = 'picker' | 'title'
+
+const forwardMessageHandoff = new Map<string, T.Chat.Message>()
+const forwardMessageKey = (conversationIDKey: T.Chat.ConversationIDKey, messageID: T.Chat.MessageID) =>
+  `${conversationIDKey}:${T.Chat.messageIDToNumber(messageID)}`
+
+// module scope outlives sign-out; holds message bodies keyed by conversation
+registerExternalResetter('chat-forward-message-handoff', () => {
+  forwardMessageHandoff.clear()
+})
+
+const getForwardMessage = (conversationIDKey: T.Chat.ConversationIDKey, messageID: T.Chat.MessageID) => {
+  const key = forwardMessageKey(conversationIDKey, messageID)
+  return forwardMessageHandoff.get(key)
+}
+
+export const showForwardMessagePicker = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  message: T.Chat.Message | undefined
+) => {
+  if (!message || !T.Chat.messageIDToNumber(message.id)) {
+    logger.warn('showForwardMessagePicker: no message id')
+    return
+  }
+  const key = forwardMessageKey(conversationIDKey, message.id)
+  forwardMessageHandoff.set(key, message)
+  C.Router2.navigateAppend({
+    name: 'chatForwardMsgPick',
+    params: {conversationIDKey, messageID: message.id},
+  })
+}
+
+const TeamPickerInner = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const srcConvID = props.conversationIDKey ?? Chat.noConversationIDKey
+  const messageID = props.messageID
+  const handoffKey = forwardMessageKey(srcConvID, messageID)
+  const [initialMessage] = React.useState(() => getForwardMessage(srcConvID, messageID))
+  const loadedMessage = useConversationMessage(srcConvID, messageID)
+  const message = loadedMessage ?? initialMessage
+  const navigation = useNavigation()
+  const [pickerState, setPickerState] = React.useState<PickerState>('picker')
+  const [term, setTerm] = React.useState('')
+  const setSearchTerm = C.useDebouncedCallback(setTerm, 200)
+  const destinationRef = React.useRef<T.Chat.ConversationIDKey | undefined>(undefined)
+  const [results, setResults] = React.useState<ReadonlyArray<T.RPCChat.ConvSearchHit>>([])
+  const [loadedTerm, setLoadedTerm] = React.useState<string>()
+  const [error, setError] = React.useState('')
+  const waiting = loadedTerm !== term
+
+  React.useEffect(() => {
+    forwardMessageHandoff.delete(handoffKey)
+  }, [handoffKey])
+
+  React.useEffect(() => {
+    let stale = false
+    getChatRpc()
+      .searchForwardDestinations(term)
+      .then(result => {
+        if (stale) return
+        setLoadedTerm(term)
+        setError('')
+        setResults(result)
+      })
+      .catch((error: RPCError) => {
+        if (stale) return
+        setLoadedTerm(term)
+        setError('Something went wrong, please try again.')
+        logger.info('TeamPicker: error loading search results: ' + error.message)
+      })
+    return () => {
+      stale = true
+    }
+  }, [term])
+
+  const clearModals = C.Router2.clearModals
+  const onClose = () => {
+    clearModals()
+  }
+
+  const [title, setTitle] = React.useState('')
+
+  let preview: React.ReactNode = (
+    <Kb.Box2 direction="vertical" fullWidth={true} fullHeight={true} centerChildren={true}>
+      <Kb.ImageIcon type="icon-file-uploading-48" />
+    </Kb.Box2>
+  )
+
+  if (message?.type === 'attachment') {
+    switch (message.attachmentType) {
+      case 'image':
+        if (message.inlineVideoPlayable) {
+          const url = `${message.fileURL}&contentforce=true`
+          preview = url ? <Kb.Video autoPlay={false} allowFile={true} url={url} muted={true} /> : null
+        } else {
+          const src = message.fileURL || message.previewURL
+          preview = src ? <Kb.ZoomableImage src={src} style={styles.image} boxCacheKey="fwdimg" /> : null
+        }
+        break
+      default:
+        // heics
+        if (Chat.isImageViewable(message)) {
+          const src = message.fileURL || message.previewURL
+          preview = src ? <Kb.ZoomableImage src={src} style={styles.image} boxCacheKey="fwdheics" /> : null
+        }
+    }
+  }
+
+  const previewConversation = C.Router2.previewConversation
+  const onSubmit = (event?: React.BaseSyntheticEvent) => {
+    event?.preventDefault()
+    event?.stopPropagation()
+    const destination = destinationRef.current
+    if (!destination || !message) return
+    previewConversation({conversationIDKey: destination, reason: 'forward'})
+    getChatRpc()
+      .forwardMessage({conversationIDKey: srcConvID, destination, messageID: message.id, title})
+      .catch((error: RPCError) => {
+        logger.info('TeamPicker: error forwarding message: ' + error.message)
+      })
+    clearModals()
+  }
+
+  const onSelect = (dstConvID: T.RPCChat.ConversationID) => {
+    if (!message) {
+      setError('Something went wrong, please try again.')
+      return
+    }
+
+    destinationRef.current = T.Chat.conversationIDToKey(dstConvID)
+
+    if (message.type === 'attachment') {
+      setPickerState('title')
+    } else {
+      onSubmit()
+    }
+  }
+
+  const renderResult = (index: number, item: T.RPCChat.ConvSearchHit) => {
+    return (
+      <Kb.ClickableBox key={index} onClick={() => onSelect(item.convID)} direction="horizontal" fullWidth={true} gap="tiny" style={styles.results} testID={TestIDs.CHAT_FORWARD_RESULT}>
+        {item.isTeam ? (
+          <TeamAvatar
+            isMuted={false}
+            isSelected={false}
+            teamname={item.name.split('#')[0] ?? ''}
+          />
+        ) : (
+          <Avatars participantOne={item.parts?.[0]} participantTwo={item.parts?.[1]} />
+        )}
+        <Kb.Text type="Body" style={{alignSelf: 'center'}}>
+          {item.name}
+        </Kb.Text>
+      </Kb.ClickableBox>
+    )
+  }
+
+  const showError = !waiting && error.length > 0
+  const content =
+    pickerState === 'picker' ? (
+      <Kb.ModalScreen scroll={false} padding="none">
+        <Kb.Box2 direction="horizontal" fullWidth={true} testID={TestIDs.CHAT_FORWARD_SEARCH}>
+          <Kb.SearchFilter
+            size="full-width"
+            icon="iconfont-search"
+            placeholderText={`Search chats and teams...`}
+            placeholderCentered={true}
+            onChange={setSearchTerm}
+            style={styles.searchFilter}
+            focusOnMount={true}
+            waiting={waiting}
+          />
+        </Kb.Box2>
+        {showError ? (
+          <Kb.Text type="Body" style={{alignSelf: 'center', color: theme.redDark}}>
+            {error}
+          </Kb.Text>
+        ) : (
+          <Kb.BoxGrow2>
+            <Kb.List
+              indexAsKey={true}
+              items={results}
+              itemHeight={{sizeType: 'Large', type: 'fixedListItemAuto'}}
+              renderItem={renderResult}
+            />
+          </Kb.BoxGrow2>
+        )}
+      </Kb.ModalScreen>
+    ) : (
+      <Kb.ModalScreen
+        scroll={false}
+        footer={
+          <Kb.ConfirmButtons split={true} onCancel={onClose} onConfirm={onSubmit} confirmLabel="Send" />
+        }
+      >
+        <Kb.BoxGrow2 style={styles.boxGrow}>{preview}</Kb.BoxGrow2>
+        <Kb.Input3
+          containerStyle={styles.input}
+          autoFocus={true}
+          autoCorrect={true}
+          placeholder="Add a caption..."
+          onEnterKeyDown={onSubmit}
+          onChangeText={setTitle}
+          value={title}
+          selectTextOnFocus={true}
+          testID={TestIDs.CHAT_FORWARD_CAPTION}
+        />
+      </Kb.ModalScreen>
+    )
+
+  React.useEffect(() => {
+    navigation.setOptions({title: pickerState === 'picker' ? 'Forward to team or chat' : 'Add a caption'})
+  }, [navigation, pickerState])
+
+  return content
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      boxGrow: {marginBottom: Kb.Styles.globalMargins.small},
+      image: {
+        height: '100%',
+        maxHeight: '100%',
+        maxWidth: '100%',
+        width: '100%',
+      },
+      input: {
+        borderColor: theme.blue,
+        minHeight: 40,
+        width: '100%',
+      },
+      results: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+        },
+        isMobile: {paddingBottom: Kb.Styles.globalMargins.tiny},
+      }),
+      searchFilter: Kb.Styles.platformStyles({
+        common: {
+          marginBottom: Kb.Styles.globalMargins.xsmall,
+          marginTop: Kb.Styles.globalMargins.tiny,
+        },
+        isElectron: {
+          ...Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+        },
+      }),
+    }) as const
+)
+
+export default TeamPickerInner

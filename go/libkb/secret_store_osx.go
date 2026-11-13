@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build darwin,!ios
+//go:build darwin && !ios
 
 package libkb
 
@@ -18,7 +18,7 @@ func (k KeychainSecretStore) accessible() keychain.Accessible {
 	return keychain.AccessibleAfterFirstUnlockThisDeviceOnly
 }
 
-func (k KeychainSecretStore) accessGroup() string {
+func (k KeychainSecretStore) accessGroup(m MetaContext) string {
 	// Don't use access group on OS X
 	return ""
 }

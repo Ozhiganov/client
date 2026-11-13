@@ -1,12 +1,13 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build darwin
+//go:build darwin
 
 package client
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/install"
@@ -49,19 +50,31 @@ func newCmdCtlStart(g *libkb.GlobalContext) *cmdCtlStart {
 	}
 }
 
+// ctlParseArgv returns map with include/exclude components
+func ctlParseArgv(ctx *cli.Context) map[string]bool {
+	components := defaultCtlComponents(true)
+	if ctx.String("exclude") != "" {
+		excluded := strings.SplitSeq(ctx.String("exclude"), ",")
+		for exclude := range excluded {
+			components[exclude] = false
+		}
+	}
+	if ctx.String("include") != "" {
+		included := strings.Split(ctx.String("include"), ",")
+		components = defaultCtlComponents(false)
+		for _, include := range included {
+			components[include] = true
+		}
+	}
+	return components
+}
+
 func (s *cmdCtlStart) ParseArgv(ctx *cli.Context) error {
 	s.components = ctlParseArgv(ctx)
 	return nil
 }
 
-func ctlBrewStart(g *libkb.GlobalContext) error {
-	return startLaunchdService(g, install.DefaultServiceLabel(g.Env.GetRunMode()), g.Env.GetServiceInfoPath(), true)
-}
-
 func ctlStart(g *libkb.GlobalContext, components map[string]bool) error {
-	if libkb.IsBrewBuild {
-		return ctlBrewStart(g)
-	}
 	g.Log.Debug("Components: %v", components)
 	errs := []error{}
 	if ok := components[install.ComponentNameService.String()]; ok {
@@ -71,7 +84,7 @@ func ctlStart(g *libkb.GlobalContext, components map[string]bool) error {
 		}
 	}
 	if ok := components[install.ComponentNameKBFS.String()]; ok {
-		if err := install.InstallKBFS(g, "", false, defaultLaunchdWait, g.Log); err != nil {
+		if err := install.InstallKBFS(g, "", false, false, defaultLaunchdWait, g.Log); err != nil {
 			errs = append(errs, err)
 			g.Log.Errorf("%s", err)
 		}

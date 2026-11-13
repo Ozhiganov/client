@@ -1,0 +1,131 @@
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import PieSlice from './pie-slice'
+import UploadIcon from './upload-icon'
+
+type Props = {
+  isTlfType?: boolean
+  isFolder: boolean
+  statusIcon?: T.FS.PathStatusIcon
+  showTooltipOnPressMobile?: boolean
+}
+
+function getIcon(status: T.FS.LocalConflictStatusType | T.FS.NonUploadStaticSyncStatus): Kb.IconType {
+  switch (status) {
+    case T.FS.NonUploadStaticSyncStatus.AwaitingToSync:
+      return 'iconfont-clock'
+    case T.FS.NonUploadStaticSyncStatus.OnlineOnly:
+      return 'iconfont-cloud'
+    case T.FS.NonUploadStaticSyncStatus.Synced:
+      return 'iconfont-success'
+    case T.FS.NonUploadStaticSyncStatus.SyncError:
+      return 'iconfont-exclamation'
+    case T.FS.LocalConflictStatus:
+      return 'iconfont-exclamation'
+    case T.FS.NonUploadStaticSyncStatus.Unknown:
+      return 'iconfont-circle'
+  }
+}
+
+function getColor(status: T.FS.LocalConflictStatusType | T.FS.NonUploadStaticSyncStatus, theme: Kb.Styles.Theme) {
+  switch (status) {
+    case T.FS.NonUploadStaticSyncStatus.AwaitingToSync:
+    case T.FS.NonUploadStaticSyncStatus.OnlineOnly:
+      return theme.blue
+    case T.FS.NonUploadStaticSyncStatus.Unknown:
+      return theme.greyDark
+    case T.FS.NonUploadStaticSyncStatus.Synced:
+      return theme.green
+    case T.FS.NonUploadStaticSyncStatus.SyncError:
+      return theme.red
+    case T.FS.LocalConflictStatus:
+      return theme.red
+  }
+}
+
+function getTooltip(statusIcon: T.FS.PathStatusIcon, isFolder: boolean): string {
+  if (typeof statusIcon === 'number') {
+    return 'Syncing ' + String(Math.floor(statusIcon * 100)) + '%...'
+  }
+
+  switch (statusIcon) {
+    case T.FS.NonUploadStaticSyncStatus.AwaitingToSync:
+      return 'Waiting to sync'
+    case T.FS.UploadIcon.AwaitingToUpload:
+      return 'Local ' + (isFolder ? 'folder' : 'file') + '. Upload will start once you get back online.'
+    case T.FS.UploadIcon.Uploading:
+      return 'Uploading...'
+    case T.FS.UploadIcon.UploadingStuck:
+      return 'Stuck in conflict resolution. Upload will start once you resolve conflict.'
+    case T.FS.NonUploadStaticSyncStatus.OnlineOnly:
+      return 'Online only'
+    case T.FS.NonUploadStaticSyncStatus.Synced:
+      return 'Synced'
+    case T.FS.NonUploadStaticSyncStatus.SyncError:
+      return (isFolder ? 'Folder' : 'File') + " couldn't sync"
+    case T.FS.LocalConflictStatus:
+      return 'Local view of a conflicted folder.'
+    case T.FS.NonUploadStaticSyncStatus.Unknown:
+      return 'Unknown sync state'
+  }
+}
+
+function PathStatusIcon(props: Props) {
+  const theme = Kb.Styles.useTheme()
+  const styles = useStyles()
+  return props.statusIcon ? (
+    <Kb.WithTooltip
+      tooltip={getTooltip(props.statusIcon, props.isFolder)}
+      showOnPressMobile={props.showTooltipOnPressMobile}
+    >
+      {typeof props.statusIcon === 'number' ? (
+        <Kb.Box2 alignSelf="center" direction="horizontal" style={{margin: Kb.Styles.globalMargins.xtiny}}>
+          <PieSlice degrees={360 * props.statusIcon} />
+        </Kb.Box2>
+      ) : props.statusIcon === T.FS.UploadIcon.AwaitingToUpload ||
+        props.statusIcon === T.FS.UploadIcon.Uploading ||
+        props.statusIcon === T.FS.UploadIcon.UploadingStuck ? (
+        <UploadIcon uploadIcon={props.statusIcon} style={styles.iconNonFont} />
+      ) : (
+        <Kb.Icon
+          type={getIcon(props.statusIcon)}
+          sizeType="Small"
+          style={styles.iconFont}
+          color={getColor(props.statusIcon, theme)}
+        />
+      )}
+    </Kb.WithTooltip>
+  ) : props.isTlfType ? (
+    <Kb.Icon type="iconfont-root" sizeType="Small" style={styles.iconFont} />
+  ) : (
+    <Kb.Box2 alignSelf="center" direction="vertical" style={styles.placeholder} />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  iconFont: {
+    alignSelf: 'center',
+    ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xtiny),
+  },
+  iconNonFont: Kb.Styles.platformStyles({
+    common: {
+      ...Kb.Styles.marginH(Kb.Styles.globalMargins.xtiny),
+    },
+    isElectron: {
+      ...Kb.Styles.size(Kb.Styles.globalMargins.xsmall),
+    },
+    isMobile: {
+      ...Kb.Styles.size(Kb.Styles.globalMargins.small),
+    },
+  }),
+  placeholder: Kb.Styles.platformStyles({
+    isElectron: {
+      ...Kb.Styles.size(Kb.Styles.globalMargins.xsmall + Kb.Styles.globalMargins.xtiny),
+    },
+    isMobile: {
+      ...Kb.Styles.size(Kb.Styles.globalMargins.small + Kb.Styles.globalMargins.xtiny),
+    },
+  }),
+}))
+
+export default PathStatusIcon

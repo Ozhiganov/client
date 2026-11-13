@@ -1,0 +1,518 @@
+import * as Common from '@/constants/chat/common'
+import * as Message from '@/constants/chat/message'
+import * as Meta from '@/constants/chat/meta'
+import * as Strings from '@/constants/strings'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {ignorePromise} from '@/constants/utils'
+import {RPCError} from '@/util/errors'
+import {persistRoute} from '@/util/storeless-actions'
+import {uint8ArrayToString} from '@/util/uint8array'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useConfigState} from '@/stores/config'
+import {type ThreadLoadReconcile, getOrdinalForMessageID} from './thread-message-state'
+import {getInboxConversationMeta, updateInboxConversationMeta} from '@/chat/inbox/metadata'
+import {conversationGone} from '@/chat/inbox/selection'
+import type {ChatThreadRpc} from './chat-rpc'
+import type {
+  ConversationThreadActions,
+  ConversationThreadState,
+  LoadMoreMessagesParams,
+  ScrollDirection,
+} from './thread-store'
+
+// Identifies one load, so the window gate can tell two loads of the same conversation apart.
+// Only ever compared for equality, never ordered.
+let nextLoadID = 0
+
+export const numMessagesOnInitialLoad = isMobile ? 20 : 100
+// How far the no-new-ordinals scroll-page chain will walk on its own before handing the thread back
+// to the reader. See the reload block in loadConversationThreadMessages.
+export const maxPageReloads = 10
+export const numMessagesOnScrollback = 100
+
+const ignoreErrors = [
+  T.RPCGen.StatusCode.scgenericapierror,
+  T.RPCGen.StatusCode.scapinetworkerror,
+  T.RPCGen.StatusCode.sctimeout,
+]
+
+// The inbox metadata store is the single owner of conversation meta; fall back to
+// an empty meta for reads that predate an unbox.
+export const emptyConversationMeta = Meta.makeConversationMeta()
+export const getMeta = (id: T.Chat.ConversationIDKey) => getInboxConversationMeta(id) ?? emptyConversationMeta
+
+export const getCurrentUser = () => {
+  const s = useCurrentUserState.getState()
+  return {devicename: s.deviceName, username: s.username}
+}
+
+export const getExplodingModeFromGregorItems = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  items: ReadonlyArray<{item: T.RPCGen.Gregor1.Item}>
+) => {
+  const explodingItems = items.filter(i => i.item.category.startsWith(Common.explodingModeGregorKeyPrefix))
+  if (!explodingItems.length) {
+    return 0
+  }
+  const category = `${Common.explodingModeGregorKeyPrefix}${conversationIDKey}`
+  const item = explodingItems.find(i => i.item.category === category)
+  if (!item) {
+    // Other conversations have exploding modes but this one's category is absent,
+    // meaning it was dismissed: the mode is off.
+    return 0
+  }
+  const secondsString = uint8ArrayToString(item.item.body)
+  const seconds = parseInt(secondsString, 10)
+  if (isNaN(seconds)) {
+    logger.warn(`Got dirty exploding mode ${secondsString} for category ${category}`)
+    return undefined
+  }
+  return seconds
+}
+
+export const getExplodingModeFromConfig = (conversationIDKey: T.Chat.ConversationIDKey) =>
+  getExplodingModeFromGregorItems(conversationIDKey, useConfigState.getState().gregorPushState) ?? 0
+
+export const persistExplodingMode = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  meta: T.Chat.ConversationMeta,
+  seconds: number,
+  rpc: ChatThreadRpc
+) => {
+  const f = async () => {
+    logger.info(`Setting exploding mode for conversation ${conversationIDKey} to ${seconds}`)
+    const convRetention = Meta.getEffectiveRetentionPolicy(meta)
+    try {
+      if (seconds === 0 || seconds === convRetention.seconds) {
+        await rpc.clearExplodingMode(conversationIDKey)
+      } else {
+        await rpc.setExplodingMode(conversationIDKey, seconds)
+        logger.info(`Successfully set exploding mode for conversation ${conversationIDKey} to ${seconds}`)
+      }
+    } catch (error) {
+      if (error instanceof RPCError) {
+        if (seconds !== 0) {
+          logger.error(
+            `Failed to set exploding mode for conversation ${conversationIDKey} to ${seconds}. Service responded with: ${error.message}`
+          )
+        } else {
+          logger.error(
+            `Failed to unset exploding mode for conversation ${conversationIDKey}. Service responded with: ${error.message}`
+          )
+        }
+        if (ignoreErrors.includes(error.code)) {
+          return
+        }
+      }
+      throw error
+    }
+  }
+  ignorePromise(f())
+}
+
+export const threadLoadReasonToRPCReason = (reason: string): T.RPCChat.GetThreadReason => {
+  switch (reason) {
+    case 'extension':
+    case 'push':
+      return T.RPCChat.GetThreadReason.push
+    default:
+      return T.RPCChat.GetThreadReason.general
+  }
+}
+
+export const getLastOrdinalFromSnapshot = (snapshot: ConversationThreadState) =>
+  snapshot.messageOrdinals?.at(-1) ?? T.Chat.numberToOrdinal(0)
+
+// Where the next scroll page that way is asked from: the newest or oldest message the window holds
+// that the service knows (pending sends have no ID yet), or past it, as far as earlier pages that
+// way carried messages the thread never renders.
+const pagingPivot = (snapshot: ConversationThreadState, direction: 'back' | 'forward') => {
+  const newest = direction === 'forward'
+  const paged = newest ? snapshot.pagedNewestMessageID : snapshot.pagedOldestMessageID
+  const ordinals = snapshot.messageOrdinals ?? []
+  for (let n = 0; n < ordinals.length; n++) {
+    const ordinal = ordinals[newest ? ordinals.length - 1 - n : n]!
+    const id = snapshot.messageMap.get(ordinal)?.id
+    if (id && T.Chat.messageIDToNumber(id) > 0) {
+      if (paged === undefined) return id
+      return newest ? (id > paged ? id : paged) : id < paged ? id : paged
+    }
+  }
+  return paged
+}
+
+export const getOrdinalForMessageIDInSnapshot = (
+  snapshot: ConversationThreadState,
+  messageID: T.Chat.MessageID
+) =>
+  getOrdinalForMessageID(
+    snapshot.messageMap,
+    snapshot.pendingOutboxToOrdinal,
+    messageID,
+    snapshot.messageIDToOrdinal
+  )
+
+export const scrollDirectionToPagination = (
+  scrollDirection: ScrollDirection,
+  numberOfMessagesToLoad: number
+) => {
+  const pagination = {
+    last: false,
+    next: '',
+    num: numberOfMessagesToLoad,
+    previous: '',
+  }
+  switch (scrollDirection) {
+    case 'none':
+      break
+    case 'back':
+      pagination.next = 'deadbeef'
+      break
+    case 'forward':
+      pagination.previous = 'deadbeef'
+  }
+  return pagination
+}
+
+// Thread load failures handled in the load itself or expected. These and a cancel (which ignorePromise
+// keeps quiet) are not worth an error-level log.
+const quietThreadLoadErrors = new Set<number>([
+  T.RPCGen.StatusCode.scchatnotinteam,
+  T.RPCGen.StatusCode.scchatnotinconv,
+  T.RPCGen.StatusCode.scteamreaderror,
+])
+
+export const loadConversationThreadMessages = (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  p: LoadMoreMessagesParams,
+  actions: ConversationThreadActions
+) => {
+  if (!T.Chat.isValidConversationIDKey(conversationIDKey)) {
+    return
+  }
+  const {
+    scrollDirection = 'none',
+    numberOfMessagesToLoad = numMessagesOnInitialLoad,
+    retryCount = 0,
+  } = p
+  const {
+    allowMarkAsRead = true,
+    reason,
+    forceContainsLatestCalc,
+    messageIDControl,
+    knownRemotes,
+    centeredMessageID,
+    isThreadLoadCurrent,
+    onThreadLoadStatus,
+  } = p
+  const isCurrentThreadLoad = () => isThreadLoadCurrent?.() ?? true
+
+  const f = async () => {
+    const loadStartedSnapshot = actions.getSnapshot()
+    const clearVersionAtLoadStart = loadStartedSnapshot.clearVersion
+    // applyThreadLoad drops the window gate when a load refills the window, but a load can end
+    // without ever applying: offline, scchatnotinteam, a response carrying no thread, or a bail
+    // before the RPC is even made. Left alone the gate would keep dropping notifications for the
+    // life of the provider, which is a thread that silently stops receiving messages.
+    //
+    // Keyed on clearVersion, not on isThreadLoadCurrent: the load generation only moves when the
+    // conversation changes or the thread unmounts, so two loads of the same conversation both call
+    // themselves current. A load that started before the clear would otherwise pull down the gate
+    // belonging to the load that started after it, while that one is still in flight.
+    //
+    // clearVersion alone still cannot separate two loads issued after the same clear, so the gate
+    // is also owned: first claim wins, and only the owner may drop it. Claimed here, before the
+    // first await, rather than when a response arrives - both clear paths bypass the load throttle
+    // (see loadMoreMessages in thread-store) and call in synchronously, so the reload the clear
+    // issued is always the first to get here, and a load that ends without ever applying still has
+    // to be the one that releases.
+    const loadID = nextLoadID++
+    actions.claimWindowGate(loadID)
+    const releaseWindowGate = () => {
+      if (actions.getSnapshot().clearVersion === clearVersionAtLoadStart) {
+        actions.clearWindowGate(loadID)
+      }
+    }
+    // Every bail from here on releases, including the two that used to sit above the claim: the
+    // clear issues its reload synchronously, so if that reload is the one bailing there is nothing
+    // else coming to take the gate down, and the thread stops receiving messages for good.
+    if (!isCurrentThreadLoad()) {
+      logger.info('loadMoreMessages: bail: stale mounted thread load')
+      releaseWindowGate()
+      return
+    }
+
+    if (!conversationIDKey || !T.Chat.isValidConversationIDKey(conversationIDKey)) {
+      logger.info('loadMoreMessages: bail: no conversationIDKey')
+      releaseWindowGate()
+      return
+    }
+
+    const currentMeta = getMeta(conversationIDKey)
+    if (currentMeta.membershipType === 'youAreReset' || currentMeta.rekeyers.size > 0) {
+      logger.info('loadMoreMessages: bail: we are reset')
+      releaseWindowGate()
+      return
+    }
+    const loadStartedLiveUpdateVersion = loadStartedSnapshot.liveUpdateVersion
+    const protectLoadedFocusRefresh =
+      loadStartedSnapshot.loaded &&
+      scrollDirection === 'none' &&
+      !centeredMessageID &&
+      !messageIDControl &&
+      (reason === 'focused' || reason === 'tab selected')
+    logger.info(
+      `loadMoreMessages: calling rpc convo: ${conversationIDKey} num: ${numberOfMessagesToLoad} reason: ${reason}`
+    )
+
+    const loadingKey = Strings.waitingKeyChatThreadLoad(conversationIDKey)
+    // What this load has put in the window, filled in by addMessagesToThreadState as each pass
+    // applies. Once the service has sent a cached thread it switches the full response to
+    // INCREMENTAL, which walks the authoritative window and sends only the messages that cached
+    // pass did not already carry unchanged (mergeLocalRemoteThread in go/chat/uithreadloader.go,
+    // where localSentThread is that exact pass). Neither pass is a whole window on its own, so the
+    // two are gathered here and the last one reconciles against the both of them.
+    const carried = new Set<T.Chat.Ordinal>()
+    // A load is all or nothing. Once one of its passes is turned away, the rest of them are too:
+    // the service filters each pass against what it has already sent this load, so the ones that
+    // follow a refused pass are a subset of a window we never took, and both ways of using them
+    // are wrong. Merging one into whatever refilled the window in the meantime is the disjoint
+    // window this whole invariant exists to prevent; reconciling against one takes out every row
+    // between the few messages it happens to carry.
+    let refusedAPass = false
+    // Whether the service's cached goroutine reported at all - with a thread, or with the nil it
+    // sends when the local cache had nothing. It is the only evidence the client gets that the
+    // full pass was not filtered behind our back: the service records the cached thread as sent
+    // before it marshals it, so a marshal failure there leaves us with an INCREMENTAL full pass
+    // and no sign of the pass it was filtered against (LoadNonblock in
+    // go/chat/uithreadloader.go). No report, no reconciling.
+    let sawCachedReport = false
+    // The reload below is judged against the whole load, not one pass of it. A warm-cache load
+    // delivers the page on the cached pass and then an INCREMENTAL full pass carrying only what
+    // changed, so measuring the full pass alone says "added nothing" for a perfectly good page.
+    // Measuring from before either pass tells the two apart: a page of real messages moves this,
+    // a page of tombstones does not, wherever it arrived.
+    const loadStartOrdinals = loadStartedSnapshot.messageOrdinals
+    const windowEndAtLoadStart = scrollDirection === 'back' ? loadStartOrdinals?.[0] : loadStartOrdinals?.at(-1)
+    // A scroll page is asked for from the window's own end, not from the cursor the service keeps:
+    // every newest-page load (focus, stale) resets that cursor, and a page read from it after one
+    // comes from the newest page instead (a newer one back empty, ending paging with the messages
+    // between the window and the present never loaded).
+    const pivot =
+      messageIDControl || scrollDirection === 'none' ? undefined : pagingPivot(loadStartedSnapshot, scrollDirection)
+    const onGotThread = (thread: string, why: string) => {
+      if (!thread) {
+        return
+      }
+      if (refusedAPass) {
+        logger.info(`loadMoreMessages: pass ignored, an earlier one of this load was: ${why}`)
+        return
+      }
+      const refuse = (msg: string) => {
+        refusedAPass = true
+        logger.info(msg)
+      }
+      if (!isCurrentThreadLoad()) {
+        refuse(`loadMoreMessages: stale response ignored: ${why}`)
+        return
+      }
+      // A clear under us - jump to recent, a centered jump - dropped the window this load was
+      // paging against, and the reload that follows fetches a disjoint region. isCurrentThreadLoad
+      // does not catch it: the load generation only moves when the conversation changes or the
+      // thread unmounts, so a load that started before the clear still calls itself current.
+      // Applying it anyway would repopulate the cleared window and lower the gate belonging to the
+      // reload, which then merges its own page into the leftovers.
+      const snapshotAtResponse = actions.getSnapshot()
+      if (snapshotAtResponse.clearVersion !== clearVersionAtLoadStart) {
+        refuse(`loadMoreMessages: response ignored after clear: ${why}`)
+        return
+      }
+      // clearVersion cannot separate two loads issued after the same clear, and the second one is
+      // not hypothetical: a ChatThreadsStale or ChatInboxSynced reload fires with scrollDirection
+      // 'none' and fetches the newest page, not the region the clear asked for. If it answers
+      // first it would fill the cleared window with that disjoint page and drop the gate, and the
+      // reload the clear issued would then merge its own page into the leftovers - exactly the
+      // ordinal gap the gate exists to prevent. While the gate is up only its owner may refill the
+      // window; once the owner settles the gate is down and everyone applies normally again.
+      if (
+        snapshotAtResponse.windowCleared &&
+        snapshotAtResponse.windowGateOwner !== undefined &&
+        snapshotAtResponse.windowGateOwner !== loadID
+      ) {
+        refuse(`loadMoreMessages: response ignored, another load owns the window: ${why}`)
+        return
+      }
+      if (protectLoadedFocusRefresh && snapshotAtResponse.liveUpdateVersion !== loadStartedLiveUpdateVersion) {
+        refuse(
+          `loadMoreMessages: stale response ignored after live update: ${why} reason=${reason} convID=${conversationIDKey}`
+        )
+        return
+      }
+
+      const {username, devicename} = getCurrentUser()
+      const {messages, pagination} = Message.parseUIMessagesJSON(
+        conversationIDKey,
+        thread,
+        username,
+        devicename,
+        () => getLastOrdinalFromSnapshot(actions.getSnapshot())
+      )
+      const moreToLoad = pagination ? !pagination.last : true
+      const canMarkReadForThreadWindow =
+        allowMarkAsRead &&
+        !centeredMessageID &&
+        !messageIDControl &&
+        scrollDirection !== 'back' &&
+        reason !== 'findNewestConversation' &&
+        reason !== 'findNewestConversationFromLayout'
+      // Reconciling is only safe against a whole window, and a single pass is not one: the cached
+      // pass is whatever the local cache holds, gaps included, and the full pass behind it carries
+      // only what changed. The full pass is the last one, so it is the one that prunes - against
+      // everything both passes delivered. Waiting instead for a pass with no cached one before it
+      // would leave the stale-row cleanup running on cold caches only, which is where ghost rows
+      // are least likely to be: a reopened conversation is warm every time.
+      const reconcile: ThreadLoadReconcile | undefined =
+        scrollDirection === 'none' ? {carried, prune: why === 'full' && sawCachedReport} : undefined
+      actions.applyThreadLoad({
+        centered: !!centeredMessageID,
+        disableActiveMarkRead: !allowMarkAsRead || !!centeredMessageID || !!messageIDControl,
+        enableActiveMarkRead: canMarkReadForThreadWindow,
+        forceContainsLatestCalc,
+        fullPass: why === 'full',
+        messages,
+        moreToLoad,
+        reconcile,
+        scrollDirection,
+      })
+      // A scroll page can be composed entirely of messages the thread will never render: a message
+      // superseded by a DELETE arrives as a hidden placeholder, becomes `deleted`, and addMessages
+      // drops it. The ordinal list is then identical to what it was, so the list never fires
+      // onStartReached / onEndReached again and paging stops even though the pager says there is
+      // more. Ask for the next page ourselves, from past the messages this one carried.
+      //
+      // The tombstones still carry message IDs, and each page must reach strictly further than the
+      // last, so the chain terminates: message IDs are finite. Strict progress alone is a weak bound
+      // though - a channel whose history was largely expunged has tens of thousands of them, which is
+      // minutes of paging off one gesture - so the chain also stops after maxPageReloads. Stopping is
+      // safe: the reader is still pinned at the end with an unchanged list, and scrolling away and
+      // back fires the end callback again, which starts a fresh chain from wherever this one left
+      // off, as the window keeps how far its pages reached.
+      if (
+        scrollDirection !== 'none' &&
+        // The full pass is the last one of a load, so by here the whole load has been applied.
+        why === 'full' &&
+        moreToLoad &&
+        retryCount < maxPageReloads
+      ) {
+        const back = scrollDirection === 'back'
+        const after = actions.getSnapshot()
+        // The window's end, not its count: a page can add real messages while its `deleted` entries
+        // remove more from the window, which nets negative on a count but is real progress.
+        const windowEnd = back ? after.messageOrdinals?.[0] : after.messageOrdinals?.at(-1)
+        const windowGrew =
+          windowEnd !== undefined &&
+          (windowEndAtLoadStart === undefined ||
+            (back ? windowEnd < windowEndAtLoadStart : windowEnd > windowEndAtLoadStart))
+        const pivotAfter = pagingPivot(after, scrollDirection)
+        const pagedFurther =
+          pivotAfter !== undefined && (pivot === undefined || (back ? pivotAfter < pivot : pivotAfter > pivot))
+        if (!windowGrew && pagedFurther) {
+          logger.info(
+            `loadMoreMessages: ${scrollDirection} page added no ordinals, reloading from ${pivotAfter} (${
+              retryCount + 1
+            }/${maxPageReloads}): convID: ${conversationIDKey}`
+          )
+          // Through the action, not loadConversationThreadMessages directly: the action carries the
+          // 500ms throttle and the unmount cancel(), and a long run of tombstones would otherwise
+          // issue these back to back with no pacing. The throttle only ever drops a call that a
+          // later load supersedes, and that load extends the window or retries in turn.
+          //
+          // Sizing, for the same reason the chain is bounded at all: a full run is 11 sequential
+          // 100-message RPCs off one gesture, several seconds of paging with nothing visible moving.
+          actions.loadMoreMessages({...p, retryCount: retryCount + 1})
+        }
+      }
+
+      if (canMarkReadForThreadWindow) {
+        actions.markThreadAsRead()
+      }
+    }
+
+    const control: T.RPCChat.MessageIDControl | undefined =
+      messageIDControl ??
+      (pivot
+        ? {
+            mode:
+              scrollDirection === 'forward'
+                ? T.RPCChat.MessageIDControlMode.newermessages
+                : T.RPCChat.MessageIDControlMode.oldermessages,
+            num: numberOfMessagesToLoad,
+            pivot,
+          }
+        : undefined)
+    // A scroll page still says which way it pages, though the service fetches by the ID control: a
+    // pagination with no cursor (or none at all) is a first page, and the service cancels any other
+    // first-page load of the conversation in flight - an older and a newer page, or a scroll page
+    // and a centred reload, would cancel each other.
+    const pagination = messageIDControl
+      ? null
+      : scrollDirectionToPagination(scrollDirection, numberOfMessagesToLoad)
+    try {
+      const results = await actions.rpc.loadThread({
+        conversationIDKey,
+        knownRemotes,
+        messageIDControl: control,
+        onCachedThread: thread => {
+          sawCachedReport = true
+          onGotThread(thread, 'cached')
+        },
+        onFullThread: thread => onGotThread(thread, 'full'),
+        onThreadStatus: status => {
+          logger.info(
+            `loadMoreMessages: thread status received: convID: ${conversationIDKey} typ: ${status.typ}`
+          )
+          if (isCurrentThreadLoad()) {
+            onThreadLoadStatus?.(conversationIDKey, status.typ)
+          }
+        },
+        pagination,
+        reason: threadLoadReasonToRPCReason(reason),
+        waitingKey: loadingKey,
+      })
+      if (!isCurrentThreadLoad() || !results) {
+        return
+      }
+      updateInboxConversationMeta(conversationIDKey, {offline: results.offline})
+    } catch (error) {
+      if (!isCurrentThreadLoad()) {
+        return
+      }
+      if (error instanceof RPCError) {
+        logger.warn(`loadMoreMessages: error: ${error.desc}`)
+        if (
+          error.code === T.RPCGen.StatusCode.scchatnotinteam ||
+          error.code === T.RPCGen.StatusCode.scchatnotinconv
+        ) {
+          // We're not in this conv or its team. Clear the persisted last-route
+          // (ui.routeState2) so app startup doesn't keep restoring and reloading
+          // this conv, which would re-trigger this error on every launch.
+          persistRoute(true, true, () => useConfigState.getState().startup.loaded)
+          // Only a conversation this account was in is gone (kicked, removed). One it never joined,
+          // opened from a link or search, stays up on every platform, as does a phone's open thread.
+          const membership = getInboxConversationMeta(conversationIDKey)?.membershipType
+          if (membership === 'active' || membership === 'youLeft') {
+            conversationGone(conversationIDKey, `thread load: ${error.desc}`)
+          }
+        }
+        if (!quietThreadLoadErrors.has(error.code)) {
+          throw error
+        }
+      }
+    } finally {
+      releaseWindowGate()
+    }
+  }
+
+  ignorePromise(f())
+}

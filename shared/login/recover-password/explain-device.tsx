@@ -1,0 +1,55 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import type {ButtonType} from '@/common-adapters/button'
+import {SignupScreen} from '@/signup/common'
+import {QuestionBody} from '../common'
+
+type Props = {route: {params: {deviceName: string; deviceType: T.RPCGen.DeviceType; username: string}}}
+
+const ExplainDevice = ({route}: Props) => {
+  const theme = Kb.Styles.useTheme()
+  const {deviceName, deviceType} = route.params
+  const onComplete = () => {
+    C.Router2.navigateUp()
+  }
+
+  const explainingMobile = deviceType === T.RPCGen.DeviceType.mobile
+
+  return (
+    <SignupScreen
+      buttons={[
+        {
+          label: 'Got it',
+          onClick: onComplete,
+          type: 'Default' as ButtonType,
+        },
+      ]}
+      noBackground={true}
+    >
+      <QuestionBody
+        centered={false}
+        gap="small"
+        topGap={false}
+        icon={<Kb.ImageIcon type={explainingMobile ? 'icon-phone-96' : 'icon-computer-96'} />}
+      >
+        <Kb.Box2 alignSelf="center" alignItems="center" direction="vertical">
+          <Kb.Text type="Body">
+            On <Kb.Text type="BodySemiboldItalic">{deviceName}</Kb.Text>, go to
+          </Kb.Text>
+          <Kb.Box2 direction="horizontal" alignItems="center" gap="xtiny">
+            {explainingMobile ? (
+              <Kb.Icon type="iconfont-nav-2-hamburger" color={theme.black} />
+            ) : (
+              <Kb.Text type="Body">Settings</Kb.Text>
+            )}
+            <Kb.Text type="Body">{`> Your account, and change your`}</Kb.Text>
+          </Kb.Box2>
+          <Kb.Text type="Body">password.</Kb.Text>
+        </Kb.Box2>
+      </QuestionBody>
+    </SignupScreen>
+  )
+}
+
+export default ExplainDevice

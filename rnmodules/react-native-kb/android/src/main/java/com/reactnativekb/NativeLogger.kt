@@ -1,0 +1,46 @@
+package com.reactnativekb
+
+import android.util.Log
+import keybase.Keybase
+
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+
+class NativeLogger(reactContext: ReactApplicationContext?) : ReactContextBaseJavaModule(reactContext) {
+    override fun getName(): String {
+        return NAME
+    }
+
+    companion object {
+        private const val NAME: String = "NativeLogger"
+
+        private fun formatLine(tagPrefix: String, toLog: String): String {
+            // Copies the Style JS outputs in native/logger.native.tsx
+            return "${tagPrefix}${NAME}: [${System.currentTimeMillis()},\"$toLog\"]"
+        }
+
+        fun error(log: String) {
+            Keybase.logToService(formatLine("e", log))
+        }
+
+        fun error(log: String, tr: Throwable?) {
+            Keybase.logToService(formatLine("e", log + Log.getStackTraceString(tr)))
+        }
+
+        fun info(log: String) {
+            Keybase.logToService(formatLine("i", log))
+        }
+
+        fun info(log: String, tr: Throwable?) {
+            Keybase.logToService(formatLine("i", log + Log.getStackTraceString(tr)))
+        }
+
+        fun warn(log: String) {
+            Keybase.logToService(formatLine("w", log))
+        }
+
+        fun warn(log: String, tr: Throwable) {
+            Keybase.logToService(formatLine("w", log + Log.getStackTraceString(tr)))
+        }
+    }
+}

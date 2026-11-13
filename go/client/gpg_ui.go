@@ -4,6 +4,8 @@
 package client
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"text/tabwriter"
@@ -11,7 +13,6 @@ import (
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"golang.org/x/net/context"
 )
 
 func NewGPGUIProtocol(g *libkb.GlobalContext) rpc.Protocol {
@@ -40,13 +41,13 @@ func (g GPGUI) SelectKeyID(_ context.Context, keys []keybase1.GPGKey) (string, e
 		for j, userID := range k.Identities {
 			userIDs[j] = fmt.Sprintf("%s <%s>", userID.Username, userID.Email)
 		}
-		(fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", i+1, k.Algorithm, k.KeyID, k.Creation, strings.Join(userIDs, ", ")))
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", i+1, k.Algorithm, k.KeyID, k.Creation, strings.Join(userIDs, ", "))
 	}
 	w.Flush()
 
 	ret, err := PromptSelectionOrCancel(PromptDescriptorGPGSelectKey, g.parent, "Choose a key", 1, len(keys))
 	if err != nil {
-		if err == ErrInputCanceled {
+		if errors.Is(err, ErrInputCanceled) {
 			return "", nil
 		}
 		return "", err
@@ -81,19 +82,26 @@ func (g GPGUI) ConfirmDuplicateKeyChosen(_ context.Context, _ int) (bool, error)
 	return g.parent.PromptYesNo(PromptDescriptorGPGConfirmDuplicateKey, "You've already selected this public key for use on Keybase. Would you like to update it on Keybase?", libkb.PromptDefaultYes)
 }
 
+func (g GPGUI) ConfirmImportSecretToExistingKey(_ context.Context, _ int) (bool, error) {
+	if g.noPrompt {
+		return false, nil
+	}
+	return g.parent.PromptYesNo(PromptDescriptorGPGConfirmDuplicateKey, "Do you want to import secret half of this key to local Keybase keyring?", libkb.PromptDefaultYes)
+}
+
 func (g GPGUI) GetTTY(_ context.Context) (string, error) {
 	return g.tty, nil
 }
 
-func (g GPGUI) Sign(_ context.Context, arg keybase1.SignArg) (string, error) {
+func (g GPGUI) Sign(ctx context.Context, arg keybase1.SignArg) (string, error) {
 	fp, err := libkb.PGPFingerprintFromSlice(arg.Fingerprint)
 	if err != nil {
 		return "", err
 	}
 	cli := g.G().GetGpgClient()
-	if err := cli.Configure(); err != nil {
+	if err := cli.Configure(g.MetaContext(ctx)); err != nil {
 		return "", err
 	}
 	cli.SetTTY(g.tty)
-	return cli.Sign(*fp, arg.Msg)
+	return cli.Sign(g.MetaContext(ctx), *fp, arg.Msg)
 }

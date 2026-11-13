@@ -1,0 +1,94 @@
+import {TurboModuleRegistry, type CodegenTypes, type TurboModule} from 'react-native'
+
+type EventEmitter<T> = CodegenTypes.EventEmitter<T>
+
+export interface Spec extends TurboModule {
+  readonly onMetaEvent: EventEmitter<string>
+  readonly onHardwareKeyPressed: EventEmitter<string>
+  readonly onPasteImage: EventEmitter<Array<string>>
+  readonly onPushToken: EventEmitter<string>
+  // Android only: a share is held, under this id (see peekIncomingShare)
+  readonly onShareData: EventEmitter<{id: number}>
+  // 'active' | 'inactive' | 'background', sent from the callbacks that report the state to Go
+  readonly onAppLifecycle: EventEmitter<{state: string}>
+  // iOS only: every fix the location watch receives, accuracy in metres
+  readonly onLocationFix: EventEmitter<{lat: number; lon: number; accuracy: number}>
+  // a notification was tapped; peekPushTap reads it
+  readonly onPushTapAvailable: EventEmitter<void>
+  getTypedConstants(): {
+    androidIsDeviceSecure: boolean
+    androidIsTestDevice: boolean
+    appVersionCode: string
+    appVersionName: string
+    darkModeSupported: boolean
+    fsCacheDir: string
+    fsDownloadDir: string
+    guiConfig: string
+    serverConfig: string
+    uses24HourClock: boolean
+    version: string
+  }
+  logSend(
+    status: string,
+    feedback: string,
+    sendLogs: boolean,
+    sendMaxBytes: boolean,
+    traceDir: string,
+    cpuProfileDir: string
+  ): Promise<string>
+  iosGetHasShownPushPrompt(): Promise<boolean>
+  // iOS only: the Android impl rejects, so call the processMedia wrapper in
+  // index.tsx rather than this directly — it hands the path back untouched off
+  // iOS. startMs/endMs are the trim range, both 0 meaning the whole clip
+  // (codegen only allows plain types here, so no nullable). stripLocation
+  // (images, compress off) guarantees an image sent as it is carries no
+  // location: Send original after a compressed run.
+  processMedia(
+    path: string,
+    isVideo: boolean,
+    compress: boolean,
+    startMs: number,
+    endMs: number,
+    removeAudio: boolean,
+    stripLocation: boolean
+  ): Promise<string>
+  // iOS only: presents the system share sheet for a local file. `text` is the
+  // file's contents when it is worth offering as text, '' otherwise (codegen
+  // has no optional string). Resolves true when an activity ran.
+  iosShareFile(path: string, text: string): Promise<boolean>
+  androidShareText(text: string, mimeType: string): Promise<boolean>
+  androidShare(text: string, mimeType: string): Promise<boolean>
+  androidSaveToDownloads(o: {path: string; filename: string; mime: string; deleteSource: boolean}): Promise<string>
+  // Android 10+ only: copies an app download into Pictures/Keybase or Movies/Keybase
+  androidSaveToGallery(o: {path: string; mime: string}): Promise<string>
+  androidOpenFile(o: {uri: string; mime: string}): Promise<void>
+  checkPushPermissions(): Promise<boolean>
+  requestPushPermissions(): Promise<boolean>
+  getRegistrationToken(): Promise<string>
+  setApplicationIconBadgeNumber(n: number): void
+  removeAllPendingNotificationRequests(): void
+  addNotificationRequest(config: {body: string; id: string}): Promise<void>
+  notifyJSReady(): void
+  // Android only: the id of the share native holds, 0 if none.
+  heldIncomingShareID(): number
+  // Android only: the held share with this id; null once it is done with or replaced.
+  // droppedCount: shared items that couldn't be copied
+  peekIncomingShare(id: number): {text?: string; localPaths?: Array<string>; droppedCount: number} | null
+  // Android only: JS is done with the share with this id.
+  ackIncomingShare(id: number): void
+  setEnablePasteImage(enabled: boolean): void
+  clearLocalLogs(): Promise<void>
+  // the last state onAppLifecycle carried, including one sent before JS listened
+  getAppLifecycleState(): string
+  // iOS only. Idempotent; the watch keeps running in the background until stopped.
+  startLocationWatch(): void
+  stopLocationWatch(): void
+  // The last tapped notification, held until ackPushTap retires it by id. payload is the push's
+  // userInfo (iOS) or data Bundle (Android) as JSON. Each tap gets a new id and replaces any tap
+  // still held.
+  peekPushTap(): {payload: string; id: number} | null
+  // No-op unless id is the held tap's.
+  ackPushTap(id: number): void
+}
+
+export default TurboModuleRegistry.getEnforcing<Spec>('Kb')

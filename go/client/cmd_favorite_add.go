@@ -4,9 +4,8 @@
 package client
 
 import (
+	"context"
 	"errors"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -17,7 +16,7 @@ import (
 
 type CmdFavoriteAdd struct {
 	libkb.Contextified
-	folder keybase1.Folder
+	folder keybase1.FolderHandle
 }
 
 func NewCmdFavoriteAdd(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Command {
@@ -35,7 +34,7 @@ func (c *CmdFavoriteAdd) Run() error {
 	arg := keybase1.FavoriteAddArg{
 		Folder: c.folder,
 	}
-	cli, err := GetFavoriteClient()
+	cli, err := GetFavoriteClient(c.G())
 	if err != nil {
 		return err
 	}

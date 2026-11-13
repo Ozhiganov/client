@@ -1,7 +1,8 @@
 // Copyright 2016 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build !production
+//go:build !production
+
 //
 // This is a test template for the AccountDelete engine.
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAccountDelete(t *testing.T) {
@@ -20,19 +22,60 @@ func TestAccountDelete(t *testing.T) {
 
 	fu := CreateAndSignupFakeUser(tc, "acct")
 
-	ctx := &Context{}
-	eng := NewAccountDelete(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	uis := libkb.UIs{
+		SecretUI: &libkb.TestSecretUI{Passphrase: fu.Passphrase},
+	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	eng := NewAccountDelete(tc.G, nil)
+	err := RunEngine2(m, eng)
+	require.NoError(t, err)
+
+	_, res, err := tc.G.Resolver.ResolveUser(m, fu.Username)
+	require.NoError(t, err)
+
+	err = res.GetError()
+	require.NoError(t, err)
+	require.True(t, res.GetDeleted())
+
+	tmp := res.FailOnDeleted()
+	err = tmp.GetError()
+	require.Error(t, err)
+
+	if _, ok := err.(libkb.UserDeletedError); !ok {
+		require.True(t, ok,
+			"expected a libkb.UserDeletedError")
 	}
 
-	_, err := libkb.LoadUser(libkb.NewLoadUserByNameArg(tc.G, fu.Username))
-	if err == nil {
-		t.Fatal("no error loading deleted user")
+	_, err = libkb.LoadUser(libkb.NewLoadUserByNameArg(tc.G, fu.Username))
+	require.Error(t, err)
+
+	_, ok := err.(libkb.UserDeletedError)
+	require.True(t, ok, "loading deleted user error type: %T, expected libkb.UserDeletedError", err)
+}
+
+func TestAccountDeleteBadPassphrase(t *testing.T) {
+	tc := SetupEngineTest(t, "acct")
+	defer tc.Cleanup()
+
+	fu := CreateAndSignupFakeUser(tc, "acct")
+
+	uis := libkb.UIs{
+		SecretUI: &libkb.TestSecretUI{Passphrase: fu.Passphrase + "xxx"},
 	}
-	if _, ok := err.(libkb.NotFoundError); !ok {
-		t.Errorf("loading deleted user error type: %T, expected libkb.NotFoundError", err)
-	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	eng := NewAccountDelete(tc.G, nil)
+	err := RunEngine2(m, eng)
+	require.Error(t, err)
+
+	_, res, err := tc.G.Resolver.ResolveUser(m, fu.Username)
+	require.NoError(t, err)
+	err = res.GetError()
+	require.NoError(t, err)
+	require.False(t, res.GetDeleted())
+
+	tmp := res.FailOnDeleted()
+	err = tmp.GetError()
+	require.NoError(t, err)
 }
 
 func TestAccountDeleteIdentify(t *testing.T) {
@@ -41,29 +84,93 @@ func TestAccountDeleteIdentify(t *testing.T) {
 
 	fu := CreateAndSignupFakeUser(tc, "acct")
 	u, err := libkb.LoadUser(libkb.NewLoadUserByNameArg(tc.G, fu.Username))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	t.Logf("created user %v %v", u.GetNormalizedName(), u.GetUID())
 
-	ctx := &Context{}
-	eng := NewAccountDelete(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	uis := libkb.UIs{
+		SecretUI: &libkb.TestSecretUI{Passphrase: fu.Passphrase},
 	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	eng := NewAccountDelete(tc.G, nil)
+	err = RunEngine2(m, eng)
+	require.NoError(t, err)
+	t.Logf("deleted user")
+
+	// Punch through the UPAK cache. Not dealing with upak vs delete race right now.
+	_, _, err = tc.G.GetUPAKLoader().LoadV2(
+		libkb.NewLoadUserArgWithMetaContext(libkb.NewMetaContextForTest(tc)).WithPublicKeyOptional().
+			WithUID(u.GetUID()).WithForcePoll(true))
+	require.NoError(t, err)
 
 	i := newIdentify2WithUIDTester(tc.G)
-	tc.G.Services = i
+	tc.G.SetProofServices(i)
 	arg := &keybase1.Identify2Arg{
-		Uid: u.GetUID(),
+		Uid:              u.GetUID(),
+		IdentifyBehavior: keybase1.TLFIdentifyBehavior_CLI,
 	}
 	ieng := NewIdentify2WithUID(tc.G, arg)
-	ictx := &Context{IdentifyUI: i}
+	uis = libkb.UIs{IdentifyUI: i}
+	m = NewMetaContextForTest(tc).WithUIs(uis)
+	t.Logf("identifying...")
+	err = RunEngine2(m, ieng)
+	require.Error(t, err)
 
-	err = RunEngine(ieng, ictx)
-	if err == nil {
-		t.Fatal("identify2 ran successfully on deleted user")
+	_, ok := err.(libkb.UserDeletedError)
+	require.True(t, ok, "identify2 error: %T, expected libkb.UserDeletedError", err)
+}
+
+func TestAccountDeleteAfterRestart(t *testing.T) {
+	tc := SetupEngineTest(t, "acct")
+	defer tc.Cleanup()
+
+	fu := SignupFakeUserStoreSecret(tc, "acct")
+
+	simulateServiceRestart(t, tc, fu)
+	uis := libkb.UIs{
+		SecretUI: &libkb.TestSecretUI{Passphrase: fu.Passphrase},
 	}
-	if _, ok := err.(libkb.DeletedError); !ok {
-		t.Errorf("identify2 error: %T, expected libkb.DeletedError", err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	eng := NewAccountDelete(tc.G, nil)
+	err := RunEngine2(m, eng)
+	require.NoError(t, err)
+
+	_, err = libkb.LoadUser(libkb.NewLoadUserByNameArg(tc.G, fu.Username))
+	require.Error(t, err,
+		"no error loading deleted user")
+	_, ok := err.(libkb.UserDeletedError)
+	require.True(t, ok, "loading deleted user error type: %T, expected libkb.DeletedError", err)
+}
+
+func TestAccountDeleteWithPassphrase(t *testing.T) {
+	tc := SetupEngineTest(t, "acct")
+	defer tc.Cleanup()
+
+	fu := CreateAndSignupFakeUser(tc, "acct")
+
+	m := NewMetaContextForTest(tc)
+	eng := NewAccountDelete(tc.G, &fu.Passphrase)
+	err := RunEngine2(m, eng)
+	require.NoError(t, err)
+
+	_, res, err := tc.G.Resolver.ResolveUser(m, fu.Username)
+	require.NoError(t, err)
+
+	err = res.GetError()
+	require.NoError(t, err)
+	require.True(t, res.GetDeleted())
+
+	tmp := res.FailOnDeleted()
+	err = tmp.GetError()
+	require.Error(t, err)
+
+	if _, ok := err.(libkb.UserDeletedError); !ok {
+		require.True(t, ok,
+			"expected a libkb.UserDeletedError")
 	}
+
+	_, err = libkb.LoadUser(libkb.NewLoadUserByNameArg(tc.G, fu.Username))
+	require.Error(t, err)
+
+	_, ok := err.(libkb.UserDeletedError)
+	require.True(t, ok, "loading deleted user error type: %T, expected libkb.UserDeletedError", err)
 }

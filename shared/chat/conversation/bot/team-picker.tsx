@@ -1,0 +1,116 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import {Avatars, TeamAvatar} from '@/chat/avatars'
+import debounce from 'lodash/debounce'
+import logger from '@/logger'
+import {getChatRpc} from '../chat-rpc'
+import type {RPCError} from '@/util/errors'
+
+type Props = {botUsername: string}
+
+const BotTeamPicker = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const botUsername = props.botUsername
+  const [term, setTerm] = React.useState('')
+  const [results, setResults] = React.useState<ReadonlyArray<T.RPCChat.ConvSearchHit>>([])
+  const [waiting, setWaiting] = React.useState(false)
+  const [error, setError] = React.useState('')
+
+  const [lastTerm, setLastTerm] = React.useState('init')
+  if (lastTerm !== term) {
+    setLastTerm(term)
+    setWaiting(true)
+    getChatRpc()
+      .searchBotDestinations(term)
+      .then(result => {
+        setWaiting(false)
+        setResults(result)
+      })
+      .catch((error: RPCError) => {
+        setWaiting(false)
+        setError('Something went wrong, please try again.')
+        logger.info('BotTeamPicker: error loading search results: ' + error.message)
+      })
+  }
+
+  const navigateAppend = C.Router2.navigateAppend
+  const onSelect = (convID: T.RPCChat.ConversationID) => {
+    const conversationIDKey = T.Chat.conversationIDToKey(convID)
+    navigateAppend({
+      name: 'chatInstallBot',
+      params: {botUsername, conversationIDKey},
+    })
+  }
+  const renderResult = (index: number, item: T.RPCChat.ConvSearchHit) => {
+    return (
+      <Kb.ClickableBox key={index} onClick={() => onSelect(item.convID)} direction="horizontal" fullWidth={true} gap="tiny" style={styles.results}>
+        {item.isTeam ? (
+          <TeamAvatar isMuted={false} isSelected={false} teamname={item.name} />
+        ) : (
+          <Avatars participantOne={item.parts?.[0]} participantTwo={item.parts?.[1]} />
+        )}
+        <Kb.Text type="Body" style={{alignSelf: 'center'}}>
+          {item.name}
+        </Kb.Text>
+      </Kb.ClickableBox>
+    )
+  }
+  return (
+    <Kb.ModalScreen scroll={false} padding="none">
+      <Kb.Box2 direction="horizontal" fullWidth={true}>
+        <Kb.SearchFilter
+          size="full-width"
+          icon="iconfont-search"
+          placeholderText={`Search chats and teams...`}
+          placeholderCentered={true}
+          onChange={debounce(setTerm, 200)}
+          style={styles.searchFilter}
+          focusOnMount={true}
+          waiting={waiting}
+        />
+      </Kb.Box2>
+      {error.length > 0 ? (
+        <Kb.Text type="Body" style={{alignSelf: 'center', color: theme.redDark}}>
+          {error}
+        </Kb.Text>
+      ) : (
+        <Kb.BoxGrow2>
+          <Kb.List
+            indexAsKey={true}
+            items={results}
+            itemHeight={{sizeType: 'Large', type: 'fixedListItemAuto'}}
+            renderItem={renderResult}
+          />
+        </Kb.BoxGrow2>
+      )}
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      results: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+        },
+        isMobile: {
+          paddingBottom: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+      searchFilter: Kb.Styles.platformStyles({
+        common: {
+          marginBottom: Kb.Styles.globalMargins.xsmall,
+          marginTop: Kb.Styles.globalMargins.tiny,
+        },
+        isElectron: {
+          ...Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+        },
+      }),
+    }) as const
+)
+
+export default BotTeamPicker

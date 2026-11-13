@@ -4,22 +4,29 @@
 package client
 
 import (
+	"errors"
 	"io"
 	"sync"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/minterm"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/client/go/terminalescaper"
 )
 
 type Terminal struct {
 	libkb.Contextified
-	once   sync.Once // protects opening the minterm
-	engine *minterm.MinTerm
+	once         sync.Once // protects opening the minterm
+	engine       *minterm.MinTerm
+	escapeWrites bool
 }
 
-func NewTerminal(g *libkb.GlobalContext) (*Terminal, error) {
-	return &Terminal{Contextified: libkb.NewContextified(g)}, nil
+func NewTerminalEscaped(g *libkb.GlobalContext) *Terminal {
+	return &Terminal{Contextified: libkb.NewContextified(g), escapeWrites: true}
+}
+
+func NewTerminalUnescaped(g *libkb.GlobalContext) *Terminal {
+	return &Terminal{Contextified: libkb.NewContextified(g), escapeWrites: false}
 }
 
 func (t *Terminal) open() error {
@@ -34,7 +41,6 @@ func (t *Terminal) open() error {
 			return
 		}
 		t.engine = eng
-		return
 	})
 	return err
 }
@@ -53,19 +59,12 @@ func (t *Terminal) PromptPassword(s string) (string, error) {
 	return t.engine.PromptPassword(s)
 }
 
-func (t *Terminal) Write(s string) error {
-	if err := t.open(); err != nil {
-		return err
-	}
-	return t.engine.Write(s)
-}
-
 func (t *Terminal) Prompt(s string) (string, error) {
 	if err := t.open(); err != nil {
 		return "", err
 	}
 	s, err := t.engine.Prompt(s)
-	if err == minterm.ErrPromptInterrupted {
+	if errors.Is(err, minterm.ErrPromptInterrupted) {
 		err = libkb.CanceledError{M: "input canceled"}
 	}
 	return s, err
@@ -87,9 +86,10 @@ func (t *Terminal) PromptYesNo(p string, def libkb.PromptDefault) (ret bool, err
 	}
 	prompt := p + " " + ch + " "
 	done := false
-	for !done && err == nil {
+	for !done {
 		var s string
 		if s, err = t.Prompt(prompt); err != nil {
+			return ret, err
 		} else if libkb.IsYes(s) {
 			ret = true
 			done = true
@@ -97,16 +97,17 @@ func (t *Terminal) PromptYesNo(p string, def libkb.PromptDefault) (ret bool, err
 			ret = false
 			done = true
 		} else if libkb.IsEmpty(s) {
-			if def == libkb.PromptDefaultNo {
+			switch def {
+			case libkb.PromptDefaultNo:
 				ret = false
 				done = true
-			} else if def == libkb.PromptDefaultYes {
+			case libkb.PromptDefaultYes:
 				ret = true
 				done = true
 			}
 		}
 	}
-	return
+	return ret, err
 }
 
 // GetSize tries to get the size for the current terminal.
@@ -119,7 +120,6 @@ func (t *Terminal) GetSize() (int, int) {
 }
 
 func (t *Terminal) GetSecret(arg *keybase1.SecretEntryArg) (res *keybase1.SecretEntryRes, err error) {
-
 	if err := t.open(); err != nil {
 		return nil, err
 	}
@@ -131,20 +131,24 @@ func (t *Terminal) GetSecret(arg *keybase1.SecretEntryArg) (res *keybase1.Secret
 		t.G().Log.Error(arg.Err)
 	}
 
+	s := ""
 	if len(desc) > 0 {
-		if err = t.Write(desc + "\n"); err != nil {
-			return
+		d := desc + "\n"
+		if t.escapeWrites {
+			d = terminalescaper.Clean(d)
 		}
+		s += d
 	}
+	s += prompt
 
 	var txt string
 	if arg.ShowTyping {
-		txt, err = t.Prompt(prompt)
+		txt, err = t.Prompt(s)
 	} else {
-		txt, err = t.PromptPassword(prompt)
+		txt, err = t.PromptPassword(s)
 	}
 
-	if err == io.EOF || err == minterm.ErrPromptInterrupted || len(txt) == 0 {
+	if errors.Is(err, io.EOF) || errors.Is(err, minterm.ErrPromptInterrupted) || len(txt) == 0 {
 		err = nil
 		res = &keybase1.SecretEntryRes{Canceled: true}
 	} else if err == nil {

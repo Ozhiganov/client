@@ -1,0 +1,75 @@
+import type * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const horizontalScrollProps = isMobile ? ({alwaysBounceHorizontal: false, horizontal: true} as const) : {}
+
+export type FollowSuggestion = T.People.FollowSuggestion
+
+export type Props = {
+  suggestions: ReadonlyArray<FollowSuggestion>
+}
+
+const FollowSuggestions = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} style={styles.container}>
+      <Kb.Text type="BodySmallSemibold" style={styles.text}>
+        Consider following...
+      </Kb.Text>
+      <Kb.ScrollView
+        {...horizontalScrollProps}
+        contentContainerStyle={styles.scrollViewContainer}
+        testID={TestIDs.PEOPLE_FOLLOW_SUGGESTIONS}
+      >
+        {props.suggestions.map(suggestion => (
+          <Kb.NameWithIcon
+            key={suggestion.username}
+            username={suggestion.username}
+            metaOne={suggestion.fullName}
+            metaStyle={styles.meta}
+            onClick="profile"
+            colorFollowing={true}
+            size="small"
+            containerStyle={styles.suggestionContainer}
+            testID={TestIDs.PEOPLE_FOLLOW_SUGGESTION}
+          />
+        ))}
+      </Kb.ScrollView>
+    </Kb.Box2>
+  )
+}
+export default FollowSuggestions
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  container: {
+    paddingTop: Kb.Styles.globalMargins.tiny,
+  },
+  meta: {
+    ...Kb.Styles.paddingH(2),
+  },
+  scrollViewContainer: Kb.Styles.platformStyles({
+    common: {
+      ...Kb.Styles.globalStyles.flexBoxRow,
+      borderBottomWidth: 1,
+      borderColor: theme.black_10,
+      paddingBottom: Kb.Styles.globalMargins.small,
+    },
+    isElectron: {
+      borderBottomStyle: 'solid',
+      flexWrap: 'wrap',
+      height: 112,
+      overflow: 'hidden',
+      width: '100%',
+    },
+  }),
+  suggestionContainer: {
+    flexShrink: 0,
+    height: 112,
+    width: 120,
+  },
+  text: {
+    marginBottom: Kb.Styles.globalMargins.tiny,
+    marginLeft: Kb.Styles.globalMargins.small,
+  },
+}))

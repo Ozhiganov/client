@@ -1,0 +1,209 @@
+import * as C from '@/constants'
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import HelloBotCard from './cards/hello-bot'
+import MakeTeamCard from './cards/make-team'
+import NewChatCard from './cards/new-chat'
+import ProfileResetNotice from './system-profile-reset-notice'
+import RetentionNotice from './retention-notice'
+import {useChatThreadRouteParams} from '../thread-search-route'
+import {
+  useConversationThreadID,
+  useConversationThreadSelector,
+  useThreadMeta,
+} from '../thread-context'
+import {useConversationParticipantsSelector} from '../data-hooks'
+import * as FS from '@/constants/fs'
+import {useCurrentUserState} from '@/stores/current-user'
+
+const ErrorMessage = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const createConversationError = useChatThreadRouteParams()?.createConversationError
+
+  const _onCreateWithoutThem = (allowedUsers: ReadonlyArray<string>) => {
+    C.Router2.createConversation(allowedUsers)
+  }
+
+  const navigateToInbox = C.Router2.navigateToInbox
+  const _onBack = () => {
+    navigateToInbox()
+  }
+  const onBack = isMobile ? _onBack : undefined
+
+  let createConversationDisallowedUsers: ReadonlyArray<string> = []
+  let createConversationErrorDescription = ''
+  let createConversationErrorHeader = ''
+  let onCreateWithoutThem: (() => void) | undefined
+  if (createConversationError) {
+    const {allowedUsers, code, disallowedUsers, message} = createConversationError
+    if (code === (T.RPCGen.StatusCode.scteamcontactsettingsblock as number)) {
+      if (disallowedUsers.length === 1 && allowedUsers.length === 0) {
+        // One-on-one conversation.
+        createConversationErrorHeader = `You cannot start a conversation with @${disallowedUsers[0]}.`
+        createConversationErrorDescription = `@${disallowedUsers[0]}'s contact restrictions prevent you from getting in touch. Contact them outside Keybase to proceed.`
+      } else {
+        // Group conversation.
+        createConversationDisallowedUsers = disallowedUsers
+        createConversationErrorHeader = 'The following people cannot be added to the conversation:'
+        createConversationErrorDescription =
+          'Their contact restrictions prevent you from getting in touch. Contact them outside Keybase to proceed.'
+        if (disallowedUsers.length > 0 && allowedUsers.length > 0) {
+          onCreateWithoutThem = () => _onCreateWithoutThem(allowedUsers)
+        }
+      }
+    } else {
+      createConversationErrorHeader = 'There was an error creating the conversation.'
+      createConversationErrorDescription = message
+    }
+  }
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      fullWidth={true}
+      fullHeight={true}
+      gap="small"
+      gapStart={true}
+      centerChildren={true}
+    >
+      <Kb.Icon color={theme.black_20} sizeType="Huge" type="iconfont-warning" />
+      <Kb.Text center={true} style={styles.errorText} type="Header">
+        {createConversationErrorHeader}
+      </Kb.Text>
+      {createConversationDisallowedUsers.length > 0 && (
+        <>
+          {createConversationDisallowedUsers.map((username, idx) => (
+            <Kb.ListItem
+              key={username}
+              type={isMobile ? 'Large' : 'Small'}
+              icon={<Kb.Avatar size={isMobile ? 48 : 32} username={username} />}
+              firstItem={idx === 0}
+              body={
+                <Kb.Box2 direction="vertical" fullWidth={true}>
+                  <Kb.Text type="BodySemibold">{username}</Kb.Text>
+                </Kb.Box2>
+              }
+            />
+          ))}
+        </>
+      )}
+      <Kb.Text center={true} type="BodyBig" style={styles.errorText} selectable={true}>
+        {createConversationErrorDescription}
+      </Kb.Text>
+      <Kb.ButtonBar
+        direction={isMobile ? 'column' : 'row'}
+        fullWidth={true}
+        style={styles.buttonBar}
+      >
+        {onCreateWithoutThem && (
+          <Kb.WaitingButton type="Default" label="Create without them" onClick={onCreateWithoutThem} />
+        )}
+        {onBack && (
+          <Kb.WaitingButton
+            type={onCreateWithoutThem ? 'Dim' : 'Default'}
+            label={onCreateWithoutThem ? 'Cancel' : 'Okay'}
+            onClick={onBack}
+          />
+        )}
+      </Kb.ButtonBar>
+    </Kb.Box2>
+  )
+}
+
+function SpecialTopMessage() {
+  const styles = useStyles()
+  const username = useCurrentUserState(s => s.username)
+  const conversationIDKey = useConversationThreadID()
+  const {hasLoadedEver, moreToLoadBack} = useConversationThreadSelector(
+    C.useShallow(s => ({
+      hasLoadedEver: s.messageOrdinals !== undefined,
+      moreToLoadBack: s.moreToLoadBack,
+    }))
+  )
+  const {teamType, supersedes, retentionPolicy, teamRetentionPolicy} = useThreadMeta(
+    C.useShallow(m => ({
+      retentionPolicy: m.retentionPolicy,
+      supersedes: m.supersedes,
+      teamRetentionPolicy: m.teamRetentionPolicy,
+      teamType: m.teamType,
+    }))
+  )
+  const partAll = useConversationParticipantsSelector(conversationIDKey, p => p.all)
+  const loadMoreType = moreToLoadBack ? 'moreToLoad' : 'noMoreToLoad'
+  const pendingState =
+    conversationIDKey === T.Chat.pendingWaitingConversationIDKey
+      ? 'waiting'
+      : conversationIDKey === T.Chat.pendingErrorConversationIDKey
+        ? 'error'
+        : 'done'
+
+  const partNum = partAll.length
+  const isHelloBotConversation = teamType === 'adhoc' && partNum === 2 && partAll.includes('hellobot')
+  const isSelfConversation = teamType === 'adhoc' && partNum === 1 && partAll.includes(username)
+  const showTeamOffer = hasLoadedEver && loadMoreType === 'noMoreToLoad' && teamType === 'adhoc' && partNum > 2
+  const hasOlderResetConversation = supersedes !== T.Chat.noConversationIDKey
+  // don't show default header in the case of the retention notice being visible
+  const showRetentionNotice =
+    retentionPolicy.type !== 'retain' &&
+    !(retentionPolicy.type === 'inherit' && teamRetentionPolicy.type === 'retain')
+
+  const openPrivateFolder = () => {
+    FS.navToPath(T.FS.stringToPath(`/keybase/private/${username}`))
+  }
+
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} style={styles.container}>
+      {hasLoadedEver && loadMoreType === 'noMoreToLoad' && showRetentionNotice && <RetentionNotice />}
+      <Kb.Box2 alignSelf="center" direction="vertical" style={styles.spacer} />
+      {hasOlderResetConversation && <ProfileResetNotice />}
+      {pendingState === 'waiting' && (
+        <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.more}>
+          <Kb.Text type="BodySmall">Loading...</Kb.Text>
+        </Kb.Box2>
+      )}
+      {pendingState === 'error' && <ErrorMessage />}
+      {hasLoadedEver && loadMoreType === 'noMoreToLoad' && !showRetentionNotice && pendingState === 'done' && (
+        <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.more}>
+          {isHelloBotConversation ? (
+            <HelloBotCard />
+          ) : (
+            <NewChatCard self={isSelfConversation} openPrivateFolder={openPrivateFolder} />
+          )}
+        </Kb.Box2>
+      )}
+      {showTeamOffer && (
+        <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.more}>
+          <MakeTeamCard />
+        </Kb.Box2>
+      )}
+      {hasLoadedEver && loadMoreType === 'moreToLoad' && pendingState === 'done' && (
+        <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.more}>
+          <Kb.Text type="BodyBig">
+            <Kb.NativeEmoji size={16} emojiName=":moyai:" />
+          </Kb.Text>
+          <Kb.Text type="BodySmallSemibold">Digging ancient messages...</Kb.Text>
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      buttonBar: {padding: Kb.Styles.globalMargins.small},
+      container: Kb.Styles.platformStyles({
+        isElectron: {
+          minHeight: 100,
+        },
+      }),
+      errorText: {padding: Kb.Styles.globalMargins.small},
+      more: {
+        paddingBottom: Kb.Styles.globalMargins.medium,
+      },
+      spacer: {height: Kb.Styles.globalMargins.small},
+    }) as const
+)
+
+export default SpecialTopMessage

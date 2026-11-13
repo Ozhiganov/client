@@ -4,7 +4,7 @@
 package client
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -88,8 +88,8 @@ func (s *CmdPGPPurge) Run() error {
 		dui.Printf("All PGP keys have been purged from the local Keybase keyring.\n")
 	} else {
 		dui.Printf("The PGP keys in the local Keybase keyring have been exported.\n")
-		dui.Printf("Please check that you have no problems decrypting them with\n\n")
-		dui.Printf("    keybase decrypt <filename>\n\n")
+		dui.Printf("Please check that you have no problems decrypting them with:\n\n")
+		dui.Printf("    keybase decrypt --infile <filename>\n\n")
 		dui.Printf("and importing them into another keyring (like GPG).\n\n")
 		dui.Printf("Once you are confident that you have your keys in a safe place,\n")
 		dui.Printf("run this command with the -p flag:\n\n")

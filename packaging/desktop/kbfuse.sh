@@ -10,12 +10,14 @@
 set -e -u -o pipefail # Fail on error
 
 dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
-cd $dir
+cd "$dir"
 
 client_dir="$dir/../.."
+# shellcheck source=packaging/lib.sh
+source "$client_dir/packaging/lib.sh"
 fuse_dir="$client_dir/osx/Fuse"
 tmp_dir="/tmp/desktop-kbfuse"
-installer_url="https://github.com/keybase/client/releases/download/v1.0.18/KeybaseInstaller-1.1.48-darwin.tgz"
+# TODO build and publish arm64 version
 
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root"
@@ -27,8 +29,8 @@ rm -rf "$tmp_dir"
 mkdir -p "$tmp_dir"
 cd "$tmp_dir"
 
-echo "Downloading installer from $installer_url"
-curl -J -L -Ss "$installer_url" | tar zx
+echo "Downloading installer from $KB_INSTALLER_URL"
+kb_fetch_verified "$KB_INSTALLER_URL" "$KB_INSTALLER_SHA256" .
 
 echo "Installing KBFuse..."
 bundle="$tmp_dir/KeybaseInstaller.app/Contents/Resources/kbfuse.bundle"

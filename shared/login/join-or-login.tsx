@@ -1,0 +1,112 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import {useConfigState} from '@/stores/config'
+import * as Kb from '@/common-adapters'
+import {InfoIcon} from '@/signup/common'
+import useRequestAutoInvite from '@/signup/use-request-auto-invite'
+import {startProvision} from '@/provision/flow'
+
+const Intro = () => {
+  const styles = useStyles()
+  const justDeletedSelf = useConfigState(s => s.justDeletedSelf)
+  const justRevokedSelf = useConfigState(s => s.justRevokedSelf)
+  const bannerMessage = justDeletedSelf
+    ? `Your Keybase account ${justDeletedSelf} has been deleted. Au revoir!`
+    : justRevokedSelf
+      ? `${justRevokedSelf} was revoked successfully`
+      : ''
+
+  const isOnline = useConfigState(s => s.isOnline)
+  const loadIsOnline = useConfigState(s => s.dispatch.loadIsOnline)
+  const requestAutoInvite = useRequestAutoInvite()
+  const onLogin = () => startProvision()
+  const onSignup = () => requestAutoInvite('')
+  const showProxySettings = () => {
+    C.Router2.navigateAppend({name: 'proxySettingsModal', params: {}})
+  }
+  const [showing, setShowing] = React.useState(true)
+  Kb.useInterval(loadIsOnline, showing ? 5000 : undefined)
+
+  C.Router2.useSafeFocusEffect(
+    React.useCallback(() => {
+      setShowing(true)
+      return () => setShowing(false)
+    }, [])
+  )
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      fullWidth={true}
+      fullHeight={true}
+      alignItems="center"
+      style={styles.container}
+    >
+      <Kb.Box2 direction="horizontal" fullWidth={true} justifyContent="flex-end" style={styles.header}>
+        <InfoIcon />
+      </Kb.Box2>
+      {!!bannerMessage && <Kb.Banner color="blue">{bannerMessage}</Kb.Banner>}
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        fullHeight={true}
+        gap="large"
+        alignItems="center"
+        centerChildren={true}
+      >
+        <Kb.Box2 direction="vertical" fullWidth={true} gap="small" alignItems="center">
+          <Kb.ImageIcon type="icon-keybase-logo-64" />
+          <Kb.Text type="HeaderBig" style={styles.text}>
+            Join Keybase
+          </Kb.Text>
+        </Kb.Box2>
+        <Kb.ButtonBar direction="column" fullWidth={isMobile} style={styles.buttonBar}>
+          <Kb.Button label="Create account" onClick={onSignup} fullWidth={true} />
+          <Kb.Button label="Log in" mode="Secondary" onClick={onLogin} fullWidth={true} />
+          {isOnline ? null : (
+            <Kb.Button
+              label="Configure a proxy"
+              mode="Secondary"
+              onClick={showProxySettings}
+              fullWidth={true}
+            />
+          )}
+        </Kb.ButtonBar>
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      buttonBar: Kb.Styles.platformStyles({
+        isElectron: {
+          paddingBottom: Kb.Styles.globalMargins.xlarge - Kb.Styles.globalMargins.tiny, // tiny added inside buttonbar
+          width: 368,
+        },
+        isMobile: {
+          ...Kb.Styles.padding(0, Kb.Styles.globalMargins.small, Kb.Styles.globalMargins.tiny),
+        },
+        isTablet: {
+          alignItems: 'center',
+          width: '100%',
+        },
+      }),
+      container: {
+        backgroundColor: theme.white,
+      },
+      header: Kb.Styles.platformStyles({
+        isElectron: {padding: Kb.Styles.globalMargins.small},
+        isMobile: {
+          paddingRight: Kb.Styles.globalMargins.small,
+          paddingTop: 10,
+        },
+      }),
+      text: {
+        color: theme.orange,
+      },
+    }) as const
+)
+
+export default Intro

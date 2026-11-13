@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/keybase/client/go/libkb"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPGPEncrypt(t *testing.T) {
@@ -19,7 +20,11 @@ func TestPGPEncrypt(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -29,15 +34,14 @@ func TestPGPEncrypt(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	out := sink.Bytes()
-	if len(out) == 0 {
-		t.Fatal("no output")
-	}
+	require.NotEmpty(t, out, "no output")
 }
 
 func TestPGPEncryptNoPGPNaClOnly(t *testing.T) {
@@ -50,7 +54,11 @@ func TestPGPEncryptNoPGPNaClOnly(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u2.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u2.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -60,14 +68,17 @@ func TestPGPEncryptNoPGPNaClOnly(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
 	if perr, ok := err.(libkb.NoPGPEncryptionKeyError); !ok {
-		t.Fatalf("Got wrong error type: %T %v", err, err)
-	} else if !perr.HasDeviceKey {
-		t.Fatalf("Should have a PGP key")
+		require.True(t, ok,
+			"Got wrong error type: %T %v", err, err)
+	} else if !perr.HasKeybaseEncryptionKey {
+		require.True(t, perr.HasKeybaseEncryptionKey,
+			"Should have a keybase encryption key")
 	} else if perr.User != u1.Username {
-		t.Fatalf("Wrong username")
+		require.FailNow(t, "Wrong username")
 	}
 }
 
@@ -79,7 +90,11 @@ func TestPGPEncryptSelfNoKey(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -89,13 +104,14 @@ func TestPGPEncryptSelfNoKey(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
-	if err == nil {
-		t.Fatal("no error encrypting for self without pgp key")
-	}
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
+	require.Error(t, err,
+		"no error encrypting for self without pgp key")
 	if _, ok := err.(libkb.NoKeyError); !ok {
-		t.Fatalf("expected error type libkb.NoKeyError, got %T (%s)", err, err)
+		require.True(t, ok,
+			"expected error type libkb.NoKeyError, got %T (%s)", err, err)
 	}
 }
 
@@ -107,7 +123,11 @@ func TestPGPEncryptNoTrack(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	sink := libkb.NewBufferCloser()
 	arg := &PGPEncryptArg{
@@ -117,15 +137,14 @@ func TestPGPEncryptNoTrack(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	out := sink.Bytes()
-	if len(out) == 0 {
-		t.Fatal("no output")
-	}
+	require.NotEmpty(t, out, "no output")
 
 	assertNotTracking(tc, "t_alice")
 	assertNotTracking(tc, "t_bob")
@@ -141,7 +160,11 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 	trackUI := &FakeIdentifyUI{
 		Proofs: make(map[string]string),
 	}
-	ctx := &Context{IdentifyUI: trackUI, SecretUI: u.NewSecretUI()}
+	uis := libkb.UIs{
+		IdentifyUI: trackUI,
+		PgpUI:      &TestPgpUI{},
+		SecretUI:   u.NewSecretUI(),
+	}
 
 	msg := "encrypt for self only once"
 	sink := libkb.NewBufferCloser()
@@ -152,11 +175,10 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 		NoSign: true,
 	}
 
-	eng := NewPGPEncrypt(arg, tc.G)
-	err := RunEngine(eng, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	eng := NewPGPEncrypt(tc.G, arg)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, eng)
+	require.NoError(t, err)
 	out := sink.Bytes()
 
 	// decrypt it
@@ -165,20 +187,17 @@ func TestPGPEncryptSelfTwice(t *testing.T) {
 		Source: bytes.NewReader(out),
 		Sink:   decoded,
 	}
-	dec := NewPGPDecrypt(decarg, tc.G)
-	ctx.LogUI = tc.G.UI.GetLogUI()
-	ctx.PgpUI = &TestPgpUI{}
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	dec := NewPGPDecrypt(tc.G, decarg)
+	m = m.WithLogUI(tc.G.UI.GetLogUI()).WithPgpUI(&TestPgpUI{})
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
-	decmsg := string(decoded.Bytes())
-	if decmsg != msg {
-		t.Errorf("decoded: %q, expected: %q", decmsg, msg)
-	}
+	decmsg := decoded.String()
+	require.Equal(t, msg, decmsg, "decoded: %q, expected: %q", decmsg, msg)
 
 	recips := dec.signStatus.RecipientKeyIDs
 	if len(recips) != 1 {
 		t.Logf("recipient key ids: %v", recips)
-		t.Errorf("num recipient key ids: %d, expected 1", len(recips))
+		require.Failf(t, "", "num recipient key ids: %d, expected 1", len(recips))
 	}
 }

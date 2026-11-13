@@ -4,17 +4,17 @@
 package engine
 
 import (
-	"crypto/rand"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
-	"github.com/keybase/client/go/kex2"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
-	"golang.org/x/net/context"
+	"github.com/keybase/client/go/saltpackkeystest"
+	"github.com/keybase/saltpack"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeSaltpackUI struct{}
@@ -39,15 +39,24 @@ func (s fakeSaltpackUI) SaltpackVerifyBadSender(_ context.Context, arg keybase1.
 	return &FakeBadSenderError{arg.Sender.SenderType}
 }
 
+func initPerUserKeyringInTestContext(t *testing.T, tc libkb.TestContext) {
+	kr, err := tc.G.GetPerUserKeyring(context.Background())
+	require.NoError(t, err)
+	err = kr.Sync(libkb.NewMetaContext(context.Background(), tc.G))
+	require.NoError(t, err)
+}
+
 func TestSaltpackDecrypt(t *testing.T) {
 	tc := SetupEngineTest(t, "SaltpackDecrypt")
 	defer tc.Cleanup()
 	fu := CreateAndSignupFakeUser(tc, "naclp")
 
+	initPerUserKeyringInTestContext(t, tc)
+
 	// encrypt a message
 	msg := "10 days in Japan"
 	sink := libkb.NewBufferCloser()
-	ctx := &Context{
+	uis := libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		SecretUI:   fu.NewSecretUI(),
 		LogUI:      tc.G.UI.GetLogUI(),
@@ -55,12 +64,16 @@ func TestSaltpackDecrypt(t *testing.T) {
 	}
 	// Should encrypt for self, too.
 	arg := &SaltpackEncryptArg{
+		Opts: keybase1.SaltpackEncryptOptions{
+			UseEntityKeys: true,
+		},
 		Source: strings.NewReader(msg),
 		Sink:   sink,
 	}
-	enc := NewSaltpackEncrypt(arg, tc.G)
-	if err := RunEngine(enc, ctx); err != nil {
-		t.Fatal(err)
+	enc := NewSaltpackEncrypt(arg, NewSaltpackUserKeyfinderAsInterface)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, enc); err != nil {
+		require.NoError(t, err)
 	}
 	out := sink.String()
 
@@ -72,14 +85,12 @@ func TestSaltpackDecrypt(t *testing.T) {
 		Source: strings.NewReader(out),
 		Sink:   decoded,
 	}
-	dec := NewSaltpackDecrypt(decarg, tc.G)
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	dec := NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
 	decmsg := decoded.String()
-	if decmsg != msg {
-		t.Errorf("decoded: %s, expected: %s", decmsg, msg)
-	}
+	require.Equal(t, msg, decmsg, "decoded: %s, expected: %s", decmsg, msg)
 
 	pgpMsg := `-----BEGIN PGP MESSAGE-----
 Version: GnuPG v1
@@ -99,16 +110,16 @@ HTngZWUk8Tjn6Q8zrnnoB92G1G+rZHAiChgBFQCaYDBsWa0Pia6Vm+10OAIulGGj
 		Source: strings.NewReader(pgpMsg),
 		Sink:   decoded,
 	}
-	dec = NewSaltpackDecrypt(decarg, tc.G)
-	err := RunEngine(dec, ctx)
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	err := RunEngine2(m, dec)
 	if wse, ok := err.(libkb.WrongCryptoFormatError); !ok {
-		t.Fatalf("Wanted a WrongCryptoFormat error, but got %T (%v)", err, err)
+		require.True(t, ok,
+			"Wanted a WrongCryptoFormat error, but got %T (%v)", err, err)
 	} else if wse.Wanted != libkb.CryptoMessageFormatSaltpack ||
 		wse.Received != libkb.CryptoMessageFormatPGP ||
 		wse.Operation != "decrypt" {
-		t.Fatalf("Bad error: %v", wse)
+		require.FailNow(t, fmt.Sprintf("Bad error: %v", wse))
 	}
-
 }
 
 type testDecryptSaltpackUI struct {
@@ -124,9 +135,9 @@ func (t *testDecryptSaltpackUI) SaltpackPromptForDecrypt(_ context.Context, arg 
 }
 
 func TestSaltpackDecryptBrokenTrack(t *testing.T) {
-
 	tc := SetupEngineTest(t, "SaltpackDecrypt")
 	defer tc.Cleanup()
+	sigVersion := libkb.GetDefaultSigVersion(tc.G)
 
 	// create a user to track the proofUser
 	trackUser := CreateAndSignupFakeUser(tc, "naclp")
@@ -134,17 +145,15 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 
 	// create a user with a rooter proof
 	proofUser := CreateAndSignupFakeUser(tc, "naclp")
-	ui, _, err := proveRooter(tc.G, proofUser)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ui, _, err := proveRooter(tc.G, proofUser, sigVersion)
+	require.NoError(t, err)
 
 	spui := testDecryptSaltpackUI{}
 
 	// encrypt a message
 	msg := "10 days in Japan"
 	sink := libkb.NewBufferCloser()
-	ctx := &Context{
+	uis := libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		SecretUI:   proofUser.NewSecretUI(),
 		LogUI:      tc.G.UI.GetLogUI(),
@@ -156,25 +165,27 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 		Sink:   sink,
 		Opts: keybase1.SaltpackEncryptOptions{
 			NoSelfEncrypt: true,
+			UseEntityKeys: true,
 			Recipients: []string{
 				trackUser.Username,
 			},
 		},
 	}
-	enc := NewSaltpackEncrypt(arg, tc.G)
-	if err := RunEngine(enc, ctx); err != nil {
-		t.Fatal(err)
+	enc := NewSaltpackEncrypt(arg, NewSaltpackUserKeyfinderAsInterface)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, enc); err != nil {
+		require.NoError(t, err)
 	}
 	out := sink.String()
 
-	// Also output a hidden-sender message
-	arg.Opts.HideSelf = true
+	// Also output a anonymous-sender message
+	arg.Opts.AuthenticityType = keybase1.AuthenticityType_ANONYMOUS
 	sink = libkb.NewBufferCloser()
 	arg.Source = strings.NewReader(msg)
 	arg.Sink = sink
-	enc = NewSaltpackEncrypt(arg, tc.G)
-	if err := RunEngine(enc, ctx); err != nil {
-		t.Fatal(err)
+	enc = NewSaltpackEncrypt(arg, NewSaltpackUserKeyfinderAsInterface)
+	if err := RunEngine2(m, enc); err != nil {
+		require.NoError(t, err)
 	}
 	outHidden := sink.String()
 
@@ -191,10 +202,8 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 		NumProofSuccesses: 1,
 		TrackStatus:       keybase1.TrackStatus_NEW_OK,
 	}
-	err = checkTrack(tc, trackUser, proofUser.Username, []sb{rbl}, &outcome)
-	if err != nil {
-		t.Fatal(err)
-	}
+	err = checkTrack(tc, trackUser, proofUser.Username, []sb{rbl}, &outcome, sigVersion)
+	require.NoError(t, err)
 
 	// decrypt it
 	decoded := libkb.NewBufferCloser()
@@ -202,21 +211,18 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 		Source: strings.NewReader(out),
 		Sink:   decoded,
 	}
-	dec := NewSaltpackDecrypt(decarg, tc.G)
+	initPerUserKeyringInTestContext(t, tc)
+	dec := NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
 	spui.f = func(arg keybase1.SaltpackPromptForDecryptArg) error {
-		if arg.Sender.SenderType != keybase1.SaltpackSenderType_TRACKING_OK {
-			t.Fatalf("Bad sender type: %v", arg.Sender.SenderType)
-		}
+		require.Equal(t, keybase1.SaltpackSenderType_TRACKING_OK, arg.Sender.SenderType, "Bad sender type: %v", arg.Sender.SenderType)
 		return nil
 	}
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
 	decmsg := decoded.String()
 	// Should work!
-	if decmsg != msg {
-		t.Fatalf("decoded: %s, expected: %s", decmsg, msg)
-	}
+	require.Equal(t, msg, decmsg, "decoded: %s, expected: %s", decmsg, msg)
 
 	// now decrypt the hidden-self message
 	decoded = libkb.NewBufferCloser()
@@ -224,27 +230,24 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 		Source: strings.NewReader(outHidden),
 		Sink:   decoded,
 	}
-	dec = NewSaltpackDecrypt(decarg, tc.G)
+	initPerUserKeyringInTestContext(t, tc)
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
 	spui.f = func(arg keybase1.SaltpackPromptForDecryptArg) error {
-		if arg.Sender.SenderType != keybase1.SaltpackSenderType_ANONYMOUS {
-			t.Fatalf("Bad sender type: %v", arg.Sender.SenderType)
-		}
+		require.Equal(t, keybase1.SaltpackSenderType_ANONYMOUS, arg.Sender.SenderType, "Bad sender type: %v", arg.Sender.SenderType)
 		return nil
 	}
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
 	decmsg = decoded.String()
 	// Should work!
-	if decmsg != msg {
-		t.Fatalf("decoded: %s, expected: %s", decmsg, msg)
-	}
+	require.Equal(t, msg, decmsg, "decoded: %s, expected: %s", decmsg, msg)
 
 	// remove the rooter proof to break the tracking statement
 	Logout(tc)
 	proofUser.LoginOrBust(tc)
 	if err := proveRooterRemove(tc.G, ui.postID); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 
 	Logout(tc)
@@ -260,28 +263,32 @@ func TestSaltpackDecryptBrokenTrack(t *testing.T) {
 			ForceRemoteCheck: true,
 		},
 	}
-	dec = NewSaltpackDecrypt(decarg, tc.G)
+	initPerUserKeyringInTestContext(t, tc)
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
 	errTrackingBroke := errors.New("tracking broke")
 	spui.f = func(arg keybase1.SaltpackPromptForDecryptArg) error {
-		if arg.Sender.SenderType != keybase1.SaltpackSenderType_TRACKING_BROKE {
-			t.Fatalf("Bad sender type: %v", arg.Sender.SenderType)
-		}
+		require.Equal(t, keybase1.SaltpackSenderType_TRACKING_BROKE, arg.Sender.SenderType, "Bad sender type: %v", arg.Sender.SenderType)
 		return errTrackingBroke
 	}
-	if err = RunEngine(dec, ctx); err != errTrackingBroke {
-		t.Fatalf("Expected an error %v; but got %v", errTrackingBroke, err)
+	err = RunEngine2(m, dec)
+	if decErr, ok := err.(libkb.DecryptionError); ok && !errors.Is(decErr.Cause.Err, errTrackingBroke) {
+		require.FailNow(t, fmt.Sprintf("Expected an error %v; but got %v", errTrackingBroke, err))
 	}
 }
 
+// The error info that this test is looking for is only available in legacy
+// saltpack encryption (i.e. repudiable) mode messages (originally called
+// encryption-only mode). Modern repudiable messages always have all-anonymous-recipients,
+// and signcryption messages have opaque receivers.
 func TestSaltpackNoEncryptionForDevice(t *testing.T) {
+	// userX has one device (device X) and a paper key. userZ will encrypt a message for userX,
+	// then userX will add a new device (Y) which should not be able to decrypt the message
+	// (as we are not using PUKs) but will receive an helpful error message which tells them
+	// which other devices to use to decrypt.
 
 	// device X (provisioner) context:
 	tcX := SetupEngineTest(t, "kex2provision")
 	defer tcX.Cleanup()
-
-	// device Y (provisionee) context:
-	tcY := SetupEngineTest(t, "kex2provionee")
-	defer tcY.Cleanup()
 
 	// device Z is the encryptor's device
 	tcZ := SetupEngineTest(t, "encryptor")
@@ -289,10 +296,6 @@ func TestSaltpackNoEncryptionForDevice(t *testing.T) {
 
 	// provisioner needs to be logged in
 	userX := CreateAndSignupFakeUserPaper(tcX, "naclp")
-	var secretX kex2.Secret
-	if _, err := rand.Read(secretX[:]); err != nil {
-		t.Fatal(err)
-	}
 
 	encryptor := CreateAndSignupFakeUser(tcZ, "naclp")
 	spui := testDecryptSaltpackUI{}
@@ -300,7 +303,7 @@ func TestSaltpackNoEncryptionForDevice(t *testing.T) {
 	// encrypt a message with encryption / tcZ
 	msg := "10 days in Japan"
 	sink := libkb.NewBufferCloser()
-	ctx := &Context{
+	uis := libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		SecretUI:   encryptor.NewSecretUI(),
 		LogUI:      tcZ.G.UI.GetLogUI(),
@@ -314,11 +317,19 @@ func TestSaltpackNoEncryptionForDevice(t *testing.T) {
 			Recipients: []string{
 				userX.Username,
 			},
+			UseDeviceKeys:    true,
+			UsePaperKeys:     true,
+			AuthenticityType: keybase1.AuthenticityType_REPUDIABLE,
 		},
 	}
-	enc := NewSaltpackEncrypt(arg, tcZ.G)
-	if err := RunEngine(enc, ctx); err != nil {
-		t.Fatal(err)
+	enc := NewSaltpackEncrypt(arg, NewSaltpackUserKeyfinderAsInterface)
+	m := NewMetaContextForTest(tcZ).WithUIs(uis)
+	// The error messages in this test only work for visible recipients, which
+	// aren't the default anymore.
+	enc.visibleRecipientsForTesting = true
+
+	if err := RunEngine2(m, enc); err != nil {
+		require.NoError(t, err)
 	}
 	out := sink.String()
 
@@ -328,76 +339,30 @@ func TestSaltpackNoEncryptionForDevice(t *testing.T) {
 		Source: strings.NewReader(out),
 		Sink:   decoded,
 	}
-	dec := NewSaltpackDecrypt(decarg, tcX.G)
+	dec := NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
 	spui.f = func(arg keybase1.SaltpackPromptForDecryptArg) error {
-		if arg.Sender.SenderType != keybase1.SaltpackSenderType_NOT_TRACKED {
-			t.Fatalf("Bad sender type: %v", arg.Sender.SenderType)
-		}
+		require.Equal(t, keybase1.SaltpackSenderType_NOT_TRACKED, arg.Sender.SenderType, "Bad sender type: %v", arg.Sender.SenderType)
 		return nil
 	}
-	ctx = &Context{
+	uis = libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		SecretUI:   userX.NewSecretUI(),
 		LogUI:      tcX.G.UI.GetLogUI(),
 		SaltpackUI: &spui,
 	}
-
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	m = NewMetaContextForTest(tcX).WithUIs(uis)
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
 	decmsg := decoded.String()
 	// Should work!
-	if decmsg != msg {
-		t.Fatalf("decoded: %s, expected: %s", decmsg, msg)
-	}
+	require.Equal(t, msg, decmsg, "decoded: %s, expected: %s", decmsg, msg)
 
-	// Now make a new device
-	secretCh := make(chan kex2.Secret)
-
-	// provisionee calls login:
-	ctx = &Context{
-		ProvisionUI: newTestProvisionUISecretCh(secretCh),
-		LoginUI:     &libkb.TestLoginUI{Username: userX.Username},
-		LogUI:       tcY.G.UI.GetLogUI(),
-		SecretUI:    &libkb.TestSecretUI{},
-		GPGUI:       &gpgtestui{},
-	}
-	eng := NewLogin(tcY.G, libkb.DeviceTypeDesktop, "", keybase1.ClientType_CLI)
-
-	var wg sync.WaitGroup
-
-	// start provisionee
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := RunEngine(eng, ctx); err != nil {
-			t.Errorf("login error: %s", err)
-			return
-		}
-	}()
-
-	// start provisioner
-	provisioner := NewKex2Provisioner(tcX.G, secretX, nil)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		ctx := &Context{
-			SecretUI:    userX.NewSecretUI(),
-			ProvisionUI: newTestProvisionUI(),
-		}
-		if err := RunEngine(provisioner, ctx); err != nil {
-			t.Errorf("provisioner error: %s", err)
-			return
-		}
-	}()
-	secretFromY := <-secretCh
-	provisioner.AddSecret(secretFromY)
-
-	wg.Wait()
-
-	if err := AssertProvisioned(tcY); err != nil {
-		t.Fatal(err)
+	// Now make a new device for userX
+	tcY, Cleanup := provisionNewDeviceKex(&tcX, userX)
+	defer Cleanup()
+	if err := AssertProvisioned(*tcY); err != nil {
+		require.NoError(t, err)
 	}
 
 	// Now try and fail to decrypt with device Y (via tcY)
@@ -406,49 +371,43 @@ func TestSaltpackNoEncryptionForDevice(t *testing.T) {
 		Source: strings.NewReader(out),
 		Sink:   decoded,
 	}
-	dec = NewSaltpackDecrypt(decarg, tcY.G)
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
 	spui.f = func(arg keybase1.SaltpackPromptForDecryptArg) error {
-		t.Fatal("should not be prompted for decryption")
+		require.FailNow(t, "should not be prompted for decryption")
 		return nil
 	}
-	ctx = &Context{
+	uis = libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		SecretUI:   userX.NewSecretUI(),
 		LogUI:      tcY.G.UI.GetLogUI(),
 		SaltpackUI: &spui,
 	}
-
-	if err := RunEngine(dec, ctx); err == nil {
-		t.Fatal("Should have seen a decryption error")
+	m = NewMetaContextForTest(*tcY).WithUIs(uis)
+	if err := RunEngine2(m, dec); err == nil {
+		require.Error(t, err,
+			"Should have seen a decryption error")
 	}
 
 	// Make sure we get the right helpful debug message back
 	me := dec.MessageInfo()
-	if len(me.Devices) != 2 {
-		t.Fatalf("expected 2 valid devices; got %d", len(me.Devices))
-	}
+	require.Len(t, me.Devices, 2, "expected 2 valid devices; got %d", len(me.Devices))
 
 	backup := 0
 	desktops := 0
 	for _, d := range me.Devices {
 		switch d.Type {
-		case "backup":
+		case keybase1.DeviceTypeV2_PAPER:
 			backup++
-		case "desktop":
+		case keybase1.DeviceTypeV2_DESKTOP:
 			desktops++
-			if !userX.EncryptionKey.GetKID().Equal(d.EncryptKey) {
-				t.Fatal("got wrong encryption key for good possibilities")
-			}
+			require.True(t, userX.EncryptionKey.GetKID().Equal(d.EncryptKey),
+				"got wrong encryption key for good possibilities")
 		default:
-			t.Fatalf("wrong kind of device: %s\n", d.Type)
+			require.FailNow(t, fmt.Sprintf("wrong kind of device: %s\n", d.Type))
 		}
 	}
-	if backup != 1 {
-		t.Fatal("Only wanted 1 backup key")
-	}
-	if desktops != 1 {
-		t.Fatal("only wanted 1 desktop key")
-	}
+	require.Equal(t, 1, backup, "Only wanted 1 backup key")
+	require.Equal(t, 1, desktops, "only wanted 1 desktop key")
 }
 
 func TestSaltpackDecryptWithPaperKey(t *testing.T) {
@@ -489,20 +448,111 @@ func TestSaltpackDecryptWithPaperKey(t *testing.T) {
 			UsePaperKey: true,
 		},
 	}
-	dec := NewSaltpackDecrypt(decarg, tc.G)
-	ctx := &Context{
+	dec := NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	uis := libkb.UIs{
 		IdentifyUI: &FakeIdentifyUI{},
 		// Here's where the paper key goes in!
 		SecretUI:   &libkb.TestSecretUI{Passphrase: paperkey},
 		LogUI:      tc.G.UI.GetLogUI(),
 		SaltpackUI: &fakeSaltpackUI{},
 	}
-	if err := RunEngine(dec, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
 	}
 	decmsg := decoded.String()
 	expected := "message for paper key"
-	if decmsg != expected {
-		t.Errorf("decoded: %s, expected: %s", decmsg, expected)
+	require.Equal(t, expected, decmsg, "decoded: %s, expected: %s", decmsg, expected)
+}
+
+func TestSaltpackDecryptErrors(t *testing.T) {
+	tc := SetupEngineTest(t, "SaltpackDecrypt")
+	defer tc.Cleanup()
+	fu := CreateAndSignupFakeUser(tc, "naclp")
+
+	initPerUserKeyringInTestContext(t, tc)
+
+	// encrypt a message
+	msg := "10 days in Japan"
+	sink := libkb.NewBufferCloser()
+	uis := libkb.UIs{
+		IdentifyUI: &FakeIdentifyUI{},
+		SecretUI:   fu.NewSecretUI(),
+		LogUI:      tc.G.UI.GetLogUI(),
+		SaltpackUI: &fakeSaltpackUI{},
+	}
+	// Should encrypt for self, too.
+	arg := &SaltpackEncryptArg{
+		Opts: keybase1.SaltpackEncryptOptions{
+			UseEntityKeys: true,
+		},
+		Source: strings.NewReader(msg),
+		Sink:   sink,
+	}
+	enc := NewSaltpackEncrypt(arg, NewSaltpackUserKeyfinderAsInterface)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, enc); err != nil {
+		require.NoError(t, err)
+	}
+	out := sink.String()
+
+	t.Logf("encrypted data: %s", out)
+
+	// assert that decryption works
+	decoded := libkb.NewBufferCloser()
+	decarg := &SaltpackDecryptArg{
+		Source: strings.NewReader(out),
+		Sink:   decoded,
+	}
+	dec := NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	if err := RunEngine2(m, dec); err != nil {
+		require.NoError(t, err)
+	}
+	decmsg := decoded.String()
+	require.Equal(t, msg, decmsg, "decoded: %s, expected: %s", decmsg, msg)
+
+	// no suitable key
+
+	noKeyOut := `
+		BEGIN KEYBASE SALTPACK ENCRYPTED MESSAGE. keDIDMQWYvVR58B FTfTeDQNI4kF4aV
+		DVTLefltGS2t8xf vO9CL7B6UQvpJEM WofNn31JYOAziF6 5vLTstSAXwLrJQ0
+		K6KJtSb38V1EsJJ sJMdU57C9s3dYEy Fk9Rw1bK2dTnua5 b822rmZdhdw7VzS
+		RwR1shIDHPXgFGC 5HhonSburbeywdE lSriPuVhSAXX9yR kwgCa3jRY3y863C
+		pwxv8lB10IjmgSx Xb5D61t8WCZ86N0 pADtHnYeyXwezjW fSEE57xOLE8naAz
+		RJLPlTEhoqllLQh iK1yzp6bGeJyAlI ctWQKKORiIyIsNS 1oFT8dj7SUtWhxy
+		nAGjUIDfkIBzBB3 SbPgWxhBKnXbW0R LCMxKOGhgpolubZ sdlVLZmP0F. END KEYBASE
+		SALTPACK ENCRYPTED MESSAGE.
+	`
+
+	decoded = libkb.NewBufferCloser()
+	decarg = &SaltpackDecryptArg{
+		Source: strings.NewReader(noKeyOut),
+		Sink:   decoded,
+	}
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	err := RunEngine2(m, dec)
+	require.Error(t, err)
+	require.ErrorAs(t, err, new(libkb.DecryptionError))
+	if err, ok := err.(libkb.DecryptionError); ok {
+		require.ErrorAs(t, err.Cause.Err, new(libkb.NoDecryptionKeyError))
+		require.Equal(t, libkb.SCDecryptionKeyNotFound, err.Cause.StatusCode)
+	}
+
+	// wrong type
+
+	wrongTypeOut := `BEGIN KEYBASE SALTPACK SIGNED MESSAGE. kXR7VktZdyH7rvq v5weRa0zkUpZbPl nShyKLCCGSyBcvL sg7Gi9ySjlkxHPS RUM4Vm3DUCrEkxO bkbzrs0zuASSJbt aRoYF7ojm5zUxFX QasNzKboA7khwAa qIlCC0iwTFB3NBq fmDjvyKYfyQACcV 4BG5Mij3RfCYqAw gLtvUzU0UmfhJoP JPbj2eztW. END KEYBASE SALTPACK SIGNED MESSAGE.`
+
+	decoded = libkb.NewBufferCloser()
+	decarg = &SaltpackDecryptArg{
+		Source: strings.NewReader(wrongTypeOut),
+		Sink:   decoded,
+	}
+	dec = NewSaltpackDecrypt(decarg, saltpackkeystest.NewMockPseudonymResolver(t))
+	err = RunEngine2(m, dec)
+	require.Error(t, err)
+	require.ErrorAs(t, err, new(libkb.DecryptionError))
+	if err, ok := err.(libkb.DecryptionError); ok {
+		require.ErrorAs(t, err.Cause.Err, new(saltpack.ErrWrongMessageType))
+		require.Equal(t, libkb.SCWrongCryptoMsgType, err.Cause.StatusCode)
 	}
 }

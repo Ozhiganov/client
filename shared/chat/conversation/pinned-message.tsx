@@ -1,0 +1,216 @@
+import * as C from '@/constants'
+import {zoomImage} from '@/constants/chat/helpers'
+import * as React from 'react'
+import type * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useChatTeam} from './team-hooks'
+import {ZoomedImage} from './common'
+import {useConversationCenterActions} from './center-context'
+import {useConversationThreadID, useThreadMeta, useThreadRpc} from './thread-context'
+import {useThreadSearchRoute} from './thread-search-route'
+import logger from '@/logger'
+import {RPCError} from '@/util/errors'
+
+const PinnedMessage = function PinnedMessage() {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const conversationIDKey = useConversationThreadID()
+  const {pinnedMsg, teamID, teamname} = useThreadMeta(
+    C.useShallow(m => ({
+      pinnedMsg: m.pinnedMsg,
+      teamID: m.teamID,
+      teamname: m.teamname,
+    }))
+  )
+  const {centerOnMessage} = useConversationCenterActions()
+  const rpc = useThreadRpc()
+  const you = useCurrentUserState(s => s.username)
+  const {yourOperations} = useChatTeam(teamID, teamname)
+  const unpinning = C.Waiting.useAnyWaiting(C.waitingKeyChatUnpin(conversationIDKey))
+  const {message, pinnerUsername} = pinnedMsg ?? {}
+  const {id: messageID, author, type} = message ?? {}
+  const canAdminDelete = !!yourOperations.deleteOtherMessages
+  const attachment: T.Chat.MessageAttachment | undefined =
+    message?.type === 'attachment' && message.attachmentType === 'image' ? message : undefined
+  const {previewHeight: imageHeight, previewURL: imageURL, previewWidth: imageWidth} = attachment ?? {}
+  const text =
+    type === 'text' ? (message?.decoratedText?.stringValue() ?? '') : message?.title || message?.fileName
+
+  const yourMessage = pinnerUsername === you
+  const dismissUnpins = yourMessage || canAdminDelete
+
+  const onClick = () => {
+    if (messageID) {
+      centerOnMessage(messageID, 'flash')
+    }
+  }
+  const onIgnore = () => {
+    const f = async () => {
+      await rpc.ignorePinnedMessage(conversationIDKey)
+    }
+    C.ignorePromise(f())
+  }
+  const onUnpin = () => {
+    const f = async () => {
+      try {
+        await rpc.unpinMessage(conversationIDKey, C.waitingKeyChatUnpin(conversationIDKey))
+      } catch (error) {
+        if (error instanceof RPCError) {
+          logger.error(`pinMessage: ${error.message}`)
+        }
+      }
+    }
+    C.ignorePromise(f())
+  }
+  const closeref = React.useRef<Kb.MeasureRef | null>(null)
+  const [showPopup, setShowPopup] = React.useState(false)
+  const _onDismiss = dismissUnpins ? onUnpin : onIgnore
+  const onDismiss = () => {
+    setShowPopup(false)
+    _onDismiss()
+  }
+
+  const onIconClick = () => {
+    if (dismissUnpins) {
+      setShowPopup(true)
+    } else {
+      onDismiss()
+    }
+  }
+
+  if (!(type === 'text' || type === 'attachment')) {
+    return null
+  }
+  if (!text) {
+    return null
+  }
+  const sizing = imageWidth && imageHeight ? zoomImage(imageWidth, imageHeight, 30) : undefined
+  const pin = (
+    <Kb.ClickableBox direction="horizontal" fullWidth={true} gap="tiny" className="hover_container" onClick={onClick} style={styles.container} testID={TestIDs.CHAT_PINNED_BANNER}>
+      <Kb.Box2 direction="horizontal" alignSelf="stretch" style={styles.blueBar} />
+      {!!imageURL && <ZoomedImage src={imageURL} sizing={sizing} />}
+      <Kb.Box2 direction="vertical" fullWidth={true} flex={1}>
+        <Kb.Box2 direction="horizontal" gap="tiny">
+          <Kb.Text type="BodyTinyBold" style={styles.author}>
+            {author}
+          </Kb.Text>
+          <Kb.Text type="BodyTinySemibold" style={styles.label}>
+            Pinned
+          </Kb.Text>
+        </Kb.Box2>
+        <Kb.Markdown smallStandaloneEmoji={true} lineClamp={1} style={styles.text} serviceOnly={true}>
+          {text}
+        </Kb.Markdown>
+      </Kb.Box2>
+      {unpinning ? (
+        <Kb.Box2 direction="vertical" alignSelf="center">
+          <Kb.ProgressIndicator type="Small" />
+        </Kb.Box2>
+      ) : (
+        <Kb.Box2 direction="vertical" ref={closeref} style={styles.close}>
+          <Kb.Icon
+            onClick={onIconClick}
+            // UNPIN only while the click asks first: without the prompt it hides the pin for you at once
+            testID={dismissUnpins ? TestIDs.CHAT_PINNED_UNPIN : TestIDs.CHAT_PINNED_DISMISS}
+            type="iconfont-close"
+            sizeType="Small"
+            color={theme.black_20}
+          />
+        </Kb.Box2>
+      )}
+    </Kb.ClickableBox>
+  )
+  const popup = (
+    <UnpinPrompt
+      attachTo={closeref}
+      onHidden={() => setShowPopup(false)}
+      onUnpin={onDismiss}
+      visible={showPopup}
+    />
+  )
+  return (
+    <>
+      {pin}
+      {popup}
+    </>
+  )
+}
+
+type UnpinProps = {
+  attachTo?: React.RefObject<Kb.MeasureRef | null>
+  onHidden: () => void
+  onUnpin: () => void
+  visible: boolean
+}
+
+const UnpinPrompt = (props: UnpinProps) => {
+  const styles = useStyles()
+  const header = (
+    <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} gap="xsmall" style={styles.popup} testID={TestIDs.CHAT_UNPIN_PROMPT}>
+      <Kb.Text type="BodyBig">Unpin this message?</Kb.Text>
+      <Kb.Box2 direction="vertical" centerChildren={true}>
+        <Kb.Text type="BodySmall">This will remove the pin from</Kb.Text>
+        <Kb.Text type="BodySmall">{"everyone's view."}</Kb.Text>
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+  return (
+    <Kb.FloatingMenu
+      attachTo={props.attachTo}
+      closeOnSelect={false}
+      mode="bottomsheet"
+      onHidden={props.onHidden}
+      visible={props.visible}
+      propagateOutsideClicks={true}
+      header={header}
+      position="left center"
+      items={['Divider', {icon: 'iconfont-close', onClick: props.onUnpin, title: 'Yes, unpin'}]}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      author: {color: theme.black},
+      blueBar: {
+        backgroundColor: theme.blue,
+        width: Kb.Styles.globalMargins.xtiny,
+      },
+      close: Kb.Styles.platformStyles({
+        common: {alignSelf: 'flex-start'},
+        isElectron: {
+          paddingBottom: Kb.Styles.globalMargins.xtiny,
+          paddingLeft: Kb.Styles.globalMargins.xtiny,
+          paddingTop: Kb.Styles.globalMargins.xtiny,
+        },
+        isMobile: {padding: Kb.Styles.globalMargins.xtiny},
+      }),
+      container: {
+        ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.xsmall),
+        ...Kb.Styles.bottomDivider(theme),
+        backgroundColor: theme.white,
+      },
+      label: {color: theme.blueDark},
+      popup: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.small, Kb.Styles.globalMargins.small, 0),
+        },
+        isElectron: {maxWidth: 200},
+      }),
+      text: Kb.Styles.platformStyles({
+        common: {color: theme.black_50},
+        isElectron: {
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        } as const,
+      }),
+    }) as const
+)
+
+// The banner hides during thread search, on both platforms: whether a layout mounts it at all.
+export const usePinnedMessageShown = () => !useThreadSearchRoute()
+
+export default PinnedMessage

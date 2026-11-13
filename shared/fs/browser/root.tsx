@@ -1,0 +1,171 @@
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import TlfType from './rows/tlf-type'
+import Tlf from './rows/tlf'
+import {useFsTlfs} from '../common'
+import SfmiBanner from '../banner/system-file-manager-integration-banner/container'
+import {WrapRow} from './rows/rows'
+import * as FS from '@/constants/fs'
+import {useCurrentUserState} from '@/stores/current-user'
+import {registerExternalResetter} from '@/util/zustand'
+
+type Props = {
+  destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource
+}
+
+type SectionListItem = {
+  name: string
+  tlfType: T.FS.TlfType
+}
+
+const rootRows: Array<SectionListItem> = [
+  {
+    name: T.FS.TlfType.Private,
+    tlfType: T.FS.TlfType.Private,
+  },
+  {
+    name: T.FS.TlfType.Public,
+    tlfType: T.FS.TlfType.Public,
+  },
+  {
+    name: T.FS.TlfType.Team,
+    tlfType: T.FS.TlfType.Team,
+  },
+]
+
+const getRenderItem = (destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource) =>
+  function WrapTLF({item, section}: {item: SectionListItem; section: {key: string}}) {
+    return section.key === 'section-top' ? (
+      <WrapRow>
+        <TlfType name={item.name as T.FS.TlfType} destinationPickerSource={destinationPickerSource} />
+      </WrapRow>
+    ) : (
+      <WrapRow>
+        <Tlf
+          disabled={false}
+          name={item.name}
+          tlfType={item.tlfType}
+          mixedMode={true}
+          destinationPickerSource={destinationPickerSource}
+        />
+      </WrapRow>
+    )
+  }
+
+const renderSectionHeader = ({section}: {section: {key: string; title: string}}) =>
+  section.key === 'banner-sfmi' ? <SfmiBanner /> : <Kb.SectionDivider label={section.title} />
+
+// recents are re-derived on every FsDataContext write; reuse item identities
+// so the memoized rows can bail
+const recentItemCache = new Map<string, SectionListItem>()
+
+// module scope outlives sign-out; keyed by TLF name
+registerExternalResetter('fs-browser-recent-item-cache', () => {
+  recentItemCache.clear()
+})
+const canonRecentItem = (name: string, tlfType: T.FS.TlfType): SectionListItem => {
+  const key = `${tlfType}-${name}`
+  let item = recentItemCache.get(key)
+  if (!item) {
+    if (recentItemCache.size > 4096) {
+      recentItemCache.clear()
+    }
+    item = {name, tlfType}
+    recentItemCache.set(key, item)
+  }
+  return item
+}
+
+// Newest first; TLFs touched at the same time keep a stable order by name instead of whatever order
+// the service listed them in.
+export const newestTlfFirst = (
+  a: {name: string; tlfMtime: number},
+  b: {name: string; tlfMtime: number}
+) => b.tlfMtime - a.tlfMtime || a.name.localeCompare(b.name)
+
+const useTopNTlfs = (
+  tlfType: T.FS.TlfType,
+  tlfs: T.FS.TlfList,
+  n: number
+): Array<{
+  name: string
+  tlfMtime: number
+  tlfType: T.FS.TlfType
+}> =>
+  // TODO move these sorting to Go HOTPOT-433
+  [...tlfs.values()]
+    .filter(({isIgnored}) => !isIgnored)
+    .sort(newestTlfFirst)
+    .slice(0, n)
+    .map(({name, tlfMtime}) => ({
+      name,
+      tlfMtime,
+      tlfType,
+    }))
+
+const useRecentTlfs = (
+  n: number,
+  destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource
+): Array<SectionListItem> => {
+  const tlfs = useFsTlfs()
+  const username = useCurrentUserState(s => s.username)
+  const privateTopN = useTopNTlfs(T.FS.TlfType.Private, tlfs.private, n)
+  const publicTopN = useTopNTlfs(T.FS.TlfType.Public, tlfs.public, n)
+  const teamTopN = useTopNTlfs(T.FS.TlfType.Team, tlfs.team, n)
+  const recent = [...privateTopN, ...publicTopN, ...teamTopN]
+    .sort(newestTlfFirst)
+    .map(({name, tlfType}) => canonRecentItem(name, tlfType))
+  const afterFilter =
+    // This isn't perfect since it doesn't cover the case where a team TLF
+    // could be readonly. But to do that we'd need some new caching in KBFS
+    // to plumb it into the Tlfs structure without awful overhead.
+    destinationPickerSource
+      ? recent.filter(
+          ({name, tlfType}) =>
+            !FS.hideOrDisableInDestinationPicker(tlfType, name, username, true)
+        )
+      : recent
+  return afterFilter.slice(0, n)
+}
+
+function Root({destinationPickerSource}: Props) {
+  const top10 = useRecentTlfs(10, destinationPickerSource)
+  const sections = [
+    ...(destinationPickerSource
+      ? [] // don't show sfmi banner in destination picker
+      : [
+          {
+            data: new Array<SectionListItem>(),
+            key: 'banner-sfmi',
+            keyExtractor: () => 'banner-sfmi-item',
+            title: '',
+          },
+        ]),
+    {
+      data: rootRows,
+      key: 'section-top',
+      keyExtractor: (item: SectionListItem) => `top:${item.name}`,
+      title: ' ',
+    },
+    {
+      data: top10,
+      key: 'section-recent-tlfs',
+      keyExtractor: (item: SectionListItem) => `recent-tlfs:${item.tlfType}-${item.name}`,
+      title: 'Recent folders',
+    },
+  ]
+  const renderItem = getRenderItem(destinationPickerSource)
+
+  return (
+    <Kb.BoxGrow>
+      <Kb.SectionList
+        sections={sections}
+        renderItem={renderItem}
+        renderSectionHeader={renderSectionHeader}
+        stickySectionHeadersEnabled={false}
+      />
+    </Kb.BoxGrow>
+  )
+}
+
+export default Root

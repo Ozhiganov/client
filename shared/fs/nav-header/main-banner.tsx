@@ -1,0 +1,81 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import * as FS from '@/constants/fs'
+import {useFsErrorActionOrThrow, useFsOverallSyncStatus, useKbfsDaemonStatus} from '../common'
+import {useCurrentUserState} from '@/stores/current-user'
+
+type Props = {
+  onRetry: () => void
+  bannerType: T.FS.MainBannerType
+}
+
+const Banner = (props: Props) => {
+  const styles = useStyles()
+  switch (props.bannerType) {
+    case T.FS.MainBannerType.None:
+      return null
+    case T.FS.MainBannerType.Offline:
+      return (
+        <Kb.Banner color="blue">
+          <Kb.BannerParagraph bannerColor="blue" content="You are offline." />
+        </Kb.Banner>
+      )
+    case T.FS.MainBannerType.TryingToConnect:
+      return (
+        <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.loadingLineContainer}>
+          <Kb.LoadingLine />
+        </Kb.Box2>
+      )
+    case T.FS.MainBannerType.OutOfSpace:
+      return (
+        <Kb.Banner color="red">
+          <Kb.BannerParagraph
+            bannerColor="red"
+            content={[
+              'Your ',
+              isMobile ? 'phone' : 'computer',
+              ' is out of space and some folders could not be properly synced. Make some space and ',
+              {onClick: props.onRetry, text: 'retry the sync'},
+              '.',
+            ]}
+          />
+        </Kb.Banner>
+      )
+  }
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  loadingLineContainer: Kb.Styles.platformStyles({
+    isElectron: {
+      position: 'relative',
+      top: -1,
+    },
+  }),
+}))
+
+const ConnectedBanner = () => {
+  const kbfsDaemonStatus = useKbfsDaemonStatus()
+  const overallSyncStatus = useFsOverallSyncStatus()
+  const name = useCurrentUserState(s => s.username)
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  // Stat'ing the path nudges the service to retry sync.
+  const onRetry = () => {
+    const path = T.FS.stringToPath('/keybase/private/' + name)
+    const f = async () => {
+      try {
+        await T.RPCGen.SimpleFSSimpleFSStatRpcPromise({
+          path: FS.pathToRPCPath(path),
+          refreshSubscription: false,
+        })
+      } catch (error) {
+        errorToActionOrThrow(error, path)
+      }
+    }
+    C.ignorePromise(f())
+  }
+
+  return <Banner bannerType={FS.getMainBannerType(kbfsDaemonStatus, overallSyncStatus)} onRetry={onRetry} />
+}
+
+export default ConnectedBanner

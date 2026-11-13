@@ -1,0 +1,74 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {PortalHost, Portal} from '@/common-adapters/portal.native'
+import AudioPlayer from './audio-player'
+import type {AmpTracker} from './amptracker'
+
+type Props = {
+  cancelRecording: () => void
+  sendRecording: () => void
+  duration: number
+  ampTracker: AmpTracker
+  path: string
+}
+
+export const ShowAudioSendContext = React.createContext({
+  setShowAudioSend: (_s: boolean) => {},
+  showAudioSend: false,
+})
+ShowAudioSendContext.displayName = 'ShowAudioSendContext'
+
+export const AudioSendWrapper = () => {
+  return <PortalHost name="audioSend" />
+}
+
+// This is created and driven by the AudioRecorder button but its ultimately rendered
+// through a portal into the parent PlatformInput
+const AudioSend = (props: Props) => {
+  const styles = useStyles()
+  const {cancelRecording, sendRecording, duration, ampTracker, path} = props
+
+  // render
+  const audioUrl = `file://${path}`
+  const player = (
+    <AudioPlayer
+      big={false}
+      duration={duration}
+      maxWidth={120}
+      url={audioUrl}
+      visAmps={ampTracker.getBucketedAmps(duration)}
+    />
+  )
+  return (
+    <Portal hostName="audioSend" useFullScreenOverlay={false}>
+      <Kb.Box2 direction="horizontal" style={styles.container} fullWidth={true} alignItems="center" justifyContent="space-between">
+        <Kb.Box2 direction="horizontal" alignItems="center">
+          <Kb.Box2 direction="vertical" centerChildren={true} style={styles.icon}>
+            <Kb.Icon type="iconfont-remove" onClick={cancelRecording} />
+          </Kb.Box2>
+          {player}
+        </Kb.Box2>
+        <Kb.Button type="Default" small={true} style={styles.send} onClick={sendRecording} label="Send" />
+      </Kb.Box2>
+    </Portal>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  container: {
+    borderStyle: 'solid',
+    borderTopColor: theme.black_10,
+    borderTopWidth: 1,
+    ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+  },
+  icon: {
+    ...Kb.Styles.size(32),
+    marginRight: Kb.Styles.globalMargins.tiny,
+  },
+  send: {
+    alignSelf: 'flex-end',
+    ...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny),
+  },
+}))
+
+export default AudioSend

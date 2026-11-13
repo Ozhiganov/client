@@ -1,0 +1,895 @@
+// Where the desktop thread scrolls, read off the DOM: opening lands at the bottom, new messages keep
+// a reader at the bottom there and leave one in history where they are, search hits centre and let
+// the reader take over, pages load in both directions without moving the reader, and the list
+// keeps its place across an edit, a mark unread and a tab switch.
+import type {Page} from '@playwright/test'
+import {test, expect, seedChatData} from '@/tests/e2e/electron/helpers/fixtures'
+import {
+  clickUnoccluded,
+  closeSearch,
+  composer,
+  composerInput,
+  dragScrollbar,
+  endTolerancePx,
+  focusThreadScroller,
+  isOrdinalCentred,
+  messageMenu,
+  navigationWithoutSearch,
+  openConversationByName,
+  openThreadSearch,
+  ordinalRect,
+  readThreadGeometry,
+  rowByOrdinal,
+  searchFor,
+  selectHit,
+  sendMessage,
+  startScrollerFrames,
+  stopScrollerFrames,
+  threadHeaderTitle,
+  threadSearch,
+  waitForRow,
+  waitForScrollStable,
+  waitForScrolledFromTop,
+  wheelThread,
+  type ThreadGeometry,
+} from '@/tests/e2e/electron/helpers/chat'
+import {
+  E2E_CHANNELS,
+  LONG_COUNT,
+  LONG_SEARCH_TOKENS,
+  SHORT_COUNT,
+  longMarker,
+  shortMarker,
+  type ChatData,
+  type E2EChannel,
+} from '@/tests/e2e/shared/chat-data'
+import {loadE2EEnv} from '@/tests/e2e/accounts/env'
+import {peerSender, type IncomingSender} from '@/tests/e2e/shared/peer-actors'
+import * as T from '@/tests/e2e/shared/test-ids'
+
+// no retries: a retry would let an intermittent race pass
+test.describe.configure({retries: 0})
+
+let data: ChatData
+
+test.beforeAll(async () => {
+  test.setTimeout(20 * 60_000) // a first run seeds; later runs only check
+  data = await seedChatData()
+})
+
+// How far a row the reader was looking at may drift across a page load: rows measure to fractional
+// pixels, and the list holds content in place to within a few of them. Scrolling up is looser
+// between page loads: rows scrolled into view from above render at the list's estimated height
+// (72px) and then measure at their real one, and the rows below them in view move by the
+// difference (17.5px on a typical 600px wheel here, 103px where the three short system messages
+// at the very top of the thread come in). That happens on master too (same list, same estimate).
+const anchorTolerancePx = 12
+// The list's own centring settles within 8px of the middle.
+const centreTolerancePx = 16
+
+const jumpToRecent = (page: Page) => page.getByTestId(T.CHAT_JUMP_TO_RECENT)
+const catchUp = (page: Page) => page.getByTestId(T.CHAT_CATCH_UP)
+
+// The second account's peer service, found by the first flow that needs it: one that is missing
+// fails only those flows, with the reason.
+let sender: Promise<IncomingSender> | undefined
+const requireSender = async () => (sender ??= peerSender(loadE2EEnv()))
+
+const sendIncoming = async (channel: E2EChannel, text: string) => {
+  await (await requireSender()).send(data.convIDs[channel], text)
+}
+
+// A row wholly in view, at least `margin` px inside both edges, for the reader to be looking at.
+const pickAnchor = (g: ThreadGeometry, margin: number) => {
+  const row = g.rows.find(r => r.top >= margin && r.bottom <= g.viewHeight - margin)
+  if (!row) throw new Error(`no row wholly in view with a ${margin}px margin`)
+  return row
+}
+
+const rowTop = (g: ThreadGeometry, ordinal: number) => g.rows.find(r => r.ordinal === ordinal)?.top
+
+// The ordinal of the newest row rendered, once the list has settled.
+const newestRendered = (g: ThreadGeometry) => g.rows.at(-1)?.ordinal ?? -1
+
+// Opens `channel` fresh: the thread is switched away from first, so the list mounts and loads anew.
+const openFresh = async (page: Page, channel: E2EChannel) => {
+  const away = channel === E2E_CHANNELS.scratch ? E2E_CHANNELS.media : E2E_CHANNELS.scratch
+  await openConversationByName(page, data.team, away)
+  await openConversationByName(page, data.team, channel)
+}
+
+// A reading short enough for an assertion message.
+const summary = (g: ThreadGeometry) =>
+  JSON.stringify({
+    clientHeight: g.clientHeight,
+    distanceFromEnd: g.distanceFromEnd,
+    newest: g.rows.at(-1),
+    oldest: g.rows[0],
+    rows: g.rows.length,
+    scrollHeight: g.scrollHeight,
+    scrollTop: g.scrollTop,
+  })
+
+const expectAtEnd = async (page: Page) => {
+  const g = await waitForScrollStable(page)
+  expect(g.distanceFromEnd, `distance from the end: ${summary(g)}`).toBeLessThanOrEqual(endTolerancePx)
+  return g
+}
+
+// Every frame from the thread's list showing until it settles, so a miss says whether it reached
+// the end and what grew after.
+const openScratchAtEnd = async (page: Page) => {
+  await openFresh(page, E2E_CHANNELS.scratch)
+  await startScrollerFrames(page)
+  const g = await waitForScrollStable(page)
+  const frames = await stopScrollerFrames(page)
+  expect(
+    g.distanceFromEnd,
+    `distance from the end after opening: ${summary(g)}; frames (ms/scrollTop/scrollHeight/clientHeight/distance/newest row/its height): ${frames
+      .slice(-12)
+      .map(f => f.join('/'))
+      .join(' ')}`
+  ).toBeLessThanOrEqual(endTolerancePx)
+  return g
+}
+
+// Selects the first hit for `token` and waits for its row; returns the row's ordinal.
+const searchAndSelect = async (page: Page, token: string, marker: string) => {
+  await openThreadSearch(page)
+  const hits = await searchFor(page, token)
+  expect(hits).toHaveLength(1)
+  await selectHit(page, 0)
+  return waitForRow(page, marker)
+}
+
+// Records each start and end of a row's highlight fade, and each time a highlighted row is put into
+// the list, against the row element, so a replay on the same row is told from a rebuilt row.
+type HighlightEvent = {el: number; kind: string; ordinal: string | null}
+const recordHighlights = async (page: Page) =>
+  page.getByTestId(T.CHAT_MESSAGE_LIST).evaluate(node => {
+    type El = {getAttribute: (n: string) => string | null; querySelectorAll: (s: string) => ArrayLike<El>}
+    type Ev = {animationName: string; target: El}
+    type Rec = {addedNodes: ArrayLike<unknown>}
+    const g = globalThis as unknown as {
+      MutationObserver: new (f: (rs: Array<Rec>) => void) => {observe: (n: unknown, o: object) => void}
+      __e2eHighlight: Array<HighlightEvent>
+    }
+    const events: Array<HighlightEvent> = []
+    g.__e2eHighlight = events
+    const ids = new WeakMap<object, number>()
+    let nextId = 0
+    const idOf = (el: object) => {
+      let id = ids.get(el)
+      if (id === undefined) {
+        id = ++nextId
+        ids.set(el, id)
+      }
+      return id
+    }
+    const list = node as unknown as {addEventListener: (t: string, f: (e: Ev) => void, c: boolean) => void}
+    const record = (kind: string) => (e: Ev) => {
+      if (e.animationName !== 'highlightAnimation') return
+      events.push({el: idOf(e.target), kind, ordinal: e.target.getAttribute('data-ordinal')})
+    }
+    list.addEventListener('animationstart', record('start'), true)
+    list.addEventListener('animationend', record('end'), true)
+    new g.MutationObserver(rs => {
+      for (const r of rs) {
+        for (const added of Array.from(r.addedNodes) as Array<El>) {
+          if (typeof added.querySelectorAll !== 'function') continue
+          for (const row of Array.from(added.querySelectorAll('.highlighted[data-ordinal]'))) {
+            events.push({el: idOf(row), kind: 'move', ordinal: row.getAttribute('data-ordinal')})
+          }
+        }
+      }
+    }).observe(node, {childList: true, subtree: true})
+  })
+const allHighlights = async (page: Page) =>
+  page.evaluate(() => (globalThis as unknown as {__e2eHighlight: Array<HighlightEvent>}).__e2eHighlight)
+const highlightsOf = async (page: Page, ordinal: number) =>
+  (await allHighlights(page)).filter(e => e.ordinal === String(ordinal))
+
+const expectCentred = async (page: Page, ordinal: number) => {
+  await expect
+    .poll(async () => (await isOrdinalCentred(page, ordinal, centreTolerancePx)).offset, {timeout: 10_000})
+    .toBeLessThanOrEqual(centreTolerancePx)
+  await waitForScrollStable(page)
+  const {centred, offset} = await isOrdinalCentred(page, ordinal, centreTolerancePx)
+  expect(centred, `row ${ordinal} centred (offset ${offset})`).toBe(true)
+}
+
+// The list's header: the top of its own content, the first child of the list's header wrapper, which
+// is the first child of this. A flow pads it to grow the header the way late intro content does.
+const headerWrapperParent = `[data-testid="${T.CHAT_MESSAGE_LIST}"] .legend-list-content-container`
+type HeaderEl = {firstElementChild: HeaderEl | null; style: {paddingBottom: string}; textContent: string | null}
+type HeaderGlobals = {
+  __e2eHeaderObserver?: {disconnect: () => void}
+  document: {querySelector: (s: string) => HeaderEl | null}
+}
+// The padding on the header, and whether it is the header: it holds the thread's intro.
+const headerPadding = async (page: Page) =>
+  page.evaluate(sel => {
+    const header = (globalThis as unknown as HeaderGlobals).document.querySelector(sel)?.firstElementChild?.firstElementChild
+    return {intro: !!header?.textContent?.includes('end-to-end encrypted'), padding: header?.style.paddingBottom ?? ''}
+  }, headerWrapperParent)
+const setHeaderPadding = async (page: Page, padding: string) =>
+  page.evaluate(
+    ([sel, pad]) => {
+      const header = (globalThis as unknown as HeaderGlobals).document.querySelector(sel)?.firstElementChild?.firstElementChild
+      if (header) header.style.paddingBottom = pad
+    },
+    [headerWrapperParent, padding] as const
+  )
+
+test.describe('opening', () => {
+  test('a short thread lands at the bottom once its intro card has grown the header', async ({page}) => {
+    // Every message of e2e-short arrives in the first page, so the header's intro card (the
+    // new-chat card) renders after the rows and grows the header above them.
+    await openFresh(page, E2E_CHANNELS.short)
+    const newest = await waitForRow(page, shortMarker(SHORT_COUNT))
+    await expect(page.getByTestId(T.CHAT_MESSAGE_LIST).getByText('This conversation is end-to-end encrypted.')).toHaveCount(1, {timeout: 10_000})
+    const g = await expectAtEnd(page)
+    expect(g.scrollHeight).toBeGreaterThan(g.clientHeight)
+    const rect = await ordinalRect(page, newest)
+    expect(Math.abs((rect?.bottom ?? 0) - g.viewHeight)).toBeLessThanOrEqual(40)
+  })
+
+  // The header's intro content can land after the list has aimed its initial scroll at the end, which
+  // it aims by the header it has measured so far. The growth is made here by padding the header the
+  // moment the thread's first rows mount, so it lands mid-open every time rather than only when the
+  // intro content happens to be slow.
+  test('a header that grows while the thread opens still lands at the bottom', async ({page}) => {
+    await openConversationByName(page, data.team, E2E_CHANNELS.scratch)
+    const marker = shortMarker(SHORT_COUNT)
+    try {
+      await page.evaluate(
+        ([testID, sel, text]) => {
+          type El = {textContent: string | null}
+          const g = globalThis as unknown as HeaderGlobals & {
+            MutationObserver: new (cb: () => void) => {disconnect: () => void; observe: (n: unknown, o: object) => void}
+            document: {body: unknown; querySelectorAll: (s: string) => ArrayLike<El>}
+          }
+          const observer = new g.MutationObserver(() => {
+            const rows = Array.from(g.document.querySelectorAll(`[data-testid="${testID}"] [data-ordinal]`))
+            if (!rows.some(r => r.textContent?.includes(text))) return
+            observer.disconnect()
+            const header = g.document.querySelector(sel)?.firstElementChild?.firstElementChild
+            if (header) header.style.paddingBottom = '160px'
+          })
+          observer.observe(g.document.body, {childList: true, subtree: true})
+          g.__e2eHeaderObserver = observer
+        },
+        [T.CHAT_MESSAGE_LIST, headerWrapperParent, marker] as const
+      )
+      await openConversationByName(page, data.team, E2E_CHANNELS.short)
+      const newest = await waitForRow(page, marker)
+      await expect.poll(async () => headerPadding(page)).toEqual({intro: true, padding: '160px'})
+      const g = await expectAtEnd(page)
+      expect(newestRendered(g)).toBe(newest)
+    } finally {
+      await page.evaluate(() => (globalThis as unknown as HeaderGlobals).__e2eHeaderObserver?.disconnect())
+      await setHeaderPadding(page, '')
+    }
+  })
+
+  // The same growth once the thread has settled at its end, with the header in view: a window just
+  // short of the thread's height leaves the intro on screen at the end.
+  test('at the bottom with the header in view, the header growing keeps the thread at the bottom', async ({page}) => {
+    const cdp = await page.context().newCDPSession(page)
+    try {
+      await openFresh(page, E2E_CHANNELS.short)
+      const newest = await waitForRow(page, shortMarker(SHORT_COUNT))
+      const before = await expectAtEnd(page)
+      const windowHeight = await page.evaluate(() => (globalThis as unknown as {innerHeight: number}).innerHeight)
+      const chrome = windowHeight - before.viewHeight
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        deviceScaleFactor: 0,
+        height: before.scrollHeight - 100 + chrome,
+        mobile: false,
+        width: 1000,
+      })
+      const fitted = await waitForScrollStable(page)
+      expect(fitted.scrollHeight - fitted.viewHeight, 'the thread is just taller than the view').toBeLessThan(200)
+      await expectAtEnd(page)
+      expect((await headerPadding(page)).intro, 'the header holds the intro').toBe(true)
+
+      await setHeaderPadding(page, '160px')
+      await expect.poll(async () => (await waitForScrollStable(page)).scrollHeight).toBeGreaterThan(fitted.scrollHeight + 100)
+      expect(newestRendered(await expectAtEnd(page))).toBe(newest)
+    } finally {
+      await setHeaderPadding(page, '')
+      await cdp.send('Emulation.clearDeviceMetricsOverride').catch(() => {})
+      await cdp.detach().catch(() => {})
+    }
+  })
+
+  test('a long thread with more history to load lands at the bottom', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const newest = await waitForRow(page, longMarker(LONG_COUNT))
+    const g = await expectAtEnd(page)
+    expect(newestRendered(g)).toBe(newest)
+  })
+})
+
+test.describe('new messages', () => {
+  test('at the bottom, an incoming message keeps the thread at the bottom', async ({page}) => {
+    await requireSender()
+    await openScratchAtEnd(page)
+    const text = `e2e-scroll-incoming-bottom-${Date.now()}`
+    await sendIncoming(E2E_CHANNELS.scratch, text)
+    const ordinal = await waitForRow(page, text, 20_000)
+    const g = await expectAtEnd(page)
+    expect(newestRendered(g)).toBe(ordinal)
+  })
+
+  for (const {name, up} of [
+    // within a tenth of the viewport of the end, which the list's own end anchor would call the end
+    {name: 'a little way', up: 60},
+    {name: 'well', up: 500},
+  ]) {
+    test(`scrolled ${name} up, an incoming message leaves the reader where they are`, async ({page}) => {
+      await requireSender()
+      await openScratchAtEnd(page)
+      await wheelThread(page, -up)
+      const before = await waitForScrollStable(page)
+      expect(before.distanceFromEnd).toBeGreaterThan(up / 2)
+      const anchor = pickAnchor(before, 40)
+
+      await sendIncoming(E2E_CHANNELS.scratch, `e2e-scroll-incoming-up-${Date.now()}`)
+      await expect
+        .poll(async () => (await readThreadGeometry(page))?.scrollHeight ?? 0, {timeout: 20_000})
+        .toBeGreaterThan(before.scrollHeight)
+      const after = await waitForScrollStable(page)
+      const top = rowTop(after, anchor.ordinal)
+      expect(top, `row ${anchor.ordinal} still rendered`).toBeDefined()
+      expect(Math.abs((top ?? 0) - anchor.top), `row ${anchor.ordinal} moved`).toBeLessThanOrEqual(2)
+      expect(after.distanceFromEnd).toBeGreaterThan(before.distanceFromEnd)
+    })
+  }
+})
+
+test.describe('search', () => {
+  test('a deep hit loads its page and is centred', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    await expectAtEnd(page)
+    const {index, token} = LONG_SEARCH_TOKENS.deep
+    // the hit is far older than the first page the thread loaded
+    await expect(page.getByTestId(T.CHAT_MESSAGE_LIST).getByText(longMarker(index))).toHaveCount(0)
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+    await closeSearch(page)
+  })
+
+  test('selecting the same hit again after scrolling away centres it again', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const {index, token} = LONG_SEARCH_TOKENS.middle
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+
+    await wheelThread(page, 900)
+    await waitForScrollStable(page)
+    expect((await isOrdinalCentred(page, ordinal, centreTolerancePx)).centred).toBe(false)
+
+    await selectHit(page, 0)
+    await expectCentred(page, ordinal)
+    await closeSearch(page)
+  })
+
+  // The chat tab is hidden (display: none) while another tab is shown, and showing an element again
+  // restarts its CSS animations: a highlight that has played must stay put when the tab comes back.
+  test('a hit highlight that has played does not replay when the chat tab is shown again', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    await recordHighlights(page)
+    const {index, token} = LONG_SEARCH_TOKENS.middle
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+    await expect.poll(async () => (await highlightsOf(page, ordinal)).some(e => e.kind === 'end'), {timeout: 5_000}).toBe(true)
+    await page.getByTestId(T.NAV_TAB_PEOPLE).click({force: true, timeout: 5_000})
+    await page.waitForTimeout(500)
+    await page.getByTestId(T.NAV_TAB_CHAT).click({force: true, timeout: 5_000})
+    await expect(rowByOrdinal(page, ordinal)).toBeVisible()
+    await page.waitForTimeout(1_000)
+    const events = await highlightsOf(page, ordinal)
+    const summary = events.map(e => `${e.kind}#${e.el}`).join(' ')
+    expect(events.filter(e => e.kind === 'start'), `the highlight replayed: ${summary}`).toHaveLength(1)
+    await closeSearch(page)
+  })
+
+  // Clicking the hit the search selected by itself centres it where it already is: nothing reloads,
+  // so its row is never rebuilt and its highlight fades in once.
+  test('clicking the hit the search already selected flashes it once and reloads nothing', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    await recordHighlights(page)
+    const {index, token} = LONG_SEARCH_TOKENS.middle
+    await openThreadSearch(page)
+    expect(await searchFor(page, token)).toHaveLength(1)
+    // the search selects its first hit itself
+    const ordinal = await waitForRow(page, longMarker(index))
+    await expectCentred(page, ordinal)
+    await selectHit(page, 0)
+    await page.waitForTimeout(1_500)
+    await expectCentred(page, ordinal)
+    const events = await highlightsOf(page, ordinal)
+    const summary = events.map(e => `${e.kind}#${e.el}`).join(' ')
+    expect(events.filter(e => e.kind === 'start'), `the highlight played again: ${summary}`).toHaveLength(1)
+    expect(new Set(events.map(e => e.el)).size, `the hit's row was rebuilt: ${summary}`).toBe(1)
+    await closeSearch(page)
+  })
+
+  // Each way the reader can move the list, done the moment the hit's row lands, while the list is
+  // still centring it. The reader's move wins: the list stays where it left it and is not pulled
+  // back to the hit.
+  const readerMoves: Array<{how: string; move: (page: Page) => Promise<void>}> = [
+    {how: 'a wheel', move: async page => wheelThread(page, -300)},
+    {
+      how: 'Page Up in the composer',
+      move: async page => {
+        await composerInput(page).press('PageUp', {timeout: 5_000})
+      },
+    },
+    // the centring's own scroll has just shown the overlay scrollbar
+    {how: 'a scrollbar drag', move: async page => dragScrollbar(page, -60)},
+  ]
+  for (const {how, move} of readerMoves) {
+    test(`${how} during centring stops it`, async ({page}) => {
+      await openFresh(page, E2E_CHANNELS.long)
+      await expectAtEnd(page)
+      const {index, token} = LONG_SEARCH_TOKENS.middle
+      await openThreadSearch(page)
+      await searchFor(page, token)
+      await selectHit(page, 0)
+      const ordinal = await waitForRow(page, longMarker(index))
+      // The hit's page lands with the list at its top; move only once the list has started for the
+      // hit, while its centring is still under way. A reader's move before that finds the list
+      // pinned at the top, where an upward move changes nothing.
+      await waitForScrolledFromTop(page)
+      await move(page)
+      const moved = await waitForScrollStable(page)
+      const offsetAfterMove = (await isOrdinalCentred(page, ordinal, centreTolerancePx)).offset
+      // outlast the centring's own 3s budget, then check nothing pulled the reader back
+      await page.waitForTimeout(3_500)
+      const later = await waitForScrollStable(page)
+      expect(Math.abs(later.scrollTop - moved.scrollTop), 'the list moved after the reader did').toBeLessThanOrEqual(2)
+      const {centred, offset} = await isOrdinalCentred(page, ordinal, centreTolerancePx)
+      expect(centred, `row ${ordinal} pulled back to the middle (offset ${offset}, after the move ${offsetAfterMove})`).toBe(false)
+      await closeSearch(page)
+    })
+  }
+
+  test('closing search leaves the list where it is', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const {index, token} = LONG_SEARCH_TOKENS.middle
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+    const before = await waitForScrollStable(page)
+    const top = rowTop(before, ordinal)
+
+    await closeSearch(page)
+    const after = await waitForScrollStable(page)
+    expect(Math.abs((rowTop(after, ordinal) ?? Infinity) - (top ?? 0))).toBeLessThanOrEqual(2)
+    expect(after.distanceFromEnd).toBeGreaterThan(endTolerancePx)
+  })
+
+  // Closing search with the list resting at its end, the newest message loaded, gives the end back
+  // to the list: the next message is followed as on any thread at its end.
+  test('closing search at the newest message, then an incoming message is followed', async ({page}) => {
+    await requireSender()
+    await openScratchAtEnd(page)
+    const token = `e2esearchend${Date.now()}`
+    await sendMessage(page, `e2e-scroll-search-end ${token}`)
+    await expectAtEnd(page)
+    await openThreadSearch(page)
+    // the search index can take a moment to hold a message just sent
+    await expect(async () => {
+      expect(await searchFor(page, token)).toHaveLength(1)
+    }).toPass({timeout: 20_000})
+    await selectHit(page, 0)
+    await expectAtEnd(page)
+    await closeSearch(page)
+    await expectAtEnd(page)
+
+    const text = `e2e-scroll-search-end-incoming-${Date.now()}`
+    await sendIncoming(E2E_CHANNELS.scratch, text)
+    const ordinal = await waitForRow(page, text, 20_000)
+    const g = await expectAtEnd(page)
+    expect(newestRendered(g)).toBe(ordinal)
+  })
+
+  test('jump to recent from a deep hit lands at the newest message', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const {index, token} = LONG_SEARCH_TOKENS.deep
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+
+    await clickUnoccluded(jumpToRecent(page))
+    const newest = await waitForRow(page, longMarker(LONG_COUNT), 15_000)
+    const g = await expectAtEnd(page)
+    expect(newestRendered(g)).toBe(newest)
+    await expect(jumpToRecent(page)).toHaveCount(0, {timeout: 5_000})
+    await expect(threadSearch(page)).toHaveCount(0, {timeout: 5_000})
+  })
+
+  // Closing search is the only navigation either of these makes: the app's navigation state after
+  // it is the one before it less the search.
+  const expectOnlySearchClosed = async (page: Page, before: {hadSearch: boolean; json: string}) => {
+    expect(before.hadSearch, 'thread search was open in the navigation state before').toBe(true)
+    await expect(threadSearch(page)).toHaveCount(0, {timeout: 5_000})
+    const after = await navigationWithoutSearch(page)
+    expect(after.hadSearch, 'thread search is still in the navigation state').toBe(false)
+    expect(after.json, 'navigation other than closing search').toBe(before.json)
+  }
+
+  test('jump to recent from a centred hit closes search and navigates nowhere else', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const {index, token} = LONG_SEARCH_TOKENS.deep
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+    const before = await navigationWithoutSearch(page)
+
+    await clickUnoccluded(jumpToRecent(page))
+    await waitForRow(page, longMarker(LONG_COUNT), 15_000)
+    await expectAtEnd(page)
+    await expectOnlySearchClosed(page, before)
+    await expect(threadHeaderTitle(page)).toHaveText(`${data.team}#${E2E_CHANNELS.long}`)
+  })
+
+  test('a send while centred on a hit closes search, lands at the sent message, and navigates nowhere else', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.scratch)
+    await openThreadSearch(page)
+    // the channel's oldest messages are its seeding pads (e2e-scratch-pad-<n>), far back from its end
+    const hits = await searchFor(page, 'scratch')
+    expect(hits.length, 'hits for the seeding pads').toBeGreaterThan(0)
+    // the oldest hit, at the bottom of the hit list, which scrolls
+    await threadSearch(page).getByTestId(T.CHAT_THREAD_SEARCH_HIT).nth(hits.length - 1).scrollIntoViewIfNeeded({timeout: 5_000})
+    await selectHit(page, hits.length - 1)
+    await expect.poll(async () => (await readThreadGeometry(page))?.distanceFromEnd ?? 0, {timeout: 10_000}).toBeGreaterThan(200)
+    await waitForScrollStable(page)
+    const before = await navigationWithoutSearch(page)
+
+    const text = `e2e-scroll-send-centred-${Date.now()}`
+    await composer.type(page, text)
+    await composer.press(page, 'Enter')
+    const sent = await waitForRow(page, text, 15_000)
+    const g = await expectAtEnd(page)
+    expect(newestRendered(g)).toBe(sent)
+    await expectOnlySearchClosed(page, before)
+    await expect(threadHeaderTitle(page)).toHaveText(`${data.team}#${E2E_CHANNELS.scratch}`)
+  })
+})
+
+// Pages that load while the reader scrolls land out of sight: a row the reader was looking at moves
+// exactly as far as the reader scrolled, however many rows arrived. Steps where no page loaded are
+// held to that too when everyStep is set; scrolling up they are not, as rows scrolled into view
+// from above swap their estimated height for their real one (see remeasureTolerancePx). Returns
+// how many times the content grew by more than a page's worth of height.
+const scrollThroughPages = async (
+  page: Page,
+  step: number,
+  everyStep: boolean,
+  done: (g: ThreadGeometry) => boolean
+) => {
+  let g = await waitForScrollStable(page)
+  let pageLoads = 0
+  for (let i = 0; i < 60 && !done(g); i++) {
+    const before = g
+    // the scroller clamps at either end of what has loaded so far
+    const room = step > 0 ? before.distanceFromEnd : before.scrollTop
+    const expected = Math.min(Math.abs(step), room) * Math.sign(step)
+    // a row wholly in view before the step that stays wholly in view after it
+    const anchor = before.rows.find(r =>
+      step > 0
+        ? r.top >= expected + 20 && r.bottom <= before.viewHeight
+        : r.top >= 0 && r.bottom <= before.viewHeight + expected - 20
+    )
+    if (!anchor) throw new Error(`step ${i}: no row in view to anchor on`)
+    await wheelThread(page, step)
+    g = await waitForScrollStable(page)
+    const pageLoaded = Math.abs(g.scrollHeight - before.scrollHeight) > 1000
+    if (pageLoaded) pageLoads++
+    const top = rowTop(g, anchor.ordinal)
+    expect(top, `step ${i}: row ${anchor.ordinal} left the view`).toBeDefined()
+    const moved = anchor.top - (top ?? 0)
+    if (pageLoaded || everyStep) {
+      expect(
+        Math.abs(moved - expected),
+        `step ${i}: row ${anchor.ordinal} moved ${moved}px for a ${expected}px scroll${pageLoaded ? ' as a page loaded' : ''}`
+      ).toBeLessThanOrEqual(anchorTolerancePx)
+    }
+  }
+  expect(done(g), 'reached the end of the scroll').toBe(true)
+  return pageLoads
+}
+
+test.describe('paging', () => {
+  test('scrolling up loads older pages without moving the reader, back to the first message', async ({page}) => {
+    test.setTimeout(120_000)
+    await openFresh(page, E2E_CHANNELS.long)
+    await expectAtEnd(page)
+    const oldest = longMarker(1)
+    const pageLoads = await scrollThroughPages(
+      page,
+      -600,
+      false,
+      g => g.scrollTop === 0 && g.rows.length > 0 && g.rows[0]!.top >= -1
+    )
+    // 400 messages, 100 in the first load and 100 per page after
+    expect(pageLoads).toBeGreaterThanOrEqual(3)
+    await waitForRow(page, oldest)
+  })
+
+  test('scrolling down from an old hit loads newer pages without jumps until the present', async ({page}) => {
+    test.setTimeout(120_000)
+    await openFresh(page, E2E_CHANNELS.long)
+    const {index, token} = LONG_SEARCH_TOKENS.deep
+    const ordinal = await searchAndSelect(page, token, longMarker(index))
+    await expectCentred(page, ordinal)
+    await closeSearch(page)
+    await expect(jumpToRecent(page)).toBeVisible({timeout: 5_000})
+
+    const newestMarker = longMarker(LONG_COUNT)
+    const pageLoads = await scrollThroughPages(
+      page,
+      500,
+      true,
+      g => g.distanceFromEnd <= endTolerancePx && newestRendered(g) > 0 && !!g.rows.length
+        && g.rows.at(-1)!.bottom <= g.viewHeight + 1
+    )
+    expect(pageLoads).toBeGreaterThanOrEqual(3)
+    await waitForRow(page, newestMarker)
+    await expectAtEnd(page)
+    await expect(jumpToRecent(page)).toHaveCount(0, {timeout: 5_000})
+  })
+})
+
+test.describe('back to the bottom', () => {
+  const ways: Array<{how: string; toBottom: (page: Page) => Promise<void>}> = [
+    {
+      how: 'End on the thread',
+      toBottom: async page => {
+        await focusThreadScroller(page)
+        await page.keyboard.press('End')
+      },
+    },
+    {
+      how: 'Page Down in the composer',
+      toBottom: async page => {
+        await composer.focus(page)
+        for (let i = 0; i < 4; i++) {
+          await composer.press(page, 'PageDown')
+        }
+      },
+    },
+    {how: 'the scrollbar', toBottom: async page => dragScrollbar(page, 2_000, {nudge: true})},
+  ]
+  for (const {how, toBottom} of ways) {
+    test(`${how} re-pins it, and a later incoming message keeps the bottom`, async ({page}) => {
+      await requireSender()
+      const atEnd = await openScratchAtEnd(page)
+      await wheelThread(page, -800)
+      const up = await waitForScrollStable(page)
+      expect(up.distanceFromEnd, `after the wheel: ${summary(up)}; before: ${summary(atEnd)}`).toBeGreaterThan(400)
+
+      // every frame from the move to the check, so a miss says whether the list reached the end
+      await startScrollerFrames(page)
+      let frames: Array<Array<number>> | undefined
+      try {
+        await toBottom(page)
+        const g = await waitForScrollStable(page)
+        frames = await stopScrollerFrames(page)
+        expect(
+          g.distanceFromEnd,
+          `distance from the end after ${how}: ${summary(g)}; frames (ms/scrollTop/scrollHeight/clientHeight/distance/newest row/its height): ${frames
+            .slice(-10)
+            .map(f => f.join('/'))
+            .join(' ')}`
+        ).toBeLessThanOrEqual(endTolerancePx)
+      } finally {
+        if (!frames) await stopScrollerFrames(page).catch(() => [])
+      }
+
+      const text = `e2e-scroll-repin-${Date.now()}`
+      await sendIncoming(E2E_CHANNELS.scratch, text)
+      const ordinal = await waitForRow(page, text, 20_000)
+      const g = await expectAtEnd(page)
+      expect(newestRendered(g)).toBe(ordinal)
+    })
+  }
+})
+
+// The list's viewport changes height under a thread at its end: the composer grows and shrinks with
+// what is typed, and the window is resized. The newest message stays at the bottom through both.
+test.describe('the view changing at the bottom', () => {
+  test('the composer growing and shrinking keeps the thread at the bottom', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.long)
+    const newest = await waitForRow(page, longMarker(LONG_COUNT))
+    const before = await expectAtEnd(page)
+    try {
+      await composer.focus(page)
+      for (let i = 0; i < 8; i++) await composer.press(page, 'Shift+Enter')
+      const grown = await waitForScrollStable(page)
+      expect(grown.viewHeight, 'the composer grew into the view').toBeLessThan(before.viewHeight - 50)
+      expect(newestRendered(await expectAtEnd(page))).toBe(newest)
+    } finally {
+      await composer.press(page, 'ControlOrMeta+a')
+      await composer.press(page, 'Backspace')
+    }
+    const shrunk = await waitForScrollStable(page)
+    expect(shrunk.viewHeight).toBe(before.viewHeight)
+    expect(newestRendered(await expectAtEnd(page))).toBe(newest)
+  })
+
+  test('the window getting shorter and taller keeps the thread at the bottom', async ({page}) => {
+    const cdp = await page.context().newCDPSession(page)
+    try {
+      await openFresh(page, E2E_CHANNELS.long)
+      const newest = await waitForRow(page, longMarker(LONG_COUNT))
+      const before = await expectAtEnd(page)
+      let previous = before.viewHeight
+      for (const height of [500, 900]) {
+        await cdp.send('Emulation.setDeviceMetricsOverride', {deviceScaleFactor: 0, height, mobile: false, width: 1000})
+        const g = await waitForScrollStable(page)
+        expect(g.viewHeight, `the view followed the window to ${height}`).not.toBe(previous)
+        previous = g.viewHeight
+        expect(newestRendered(await expectAtEnd(page))).toBe(newest)
+      }
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride').catch(() => {})
+      await cdp.detach().catch(() => {})
+    }
+  })
+})
+
+test.describe('editing', () => {
+  const editBar = (page: Page) => page.getByTestId(T.CHAT_EDIT_CANCEL)
+
+  // an edit left open (a failed assertion) must not carry into the next test
+  test.afterEach(async ({page}) => {
+    if (await editBar(page).count()) {
+      await composer.press(page, 'Escape')
+    }
+    await expect(editBar(page)).toHaveCount(0, {timeout: 5_000})
+    await expect.poll(async () => composer.getText(page), {timeout: 5_000}).toBe('')
+  })
+
+  const expectRowWhollyInView = async (page: Page, ordinal: number) => {
+    const rect = await ordinalRect(page, ordinal)
+    expect(rect, `row ${ordinal} rendered`).toBeDefined()
+    expect(rect!.top, `row ${ordinal} top`).toBeGreaterThanOrEqual(-1)
+    expect(rect!.bottom, `row ${ordinal} bottom against the view's ${rect!.viewHeight}`).toBeLessThanOrEqual(rect!.viewHeight + 1)
+  }
+
+  test('editing a message in view does not scroll the thread', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.scratch)
+    const text = `e2e-scroll-edit-visible-${Date.now()}`
+    const ordinal = await sendMessage(page, text)
+    await expectAtEnd(page)
+
+    await composer.press(page, 'ArrowUp')
+    await expect(editBar(page)).toBeVisible({timeout: 5_000})
+    await expect.poll(async () => composer.getText(page), {timeout: 5_000}).toBe(text)
+    // the composer grows for the edit bar; the list keeps its end and the row stays in view
+    await expectAtEnd(page)
+    await expectRowWhollyInView(page, ordinal)
+  })
+
+  // A reveal from far away animates for longer than a second (about 1.5s here). All of it is the
+  // list's own, so the edit stays held in view: the composer growing under it afterwards, which
+  // would cover the row where the reveal left it, brings it back into view. The window is made
+  // short (an emulated 470px) so the composer's growth reaches a row centred by the reveal.
+  test('a long animated edit reveal keeps holding the row: the composer growing after brings it back into view', async ({page}) => {
+    test.setTimeout(120_000)
+    await requireSender()
+    const cdp = await page.context().newCDPSession(page)
+    try {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {deviceScaleFactor: 0, height: 470, mobile: false, width: 1000})
+      await openFresh(page, E2E_CHANNELS.scratch)
+      const text = `e2e-scroll-edit-long-${Date.now()}`
+      const ordinal = await sendMessage(page, text)
+      // enough rows below it that the reveal centres it rather than resting at the end
+      for (let i = 0; i < 10; i++) {
+        const below = `e2e-scroll-edit-long-below-${Date.now()}-${i}`
+        await sendIncoming(E2E_CHANNELS.scratch, below)
+        await waitForRow(page, below, 20_000)
+      }
+      await focusThreadScroller(page)
+      for (let i = 0; i < 3; i++) {
+        await page.keyboard.press('Home')
+        await waitForScrollStable(page, 15_000)
+      }
+      expect(await ordinalRect(page, ordinal), 'the message is out of view').toBeUndefined()
+
+      // every frame of the reveal: when the scroller moved
+      await startScrollerFrames(page)
+      let frames: Array<Array<number>> | undefined
+      try {
+        await composer.press(page, 'ArrowUp')
+        await expect(editBar(page)).toBeVisible({timeout: 5_000})
+        await expect(rowByOrdinal(page, ordinal)).toHaveCount(1, {timeout: 5_000})
+        await page.waitForTimeout(3_000)
+        frames = await stopScrollerFrames(page)
+      } finally {
+        if (!frames) await stopScrollerFrames(page).catch(() => [])
+      }
+      // frames are [ms, scrollTop, ...]: the times scrollTop changed
+      const moves = frames.flatMap((f, i, all) => (i > 0 && f[1] !== all[i - 1]![1] ? [f[0]!] : []))
+      const revealMs = Math.round((moves.at(-1) ?? 0) - (moves[0] ?? 0))
+      const revealed = await waitForScrollStable(page)
+      await expectRowWhollyInView(page, ordinal)
+      const at = (await ordinalRect(page, ordinal))!
+
+      for (let i = 0; i < 20; i++) await composer.press(page, 'Shift+Enter')
+      const grown = await waitForScrollStable(page)
+      console.log(
+        `long reveal: ${revealMs}ms of movement; row at ${Math.round(at.top)}-${Math.round(at.bottom)} of ${revealed.viewHeight}, the view then ${grown.viewHeight}`
+      )
+      expect(revealMs, 'the reveal was not longer than a second').toBeGreaterThan(1_000)
+      // where the reveal left it, the grown composer covers it
+      expect(at.bottom, 'the composer growth would not have covered the row').toBeGreaterThan(grown.viewHeight + 1)
+      await expectRowWhollyInView(page, ordinal)
+    } finally {
+      await cdp.send('Emulation.clearDeviceMetricsOverride').catch(() => {})
+      await cdp.detach().catch(() => {})
+    }
+  })
+
+  test('editing a message scrolled out of view brings it into view', async ({page}) => {
+    await openFresh(page, E2E_CHANNELS.scratch)
+    const text = `e2e-scroll-edit-offscreen-${Date.now()}`
+    const ordinal = await sendMessage(page, text)
+    await expectAtEnd(page)
+    await wheelThread(page, -1_500)
+    await waitForScrollStable(page)
+    expect(await ordinalRect(page, ordinal), 'the message is out of view').toBeUndefined()
+
+    await composer.press(page, 'ArrowUp')
+    await expect(editBar(page)).toBeVisible({timeout: 5_000})
+    await expect(rowByOrdinal(page, ordinal)).toHaveCount(1, {timeout: 5_000})
+    await waitForScrollStable(page)
+    await expectRowWhollyInView(page, ordinal)
+  })
+})
+
+// Seeing the unread line is catching up: the pill shows only for a line the reader has not had on
+// screen, so it is checked from a fresh open, which lands at the end with the line above the view.
+test('an unread line above the view shows the catch-up pill, which centres the unread line', async ({page}) => {
+  await openFresh(page, E2E_CHANNELS.long)
+  await expectAtEnd(page)
+  await wheelThread(page, -1_500)
+  const up = await waitForScrollStable(page)
+  const target = pickAnchor(up, 100)
+  try {
+    const menu = await messageMenu(page, target.ordinal)
+    await clickUnoccluded(menu.getByText('Mark as unread', {exact: true}))
+    await expect(page.getByTestId(T.FLOATING_MENU)).toHaveCount(0, {timeout: 5_000})
+    // the unread line is in view: no pill
+    await waitForScrollStable(page)
+    await expect(catchUp(page)).toHaveCount(0)
+
+    await openFresh(page, E2E_CHANNELS.long)
+    await expectAtEnd(page)
+    await expect(catchUp(page)).toBeVisible({timeout: 5_000})
+
+    await clickUnoccluded(catchUp(page))
+    await expectCentred(page, target.ordinal)
+    await expect(catchUp(page)).toHaveCount(0, {timeout: 5_000})
+  } finally {
+    // a fresh open marks the thread read again
+    await openFresh(page, E2E_CHANNELS.long)
+  }
+})
+
+test('returning to the chat tab keeps the reader in place', async ({page}) => {
+  await openFresh(page, E2E_CHANNELS.long)
+  await expectAtEnd(page)
+  await wheelThread(page, -700)
+  const before = await waitForScrollStable(page)
+  const anchor = pickAnchor(before, 40)
+
+  await page.getByTestId(T.NAV_TAB_PEOPLE).click({force: true, timeout: 5_000})
+  await expect(page.getByTestId(T.CHAT_MESSAGE_LIST)).toBeHidden({timeout: 5_000})
+  await page.getByTestId(T.NAV_TAB_CHAT).click({force: true, timeout: 5_000})
+  await expect(rowByOrdinal(page, anchor.ordinal)).toBeVisible({timeout: 5_000})
+
+  const after = await waitForScrollStable(page)
+  expect(Math.abs((rowTop(after, anchor.ordinal) ?? Infinity) - anchor.top)).toBeLessThanOrEqual(2)
+})

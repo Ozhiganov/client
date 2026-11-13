@@ -6,6 +6,8 @@ package engine
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 )
@@ -16,15 +18,14 @@ func TestPGPExportOptions(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "login")
 	secui := &libkb.TestSecretUI{Passphrase: u.Passphrase}
-	ctx := &Context{LogUI: tc.G.UI.GetLogUI(), SecretUI: secui}
+	uis := libkb.UIs{LogUI: tc.G.UI.GetLogUI(), SecretUI: secui}
 
-	fp, kid, key := armorKey(t, tc, u.Email)
-	eng, err := NewPGPKeyImportEngineFromBytes([]byte(key), true, tc.G)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	fp, kid, key := genPGPKeyAndArmor(t, tc, u.Email)
+	eng, err := NewPGPKeyImportEngineFromBytes(tc.G, []byte(key), true)
+	require.NoError(t, err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err = RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	table := []exportTest{
@@ -60,19 +61,11 @@ func TestPGPExportOptions(t *testing.T) {
 	}
 
 	for i, test := range table {
-		ec, err := pgpExport(ctx, tc.G, test.secret, test.query, test.exact)
-		if err != nil {
-			t.Errorf("test %d error: %s", i, err)
-		}
-		if ec.either != test.either {
-			t.Errorf("test %d: (either) num keys exported: %d, expected %d", i, ec.either, test.either)
-		}
-		if ec.fingerprint != test.fingerprint {
-			t.Errorf("test %d: (fp) num keys exported: %d, expected %d", i, ec.fingerprint, test.fingerprint)
-		}
-		if ec.kid != test.kid {
-			t.Errorf("test %d: (kid) num keys exported: %d, expected %d", i, ec.kid, test.kid)
-		}
+		ec, err := pgpExport(m, test.secret, test.query, test.exact)
+		require.NoError(t, err, "test %d error: %s", i, err)
+		require.Equal(t, test.either, ec.either, "test %d: (either) num keys exported: %d, expected %d", i, ec.either, test.either)
+		require.Equal(t, test.fingerprint, ec.fingerprint, "test %d: (fp) num keys exported: %d, expected %d", i, ec.fingerprint, test.fingerprint)
+		require.Equal(t, test.kid, ec.kid, "test %d: (kid) num keys exported: %d, expected %d", i, ec.kid, test.kid)
 	}
 }
 
@@ -91,7 +84,7 @@ type exportCounts struct {
 	kid         int
 }
 
-func pgpExport(ctx *Context, g *libkb.GlobalContext, secret bool, query string, exact bool) (exportCounts, error) {
+func pgpExport(m libkb.MetaContext, secret bool, query string, exact bool) (exportCounts, error) {
 	opts := keybase1.PGPQuery{
 		Secret:     secret,
 		Query:      query,
@@ -103,8 +96,9 @@ func pgpExport(ctx *Context, g *libkb.GlobalContext, secret bool, query string, 
 	arg := keybase1.PGPExportArg{
 		Options: opts,
 	}
-	xe := NewPGPKeyExportEngine(arg, g)
-	if err := RunEngine(xe, ctx); err != nil {
+	g := m.G()
+	xe := NewPGPKeyExportEngine(g, arg)
+	if err := RunEngine2(m, xe); err != nil {
 		return xcount, err
 	}
 
@@ -113,8 +107,8 @@ func pgpExport(ctx *Context, g *libkb.GlobalContext, secret bool, query string, 
 	farg := keybase1.PGPExportByFingerprintArg{
 		Options: opts,
 	}
-	xf := NewPGPKeyExportByFingerprintEngine(farg, g)
-	if err := RunEngine(xf, ctx); err != nil {
+	xf := NewPGPKeyExportByFingerprintEngine(g, farg)
+	if err := RunEngine2(m, xf); err != nil {
 		return xcount, err
 	}
 
@@ -123,12 +117,164 @@ func pgpExport(ctx *Context, g *libkb.GlobalContext, secret bool, query string, 
 	karg := keybase1.PGPExportByKIDArg{
 		Options: opts,
 	}
-	xk := NewPGPKeyExportByKIDEngine(karg, g)
-	if err := RunEngine(xk, ctx); err != nil {
+	xk := NewPGPKeyExportByKIDEngine(g, karg)
+	if err := RunEngine2(m, xk); err != nil {
 		return xcount, err
 	}
 
 	xcount.kid = len(xk.Results())
 
 	return xcount, nil
+}
+
+type PGPTestSecretUI struct {
+	libkb.TestSecretUI
+	Prompts []string
+}
+
+func (t *PGPTestSecretUI) GetPassphrase(p keybase1.GUIEntryArg, _ *keybase1.SecretEntryArg) (keybase1.GetPassphraseRes, error) {
+	t.CalledGetPassphrase = true
+	t.Prompts = append(t.Prompts, p.Prompt)
+	return keybase1.GetPassphraseRes{
+		Passphrase:  t.Passphrase,
+		StoreSecret: t.StoreSecret,
+	}, nil
+}
+
+func TestPGPExportEncryption(t *testing.T) {
+	tc := SetupEngineTest(t, "pgpsave")
+	defer tc.Cleanup()
+
+	u := CreateAndSignupFakeUser(tc, "login")
+
+	pgpPassphrase := "hello_pgp" + u.Passphrase
+	secui := &PGPTestSecretUI{}
+	secui.Passphrase = pgpPassphrase
+	uis := libkb.UIs{LogUI: tc.G.UI.GetLogUI(), SecretUI: secui}
+
+	fp, _, key := genPGPKeyAndArmor(t, tc, u.Email)
+	eng, err := NewPGPKeyImportEngineFromBytes(tc.G, []byte(key), true)
+	require.NoError(t, err)
+
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err = RunEngine2(m, eng)
+	require.NoError(t, err)
+
+	opts := keybase1.PGPQuery{
+		Secret:     true,
+		Query:      fp.String(),
+		ExactMatch: true,
+	}
+
+	// Run export with Encrypted: true
+
+	arg := keybase1.PGPExportArg{
+		Options:   opts,
+		Encrypted: true,
+	}
+	xe := NewPGPKeyExportEngine(tc.G, arg)
+	if err := RunEngine2(m, xe); err != nil {
+		require.NoError(t, err)
+	}
+
+	require.Len(t, secui.Prompts, 2, "Expected two prompts in SecretUI (PGP passphrase and confirmation)")
+	secui.Prompts = []string{}
+
+	entity, _, err := libkb.ReadOneKeyFromString(xe.Results()[0].Key)
+	require.NoError(t, err)
+
+	require.NotNil(t, entity.PrivateKey, "Key isn't private key")
+	require.True(t, entity.PrivateKey.Encrypted, "Key is not encrypted")
+
+	for i, subkey := range entity.Subkeys {
+		require.True(t, subkey.PrivateKey.Encrypted, "Subkey %d is not encrypted", i)
+	}
+
+	if err := entity.PrivateKey.Decrypt([]byte(pgpPassphrase)); err != nil {
+		require.NoError(t, err,
+			"Decryption with passphrase failed")
+	}
+
+	// Run export with Encrypted: false
+
+	arg = keybase1.PGPExportArg{
+		Options:   opts,
+		Encrypted: false,
+	}
+	xe = NewPGPKeyExportEngine(tc.G, arg)
+	err = RunEngine2(m, xe)
+	require.NoError(t, err)
+
+	require.Empty(t, secui.Prompts, "Expected no prompts in SecretUI")
+
+	entity, _, err = libkb.ReadOneKeyFromString(xe.Results()[0].Key)
+	require.NoError(t, err)
+
+	require.NotNil(t, entity.PrivateKey, "Key isn't private key")
+	require.False(t, entity.PrivateKey.Encrypted, "Key is encrypted")
+
+	for i, subkey := range entity.Subkeys {
+		require.False(t, subkey.PrivateKey.Encrypted, "Subkey %d is encrypted", i)
+	}
+}
+
+func TestPGPExportMultipleSyncedKeys(t *testing.T) {
+	tc := SetupEngineTest(t, "pgpexport")
+	defer tc.Cleanup()
+
+	u := CreateAndSignupFakeUser(tc, "pgp")
+
+	secui := &PGPTestSecretUI{}
+	uis := libkb.UIs{LogUI: tc.G.UI.GetLogUI(), SecretUI: secui}
+
+	// Generate two keys and import with pushPrivate.
+	fps := make([]libkb.PGPFingerprint, 2)
+	for i := range fps {
+		fp, _, key := genPGPKeyAndArmor(t, tc, u.Email)
+		eng, err := NewPGPKeyImportEngineFromBytes(tc.G, []byte(key), true /* pushPrivate */)
+		require.NoError(t, err)
+
+		m := NewMetaContextForTest(tc).WithUIs(uis)
+		err = RunEngine2(m, eng)
+		require.NoError(t, err)
+
+		fps[i] = fp
+	}
+
+	// Purge PGP keys from local keychain so we are forced to fetch server
+	// synced keys.
+	{
+		eng := NewPGPPurge(tc.G, keybase1.PGPPurgeArg{
+			DoPurge: true,
+		})
+		m := NewMetaContextForTest(tc).WithUIs(uis)
+		err := RunEngine2(m, eng)
+		require.NoError(t, err)
+	}
+
+	t.Logf("Trying to export keys now")
+
+	// Try to export each key.
+	for _, fp := range fps {
+		arg := keybase1.PGPExportArg{
+			Options: keybase1.PGPQuery{
+				Secret:     true,
+				Query:      fp.String(),
+				ExactMatch: true,
+			},
+			Encrypted: false,
+		}
+		eng := NewPGPKeyExportEngine(tc.G, arg)
+		m := NewMetaContextForTest(tc).WithUIs(uis)
+		err := RunEngine2(m, eng)
+		require.NoError(t, err)
+
+		require.Len(t, eng.Results(), 1)
+
+		entity, _, err := libkb.ReadOneKeyFromString(eng.Results()[0].Key)
+		require.NoError(t, err)
+
+		require.NotNil(t, entity.PrivateKey, "Key isn't private key")
+		require.Equal(t, fp, entity.GetFingerprint())
+	}
 }

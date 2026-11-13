@@ -1,0 +1,170 @@
+import * as Kb from '@/common-adapters'
+import {formatTimeForPopup, formatTimeForRevoked} from '@/util/timestamp'
+import type * as T from '@/constants/types'
+import {navToProfile} from '@/constants/router'
+import {humanReadableFileSize} from '@/constants/fs'
+
+const iconNameForDeviceType = isMobile
+  ? (deviceType: string, isRevoked: boolean, isLocation: boolean): Kb.IconType => {
+      switch (deviceType) {
+        case 'mobile':
+          return isRevoked
+            ? 'icon-fancy-revoked-phone-mobile-226-96'
+            : isLocation
+              ? 'icon-fancy-location-phone-mobile-226-96'
+              : 'icon-fancy-encrypted-phone-mobile-226-96'
+        default:
+          return isRevoked
+            ? 'icon-fancy-revoked-computer-mobile-226-96'
+            : 'icon-fancy-encrypted-computer-mobile-226-96'
+      }
+    }
+  : (deviceType: string, isRevoked: boolean, isLocation: boolean): Kb.IconType => {
+      switch (deviceType) {
+        case 'mobile':
+          return isRevoked
+            ? 'icon-fancy-revoked-phone-desktop-150-72'
+            : isLocation
+              ? 'icon-fancy-location-phone-desktop-150-72'
+              : 'icon-fancy-encrypted-phone-desktop-150-72'
+        default:
+          return isRevoked
+            ? 'icon-fancy-revoked-computer-desktop-150-72'
+            : 'icon-fancy-encrypted-computer-desktop-150-72'
+      }
+    }
+
+const headerIconHeight = isMobile ? 96 : 48
+
+type Props = {
+  author: string
+  botUsername?: string
+  deviceName: string
+  deviceRevokedAt?: number
+  deviceType: T.Devices.DeviceType
+  fileSize?: number
+  isLast?: boolean
+  isLocation: boolean
+  timestamp: number
+  yourMessage: boolean
+  onHidden: () => void
+}
+const MessagePopupHeader = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {author, botUsername, deviceName, deviceRevokedAt, deviceType, fileSize} = props
+  const {isLast, isLocation, timestamp, yourMessage, onHidden} = props
+  const prettySize = fileSize ? humanReadableFileSize(fileSize) : ''
+  const iconName = iconNameForDeviceType(deviceType, !!deviceRevokedAt, isLocation)
+  const whoRevoked = yourMessage ? 'You' : author
+
+  const onUsernameClicked = (user: string) => {
+    navToProfile(user)
+    onHidden()
+  }
+
+  return (
+    <Kb.Box2 direction="vertical" alignItems="center" fullWidth={true} style={styles.headerContainer}>
+      {isMobile ? null : <Kb.ImageIcon type={iconName} style={styles.headerIcon} />}
+      {isMobile ? null : (
+        <Kb.Text
+          type="BodySmall"
+          style={{
+            color: deviceRevokedAt ? theme.black_50 : theme.greenDark,
+          }}
+        >
+          ENCRYPTED & SIGNED
+        </Kb.Text>
+      )}
+      <Kb.Box2 direction="horizontal" gap="xtiny" gapStart={true} alignItems="center">
+        <Kb.Avatar username={author} size={16} onClick="profile" />
+        <Kb.ConnectedUsernames
+          onUsernameClicked={onUsernameClicked}
+          colorFollowing={true}
+          colorYou={true}
+          usernames={author}
+          underline={true}
+          type="BodySmallBold"
+        />
+        <Kb.Text type="BodySmallSemibold">{deviceName}</Kb.Text>
+      </Kb.Box2>
+      {botUsername && (
+        <Kb.Box2 direction="horizontal" gap="xtiny" gapStart={true} alignItems="center">
+          <Kb.Text type="BodySmall">also encrypted for</Kb.Text>
+          <Kb.Avatar username={botUsername} size={16} onClick="profile" />
+          <Kb.ConnectedUsernames
+            onUsernameClicked="profile"
+            colorFollowing={true}
+            colorYou={true}
+            usernames={botUsername}
+            underline={true}
+            type="BodySmallBold"
+          />
+        </Kb.Box2>
+      )}
+      <Kb.Text center={true} type="BodySmall">
+        {formatTimeForPopup(timestamp)}
+      </Kb.Text>
+      {prettySize ? (
+        <Kb.Text center={true} type="BodySmall">
+          {prettySize}
+        </Kb.Text>
+      ) : null}
+      {!!deviceRevokedAt && (
+        <Kb.Box2
+          gap="small"
+          fullWidth={true}
+          gapStart={true}
+          direction="vertical"
+          style={Kb.Styles.collapseStyles([isLast && styles.revokedAtContainerLast])}
+        >
+          <Kb.Text center={true} type="BodySmallSemibold" style={styles.popupHeaderText}>
+            {whoRevoked} revoked this device on {formatTimeForRevoked(deviceRevokedAt)}.
+          </Kb.Text>
+        </Kb.Box2>
+      )}
+      <Kb.Divider style={styles.divider} />
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      headerContainer: Kb.Styles.platformStyles({
+        common: {
+          paddingTop: Kb.Styles.globalMargins.tiny,
+        },
+        isElectron: {
+          maxWidth: 240,
+          minWidth: 200,
+        },
+      }),
+      headerIcon: Kb.Styles.platformStyles({
+        common: {
+          height: headerIconHeight,
+          ...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny),
+        },
+        isElectron: {marginTop: 0},
+        isMobile: {marginTop: Kb.Styles.globalMargins.small},
+      }),
+      popupHeaderText: {
+        backgroundColor: theme.blue,
+        color: theme.white,
+        ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.small),
+      },
+      divider: {
+        marginBottom: isMobile ? Kb.Styles.globalMargins.tiny : 0,
+        marginTop: Kb.Styles.globalMargins.tiny,
+        width: '100%',
+      },
+      revokedAtContainerLast: {
+        borderBottomLeftRadius: 3,
+        borderBottomRightRadius: 3,
+        marginBottom: -Kb.Styles.globalMargins.small,
+        overflow: 'hidden',
+      },
+    }) as const
+)
+
+export default MessagePopupHeader

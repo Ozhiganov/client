@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func genTableForTest(t *testing.T) *Table {
@@ -18,7 +20,7 @@ func genTableForTest(t *testing.T) *Table {
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"alice 4h"}},
 		Cell{Alignment: Left, Content: SingleCell{"hello!"}},
 	}); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 	if err := table.Insert(Row{
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"1"}},
@@ -26,7 +28,7 @@ func genTableForTest(t *testing.T) *Table {
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"bob 2h"}},
 		Cell{Alignment: Left, Content: SingleCell{"hello! wejoi fwoi jwe oiew oiwfowfw"}},
 	}); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 	if err := table.Insert(Row{
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"10"}},
@@ -34,7 +36,7 @@ func genTableForTest(t *testing.T) *Table {
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"charlie 4h"}},
 		Cell{Alignment: Left, Content: SingleCell{"hello! this is super long hahahaha blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah blah"}},
 	}); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 	if err := table.Insert(Row{
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"11"}},
@@ -42,13 +44,13 @@ func genTableForTest(t *testing.T) *Table {
 		Cell{Frame: [2]string{"[", "]"}, Alignment: Right, Content: SingleCell{"charliecharliecharlie 2h"}},
 		Cell{Alignment: Left, Content: SingleCell{"hello! hello!"}},
 	}); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 	return table
 }
 
 func readable(in string) string {
-	return strings.Replace(strings.Replace(in, "\n", "⏎\n", -1), " ", "␣", -1)
+	return strings.ReplaceAll(strings.ReplaceAll(in, "\n", "⏎\n"), " ", "␣")
 }
 
 func TestTable(t *testing.T) {
@@ -62,13 +64,9 @@ func TestTable(t *testing.T) {
 	out := &bytes.Buffer{}
 	fmt.Fprintln(out)
 	err := table.Render(out, " ", 80, []ColumnConstraint{10, 12, 12, Expandable})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.String() != expected {
-		t.Fatalf("wrong rendering result.\nGot:\n%s\nExpected:\n%s",
-			readable(out.String()), readable(expected))
-	}
+	require.NoError(t, err)
+	require.Equal(t, expected, out.String(), "wrong rendering result.\nGot:\n%s\nExpected:\n%s",
+		readable(out.String()), readable(expected))
 }
 
 func TestTableWrap(t *testing.T) {
@@ -84,13 +82,43 @@ func TestTableWrap(t *testing.T) {
 	out := &bytes.Buffer{}
 	fmt.Fprintln(out)
 	err := table.Render(out, " ", 80, []ColumnConstraint{10, 12, 12, ExpandableWrappable})
+	require.NoError(t, err)
+	require.Equal(t, expected, out.String(), "wrong rendering result.\nGot:\n%s\nExpected:\n%s",
+		readable(out.String()),
+		readable(expected))
+}
+
+func TestTableTooNarrowReturnsError(t *testing.T) {
+	table := &Table{}
+	if err := table.Insert(Row{
+		Cell{Content: SingleCell{Item: "fixed"}},
+		Cell{Content: SingleCell{Item: "wrappable"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := table.Render(&bytes.Buffer{}, " ", 0, []ColumnConstraint{5, ExpandableWrappable})
+	if _, ok := err.(WidthTooSmallError); !ok {
+		t.Fatalf("expected WidthTooSmallError, got %v", err)
+	}
+}
+
+func TestTableFixedColumnsCanFitExactly(t *testing.T) {
+	table := &Table{}
+	if err := table.Insert(Row{
+		Cell{Content: SingleCell{Item: "a"}},
+		Cell{Content: SingleCell{Item: "b"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err := table.Render(&out, " ", 3, []ColumnConstraint{1, 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != expected {
-		t.Fatalf("wrong rendering result.\nGot:\n%s\nExpected:\n%s",
-			readable(out.String()),
-			readable(expected))
+	if got, want := out.String(), "a b\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
@@ -111,12 +139,8 @@ func TestTableMultiline(t *testing.T) {
 	out := &bytes.Buffer{}
 	fmt.Fprintln(out)
 	err := table.Render(out, " ", 80, []ColumnConstraint{10, 12, 12, ExpandableWrappable})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.String() != expected {
-		t.Fatalf("wrong rendering result.\nGot:\n%s\nExpected:\n%s",
-			readable(out.String()),
-			readable(expected))
-	}
+	require.NoError(t, err)
+	require.Equal(t, expected, out.String(), "wrong rendering result.\nGot:\n%s\nExpected:\n%s",
+		readable(out.String()),
+		readable(expected))
 }

@@ -1,0 +1,104 @@
+import type * as T from '@/constants/types'
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {useChatTeam} from '../team-hooks'
+import {useThreadMeta} from '../thread-context'
+import {useConversationShowInfoPanel} from '../thread-navigation'
+
+// Parses retention policies into a string suitable for display at the top of a conversation
+function makeRetentionNotice(
+  policy: T.Retention.RetentionPolicy,
+  teamPolicy: T.Retention.RetentionPolicy,
+  teamType: 'adhoc' | 'big' | 'small'
+): string | undefined {
+  if (policy.type === 'retain' || (policy.type === 'inherit' && teamPolicy.type === 'retain')) {
+    // Messages stick around forever; no explanation needed
+    return
+  }
+
+  let convType = 'chat'
+  if (teamType === 'big') {
+    convType = 'channel'
+  }
+  let explanation = ''
+  switch (policy.type) {
+    case 'expire': {
+      explanation = `will auto-delete after ${policy.title}.`
+      break
+    }
+    case 'inherit': {
+      explanation = `${teamPolicy.type === 'explode' ? 'will explode' : 'will auto-delete'} after ${
+        teamPolicy.title
+      }`
+      explanation += teamType === 'small' ? '.' : ', the team default.'
+      break
+    }
+    case 'explode': {
+      explanation = `will explode after ${policy.title}.`
+      break
+    }
+  }
+  return `Messages in this ${convType} ${explanation}`
+}
+
+function RetentionNoticeContainer() {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const meta = useThreadMeta(
+    C.useShallow(m => ({
+      retentionPolicy: m.retentionPolicy,
+      teamID: m.teamID,
+      teamRetentionPolicy: m.teamRetentionPolicy,
+      teamType: m.teamType,
+      teamname: m.teamname,
+    }))
+  )
+  const {teamType, retentionPolicy: policy, teamRetentionPolicy: teamPolicy} = meta
+  const {yourOperations} = useChatTeam(meta.teamID, meta.teamname)
+  const canChange = meta.teamType !== 'adhoc' ? yourOperations.setRetentionPolicy : true
+  const showInfoPanel = useConversationShowInfoPanel()
+  const onChange = () => showInfoPanel(true, 'settings')
+  const explanation = makeRetentionNotice(policy, teamPolicy, teamType) ?? undefined
+
+  const iconType =
+    policy.type === 'explode' || (policy.type === 'inherit' && teamPolicy.type === 'explode')
+      ? 'iconfont-bomb-solid'
+      : 'iconfont-timer-solid'
+
+  return (
+    <Kb.Box2 direction="vertical" alignItems="center" fullWidth={true} style={styles.container}>
+      <Kb.Box2 direction="vertical" style={styles.iconBox}>
+        <Kb.Icon color={theme.black_20} fontSize={20} type={iconType} />
+      </Kb.Box2>
+      {!!explanation && (
+        <Kb.Text center={true} type="BodySmallSemibold">
+          {explanation}
+        </Kb.Text>
+      )}
+      {canChange && (
+        <Kb.Text
+          type="BodySmallSemiboldPrimaryLink"
+          style={{color: theme.blueDark}}
+          onClick={onChange}
+        >
+          Change this
+        </Kb.Text>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: {
+        backgroundColor: theme.blueLighter3,
+        ...Kb.Styles.padding(
+          Kb.Styles.globalMargins.small,
+          Kb.Styles.globalMargins.medium
+        ),
+      },
+      iconBox: {marginBottom: Kb.Styles.globalMargins.xtiny},
+    }) as const
+)
+export default RetentionNoticeContainer

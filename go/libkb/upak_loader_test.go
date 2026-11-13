@@ -6,6 +6,7 @@
 package libkb
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -16,57 +17,55 @@ import (
 
 func TestCachedUserLoad(t *testing.T) {
 	tc := SetupTest(t, "GetUPAKLoader()", 1)
+	defer tc.Cleanup()
+
 	fakeClock := clockwork.NewFakeClock()
 	tc.G.SetClock(fakeClock)
 
 	// Load t_alice a few different ways
-	arg := LoadUserArg{
-		UID: keybase1.UID("295a7eea607af32040647123732bc819"),
-	}
+	arg := NewLoadUserArg(tc.G).WithUID(keybase1.UID("295a7eea607af32040647123732bc819"))
 	var info CachedUserLoadInfo
-	upk, user, err := tc.G.GetUPAKLoader().loadWithInfo(arg, &info)
+	_, _, err := tc.G.GetUPAKLoader().(*CachedUPAKLoader).loadWithInfo(arg, &info, nil, true)
+	require.NoError(t, err)
 
-	checkLoad := func(upk *keybase1.UserPlusAllKeys, err error) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if upk == nil {
-			t.Fatal("expected a UPK back")
-		}
-		if upk.GetName() != "t_alice" {
-			t.Fatalf("expected %s but got %s", "t_alice", upk.GetName())
-		}
+	checkLoad := func(upk *keybase1.UserPlusKeysV2AllIncarnations, err error) {
+		require.NoError(t, err)
+		require.NotNil(t, upk,
+			"expected a UPK back")
+		require.Equal(t, "t_alice", upk.Current.Username, "expected %s but got %s", "t_alice", upk.Current.Username)
 	}
-	if info.InCache || info.TimedOut || info.StaleVersion || info.LoadedLeaf || !info.LoadedUser {
-		t.Fatalf("wrong info: %+v", info)
-	}
+	require.False(t, info.InCache || info.TimedOut || info.StaleVersion || info.LoadedLeaf || !info.LoadedUser,
+		"wrong info: %+v", info)
 
 	fakeClock.Advance(CachedUserTimeout / 100)
 	info = CachedUserLoadInfo{}
-	upk, user, err = tc.G.GetUPAKLoader().loadWithInfo(arg, &info)
+	upk, user, err := tc.G.GetUPAKLoader().(*CachedUPAKLoader).loadWithInfo(arg, &info, nil, true)
 	checkLoad(upk, err)
-	if user != nil {
-		t.Fatal("expected no full user load")
-	}
+	require.Nil(t, user,
+		"expected no full user load")
 
-	if !info.InCache || info.TimedOut || info.StaleVersion || info.LoadedLeaf || info.LoadedUser {
-		t.Fatalf("wrong info: %+v", info)
-	}
+	require.False(t, !info.InCache || info.TimedOut || info.StaleVersion || info.LoadedLeaf || info.LoadedUser,
+		"wrong info: %+v", info)
 
 	fakeClock.Advance(2 * CachedUserTimeout)
 	info = CachedUserLoadInfo{}
-	upk, user, err = tc.G.GetUPAKLoader().loadWithInfo(arg, &info)
+	upk, user, err = tc.G.GetUPAKLoader().(*CachedUPAKLoader).loadWithInfo(arg, &info, nil, true)
 	checkLoad(upk, err)
-	if user != nil {
-		t.Fatal("expected no full user load")
-	}
-	if !info.InCache || !info.TimedOut || info.StaleVersion || !info.LoadedLeaf || info.LoadedUser {
-		t.Fatalf("wrong info: %+v", info)
-	}
+	require.Nil(t, user,
+		"expected no full user load")
+	require.False(t, !info.InCache || !info.TimedOut || info.StaleVersion || !info.LoadedLeaf || info.LoadedUser,
+		"wrong info: %+v", info)
+
+	require.True(t, IsUserByUsernameOffline(NewMetaContextForTest(tc), "t_alice"))
+	require.False(t, IsUserByUsernameOffline(NewMetaContextForTest(tc), "t_alice_xxx"))
+	// This hardcoded user was put into the TestUIDMapper, so it should return a result
+	require.True(t, IsUserByUsernameOffline(NewMetaContextForTest(tc), "max"))
 }
 
 func TestCheckKIDForUID(t *testing.T) {
 	tc := SetupTest(t, "CheckKIDForUID", 1)
+	defer tc.Cleanup()
+
 	fakeClock := clockwork.NewFakeClock()
 	tc.G.SetClock(fakeClock)
 
@@ -80,39 +79,35 @@ func TestCheckKIDForUID(t *testing.T) {
 	rebeccaUID := keybase1.UID("99337e411d1004050e9e7ee2cf1a6219")
 	rebeccaKIDRevoked := keybase1.KID("0120e177772304cd9ec833ceb88eeb6e32a667151d9e4fb09df433a846d05e6c40350a")
 
-	found, revokedAt, deleted, err := tc.G.GetUPAKLoader().CheckKIDForUID(nil, georgeUID, georgeKIDSibkey)
-	if !found || (revokedAt != nil) || deleted || (err != nil) {
-		t.Fatalf("bad CheckKIDForUID response")
-	}
-	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(nil, georgeUID, georgeKIDSubkey)
-	if !found || (revokedAt != nil) || deleted || (err != nil) {
-		t.Fatalf("bad CheckKIDForUID response")
-	}
-	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(nil, georgeUID, kbKIDSibkey)
-	if found || (revokedAt != nil) || deleted || (err != nil) {
-		t.Fatalf("bad CheckKIDForUID response")
-	}
+	found, revokedAt, deleted, err := tc.G.GetUPAKLoader().CheckKIDForUID(context.Background(), georgeUID, georgeKIDSibkey)
+	require.False(t, !found || (revokedAt != nil) || deleted || (err != nil),
+		"bad CheckKIDForUID response")
+	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(context.Background(), georgeUID, georgeKIDSubkey)
+	require.False(t, !found || (revokedAt != nil) || deleted || (err != nil),
+		"bad CheckKIDForUID response")
+	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(context.Background(), georgeUID, kbKIDSibkey)
+	require.False(t, found || (revokedAt != nil) || deleted || (err != nil),
+		"bad CheckKIDForUID response")
 
-	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(nil, rebeccaUID, rebeccaKIDRevoked)
-	if !found || (revokedAt == nil) || deleted || (err != nil) {
-		t.Fatalf("bad CheckKIDForUID response")
-	}
+	found, revokedAt, deleted, err = tc.G.GetUPAKLoader().CheckKIDForUID(context.Background(), rebeccaUID, rebeccaKIDRevoked)
+	require.False(t, !found || (revokedAt == nil) || deleted || (err != nil),
+		"bad CheckKIDForUID response")
 }
 
 func TestCacheFallbacks(t *testing.T) {
 	tc := SetupTest(t, "LookupUsernameAndDevice", 1)
 	defer tc.Cleanup()
+
 	fakeClock := clockwork.NewFakeClock()
 	tc.G.SetClock(fakeClock)
 
 	test := func() *CachedUserLoadInfo {
 		var ret CachedUserLoadInfo
 		uid := keybase1.UID("eb72f49f2dde6429e5d78003dae0c919")
-		var arg LoadUserArg
-		arg.UID = uid
-		upk, _, err := tc.G.GetUPAKLoader().loadWithInfo(arg, &ret)
+		arg := NewLoadUserArg(tc.G).WithUID(uid)
+		upk, _, err := tc.G.GetUPAKLoader().(*CachedUPAKLoader).loadWithInfo(arg, &ret, nil, false)
 		require.NoError(t, err)
-		require.Equal(t, upk.Base.Username, "t_tracy", "tracy was right")
+		require.Equal(t, "t_tracy", upk.Current.Username, "tracy was right")
 		return &ret
 	}
 	i := test()
@@ -142,14 +137,39 @@ func TestLookupUsernameAndDevice(t *testing.T) {
 	test := func() {
 		uid := keybase1.UID("eb72f49f2dde6429e5d78003dae0c919")
 		did := keybase1.DeviceID("e5f7f7ca6b6277de4d2c45f57b767f18")
-		un, name, typ, err := tc.G.GetUPAKLoader().LookupUsernameAndDevice(nil, uid, did)
+		un, name, typ, err := tc.G.GetUPAKLoader().LookupUsernameAndDevice(context.Background(), uid, did)
 		require.NoError(t, err)
-		require.Equal(t, un.String(), "t_tracy", "tracy was right")
-		require.Equal(t, name, "work", "right device name")
-		require.Equal(t, typ, "desktop", "right type")
+		require.Equal(t, "t_tracy", un.String(), "tracy was right")
+		require.Equal(t, "work", name, "right device name")
+		require.Equal(t, keybase1.DeviceTypeV2_DESKTOP, typ, "right type")
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
+		test()
+		test()
+		fakeClock.Advance(10 * time.Hour)
+		test()
+		test()
+		tc.G.GetUPAKLoader().ClearMemory()
+	}
+}
+
+func TestLookupUID(t *testing.T) {
+	tc := SetupTest(t, "LookupUsernameAndDevice", 1)
+	defer tc.Cleanup()
+
+	fakeClock := clockwork.NewFakeClock()
+	tc.G.SetClock(fakeClock)
+
+	test := func() {
+		uid := keybase1.UID("eb72f49f2dde6429e5d78003dae0c919")
+		un := NewNormalizedUsername("t_tracy")
+		uid2, err := tc.G.GetUPAKLoader().LookupUID(context.Background(), un)
+		require.NoError(t, err)
+		require.Equal(t, uid, uid2)
+	}
+
+	for range 2 {
 		test()
 		test()
 		fakeClock.Advance(10 * time.Hour)
@@ -162,11 +182,31 @@ func TestLookupUsernameAndDevice(t *testing.T) {
 func TestLookupUsername(t *testing.T) {
 	tc := SetupTest(t, "LookupUsernameAndDevice", 1)
 	defer tc.Cleanup()
+
 	uid := keybase1.UID("eb72f49f2dde6429e5d78003dae0c919")
-	un, err := tc.G.GetUPAKLoader().LookupUsername(nil, uid)
+	un, err := tc.G.GetUPAKLoader().LookupUsername(context.Background(), uid)
 	require.NoError(t, err)
 	require.Equal(t, un, NewNormalizedUsername("t_tracy"), "tracy came back")
 	badUID := keybase1.UID("eb72f49f2dde6429e5d78003dae0b919")
-	_, err = tc.G.GetUPAKLoader().LookupUsername(nil, badUID)
+	_, err = tc.G.GetUPAKLoader().LookupUsername(context.Background(), badUID)
 	require.Error(t, err)
+}
+
+func TestLoadUPAK2(t *testing.T) {
+	tc := SetupTest(t, "LookupUsernameAndDevice", 1)
+	defer tc.Cleanup()
+
+	load := func() {
+		uid := keybase1.UID("eb72f49f2dde6429e5d78003dae0c919")
+		upak, _, err := tc.G.GetUPAKLoader().LoadV2(NewLoadUserByUIDArg(context.TODO(), tc.G, uid))
+		require.NoError(t, err)
+		key, ok := upak.Current.DeviceKeys[keybase1.KID("01204fbb0a8ee105c2732155bffd927a6f612b6a36c63c484e6290f6a7ac560a1a780a")]
+		require.True(t, ok)
+		require.Equal(t, key.Base.Provisioning.SigChainLocation.Seqno, keybase1.Seqno(3))
+		require.Equal(t, keybase1.SeqType_PUBLIC, key.Base.Provisioning.SigChainLocation.SeqType)
+		require.Nil(t, key.Base.Revocation)
+	}
+
+	load()
+	load()
 }

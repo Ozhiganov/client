@@ -1,0 +1,652 @@
+// links all the stores together, stores never import this
+import * as Chat from '@/constants/chat'
+import {ignorePromise, neverThrowPromiseFunc} from '@/constants/utils'
+import {useConfigState} from '@/stores/config'
+import {FatalHandshakeError, useDaemonState} from '@/stores/daemon'
+import {useRouterState} from '@/stores/router'
+import {useShellState} from '@/stores/shell'
+import {useSettingsContactsState} from '@/stores/settings-contacts'
+import * as T from '@/constants/types'
+import type * as EngineGen from '@/constants/rpc'
+import type * as Tabs from '@/constants/tabs'
+import {NotifyPopup} from '@/util/misc'
+import logger from '@/logger'
+import {getEngine} from '@/engine'
+import {registerIncomingAnswerer} from '@/engine/incoming-answerers'
+import {afterKbfsDaemonRpcStatusChanged} from '@/fs/common/lifecycle'
+import {setThreadInputCommandStatus} from '@/constants/router'
+import {initSharedSubscriptions, _onEngineIncoming} from './shared'
+import {noConversationIDKey} from '../types/chat/common'
+import {dumpLogs, persistRoute} from '@/util/storeless-actions'
+
+// ─── Platform-specific init helpers (resolved per platform: platform.desktop /
+// platform.native — native keeps require() for Metro importAll ordering) ─────
+import {
+  getDesktop as _getDesktop,
+  getNative as _getNative,
+  getNativeSync as _getNativeSync,
+  initPushListener,
+  maybePauseVideos,
+  setupWindowEventListeners,
+} from './platform'
+import type {ExpoLocationObject, ExpoTaskManagerModule} from './platform-types'
+import {shouldRecordFix, type Fix, type FixThrottle} from './location-throttle'
+import {openAtLoginKey} from '@/stores/shell'
+import * as ScreenCapture from 'expo-screen-capture'
+import {purgeStaleSharedTextFiles} from '@/util/shared-text-file'
+
+const _getOpenAtLoginKey = () => openAtLoginKey
+
+// ─── Location tracking (native only) ─────────────────────────────────────────
+
+const locationTaskName = 'background-location-task'
+let locationRefs = 0
+let madeBackgroundTask = false
+
+const ensureBackgroundTask = (ExpoTaskManager: ExpoTaskManagerModule) => {
+  if (madeBackgroundTask) return
+  madeBackgroundTask = true
+
+  ExpoTaskManager.defineTask(locationTaskName, async ({data, error}: {data: unknown; error: unknown}) => {
+    if (error) return Promise.resolve()
+    if (!data) return Promise.resolve()
+    const d = data as {locations?: Array<ExpoLocationObject>}
+    const locations = d.locations
+    if (!locations?.length) return Promise.resolve()
+    const pos = locations.at(-1)
+    const coord = {
+      accuracy: Math.floor(pos?.coords.accuracy ?? 0),
+      lat: pos?.coords.latitude ?? 0,
+      lon: pos?.coords.longitude ?? 0,
+    }
+    try {
+      await T.RPCChat.localLocationUpdateRpcPromise({coord})
+    } catch (error) {
+      logger.info('background location update failed: ' + String(error))
+    }
+    return Promise.resolve()
+  })
+}
+
+// Builds from before native iOS location left this expo task registered, and expo restores it
+// into a second CLLocationManager on every launch. JS is early enough to remove it: with no
+// UMAppLoader registered, expo can never start JS for a restored task on a background launch
+// (expo-task-manager EXTaskService.m `_loadAppWithId:appUrl:`).
+export const unregisterLegacyIOSLocationTask = async () => {
+  if (!isIOS) return
+  const {ExpoTaskManager} = _getNative()
+  try {
+    if (await ExpoTaskManager.isTaskRegisteredAsync(locationTaskName)) {
+      await ExpoTaskManager.unregisterTaskAsync(locationTaskName)
+      logger.info('[location] removed the legacy iOS background location task')
+    }
+  } catch (error) {
+    logger.info('[location] failed to remove the legacy iOS background location task: ' + String(error))
+  }
+}
+
+// iOS: the native watcher sends every fix past its 65 m distance filter; the throttle picks the
+// ones worth recording.
+let removeFixListener: (() => void) | undefined
+let fixThrottle: FixThrottle = {}
+
+const onLocationFix = (fix: Fix) => {
+  const {record, throttle} = shouldRecordFix(useShellState.getState().mobileAppState, fixThrottle, fix)
+  fixThrottle = throttle
+  if (!record) return
+  const coord = {accuracy: Math.floor(fix.accuracy), lat: fix.lat, lon: fix.lon}
+  T.RPCChat.localLocationUpdateRpcPromise({coord}).catch((error: unknown) => {
+    logger.info('location update failed: ' + String(error))
+  })
+}
+
+const startIOSLocationWatch = () => {
+  const {addLocationFixListener, startLocationWatch} = _getNative()
+  startLocationWatch()
+  fixThrottle = {}
+  removeFixListener?.()
+  removeFixListener = addLocationFixListener(onLocationFix)
+}
+
+// Significant-change monitoring outlives the process and keeps relaunching the app, and the service
+// drops an expired share without clearing its watch, so each launch stops whatever a previous
+// process left running. Runs before the engine delivers any chatWatchPosition, and native applies
+// start/stop in call order, so a share the service restores still starts it again.
+export const initIOSLocation = () => {
+  if (!isIOS) return
+  try {
+    _getNative().stopLocationWatch()
+  } catch (error) {
+    logger.info('[location] failed to stop a leftover location watch: ' + String(error))
+  }
+  ignorePromise(unregisterLegacyIOSLocationTask())
+}
+
+const stopIOSLocationWatch = () => {
+  const {stopLocationWatch} = _getNative()
+  stopLocationWatch()
+  removeFixListener?.()
+  removeFixListener = undefined
+}
+
+const setPermissionDeniedCommandStatus = (conversationIDKey: T.Chat.ConversationIDKey, text: string) => {
+  setThreadInputCommandStatus(conversationIDKey, {
+    actions: [T.RPCChat.UICommandStatusActionTyp.appsettings],
+    displayText: text,
+    displayType: T.RPCChat.UICommandStatusDisplayTyp.error,
+  })
+}
+
+const onChatWatchPosition = async (
+  action: EngineGen.EngineAction<'chat.1.chatUi.chatWatchPosition'>
+) => {
+  const {ExpoLocation, ExpoTaskManager, requestLocationPermission} = _getNative()
+  try {
+    await requestLocationPermission(action.payload.params.perm)
+  } catch (_error) {
+    const error = _error as {message?: string}
+    const message = String(error.message)
+    logger.info('failed to get location perms: ' + message)
+    setPermissionDeniedCommandStatus(
+      T.Chat.conversationIDToKey(action.payload.params.convID),
+      `Failed to access location. ${message}`
+    )
+  }
+
+  locationRefs++
+
+  if (locationRefs === 1) {
+    try {
+      logger.info('[location] location watch start due to ', T.Chat.conversationIDToKey(action.payload.params.convID))
+      if (isIOS) {
+        startIOSLocationWatch()
+      } else {
+        ensureBackgroundTask(ExpoTaskManager)
+        await ExpoLocation.startLocationUpdatesAsync(locationTaskName, {
+          deferredUpdatesDistance: 65,
+          pausesUpdatesAutomatically: true,
+          showsBackgroundLocationIndicator: true,
+        })
+      }
+      logger.info('[location] start success')
+    } catch {
+      logger.info('[location] start failed')
+      locationRefs--
+    }
+  }
+}
+
+const onChatClearWatch = async () => {
+  const {ExpoLocation, ExpoTaskManager} = _getNative()
+  locationRefs = Math.max(0, locationRefs - 1)
+  if (locationRefs === 0) {
+    try {
+      logger.info('[location] end start')
+      if (isIOS) {
+        stopIOSLocationWatch()
+      } else {
+        ensureBackgroundTask(ExpoTaskManager)
+        await ExpoLocation.stopLocationUpdatesAsync(locationTaskName)
+      }
+      logger.info('[location] end success')
+    } catch {
+      logger.info('[location] end failed')
+    }
+  }
+}
+
+// ─── Startup details (native only) ───────────────────────────────────────────
+
+const loadStartupDetails = async () => {
+  logger.info('[Startup] loadStartupDetails: starting')
+  const {guiConfig, Linking} = _getNative()
+
+  let routeState = ''
+  try {
+    const config = JSON.parse(guiConfig) as {ui?: {routeState2?: string}} | undefined
+    routeState = config?.ui?.routeState2 ?? ''
+  } catch {}
+
+  // A tapped push doesn't pass through here: constants/init/shared takes it from native and
+  // queues it as a navigation intent.
+  const initialUrl = await neverThrowPromiseFunc(async () => {
+    const linkingStart = Date.now()
+    logger.info('[Startup] loadStartupDetails: calling Linking.getInitialURL')
+    const url = (await Linking.getInitialURL()) ?? null
+    const elapsed = Date.now() - linkingStart
+    if (url === null) {
+      logger.warn(`[Startup] loadStartupDetails: Linking.getInitialURL returned null in ${elapsed}ms`)
+    } else {
+      logger.info(`[Startup] loadStartupDetails: Linking.getInitialURL returned in ${elapsed}ms: ${url}`)
+    }
+    return url
+  })
+
+  let conversation: T.Chat.ConversationIDKey | undefined
+  let conversationUid = ''
+  let tab = ''
+
+  if (!initialUrl && routeState) {
+    // Last priority, saved from last session. The linking config reads the launch URL
+    // itself; this read only decides whether the saved route may be restored, since a
+    // launch URL outranks it.
+    try {
+      const item = JSON.parse(routeState) as
+        | undefined
+        | {param?: {selectedConversationIDKey?: unknown}; routeName?: string; uid?: unknown}
+      if (item) {
+        const _convo = item.param?.selectedConversationIDKey || undefined
+        if (typeof _convo === 'string') {
+          conversation = _convo
+          if (typeof item.uid === 'string') {
+            conversationUid = item.uid
+          }
+          logger.info('initialState: routeState', conversation)
+        }
+        const _rn = item.routeName || undefined
+        if (typeof _rn === 'string') {
+          tab = _rn as unknown as typeof tab
+        }
+      }
+    } catch {
+      logger.info('initialState: routeState parseFail')
+      conversation = undefined
+      tab = ''
+    }
+  }
+
+  // never allow this case
+  if (tab === 'blank') tab = ''
+
+  useConfigState.getState().dispatch.setStartupDetails({
+    conversation: conversation ?? noConversationIDKey,
+    conversationUid,
+    tab: tab as Tabs.Tab,
+  })
+
+  // Clear last value to be extra safe bad things don't hose us forever (don't block startup)
+  ignorePromise(
+    T.RPCGen.configGuiSetValueRpcPromise({
+      path: 'ui.routeState2',
+      value: {isNull: false, s: ''},
+    }).catch(() => {})
+  )
+}
+
+// ─── onEngineIncoming ─────────────────────────────────────────────────────────
+
+export const onEngineIncoming = (action: EngineGen.Actions) => {
+  _onEngineIncoming(action)
+
+  if (isMobile) {
+    switch (action.type) {
+      case 'chat.1.chatUi.triggerContactSync':
+        useSettingsContactsState.getState().dispatch.manageContactsCache()
+        break
+      case 'keybase.1.logUi.log': {
+        const {params} = action.payload
+        const {level, text} = params
+        logger.info('keybase.1.logUi.log:', params.text.data)
+        if (level >= T.RPCGen.LogLevel.error) {
+          NotifyPopup(text.data)
+        }
+        break
+      }
+      case 'chat.1.chatUi.chatWatchPosition':
+        ignorePromise(onChatWatchPosition(action))
+        break
+      case 'chat.1.chatUi.chatClearWatch':
+        ignorePromise(onChatClearWatch())
+        break
+      default:
+    }
+  } else {
+    const {isWindows, kbfsNotification} = _getDesktop()
+    switch (action.type) {
+      case 'keybase.1.NotifyApp.exit':
+        console.log('App exit requested')
+        _getDesktop().KB2.functions.exitApp?.(0)
+        break
+      case 'keybase.1.NotifyFS.FSActivity':
+        kbfsNotification(action.payload.params.notification, (title, opts, onClick) => { NotifyPopup(title, opts, -1, undefined, onClick) })
+        break
+      case 'keybase.1.NotifyPGP.pgpKeyInSecretStoreFile': {
+        const f = async () => {
+          try {
+            await T.RPCGen.pgpPgpStorageDismissRpcPromise()
+          } catch (err) {
+            console.warn('Error in sending pgpPgpStorageDismissRpc:', err)
+          }
+        }
+        ignorePromise(f())
+        break
+      }
+      case 'keybase.1.NotifyService.shutdown': {
+        const {code} = action.payload.params
+        if (isWindows && code !== (T.RPCGen.ExitCode.restart as number)) {
+          console.log('Quitting due to service shutdown with code: ', code)
+          // Quit just the app, not the service
+          _getDesktop().KB2.functions.quitApp?.()
+        }
+        break
+      }
+      case 'keybase.1.logUi.log': {
+        const {params} = action.payload
+        const {level, text} = params
+        logger.info('keybase.1.logUi.log:', params.text.data)
+        if (level >= T.RPCGen.LogLevel.error) {
+          NotifyPopup(text.data)
+        }
+        break
+      }
+      case 'keybase.1.NotifySession.clientOutOfDate': {
+        const {upgradeTo, upgradeURI, upgradeMsg} = action.payload.params
+        const body = upgradeMsg || `Please update to ${upgradeTo} by going to ${upgradeURI}`
+        NotifyPopup('Client out of date!', {body}, 60 * 60)
+        // This is from the API server. Consider notifications from server always critical.
+        useConfigState
+          .getState()
+          .dispatch.setOutOfDate({critical: true, message: upgradeMsg, outOfDate: true, updating: false})
+        break
+      }
+      default:
+    }
+  }
+}
+
+// Calls the service makes outside any session that this platform answers itself
+export const registerPlatformAnswerers = (): Array<() => void> =>
+  isMobile
+    ? // The watch itself starts from the chatWatchPosition action
+      [registerIncomingAnswerer('chat.1.chatUi.chatWatchPosition', (_, response) => response.result(0))]
+    : [
+        registerIncomingAnswerer('keybase.1.logsend.prepareLogsend', (_, response) => {
+          const f = async () => {
+            try {
+              await dumpLogs()
+            } finally {
+              response.result()
+            }
+          }
+          ignorePromise(f())
+        }),
+        // Desktop has no location watch, so it answers watch id 0 as before
+        registerIncomingAnswerer('chat.1.chatUi.chatWatchPosition', (_, response) => response.result(0)),
+      ]
+
+// ─── initPlatformListener ─────────────────────────────────────────────────────
+
+const _platformUnsubs: Array<() => void> = __DEV__
+  ? (globalThis.__hmr_platformUnsubs ??= [])
+  : []
+
+let _oneTimeInitDone: boolean = __DEV__
+  ? (globalThis.__hmr_oneTimeInitDone ?? false)
+  : false
+
+export const initPlatformListener = () => {
+  if (isMobile) {
+    _initNativePlatformListener()
+  } else {
+    _initDesktopPlatformListener()
+  }
+}
+
+const _initNativePlatformListener = () => {
+  // HMR cleanup: unsubscribe old subscriptions before re-subscribing
+  for (const unsub of _platformUnsubs) unsub()
+  _platformUnsubs.length = 0
+  _platformUnsubs.push(...registerPlatformAnswerers())
+
+  _platformUnsubs.push(useShellState.subscribe((s, old) => {
+    if (s.mobileAppState === old.mobileAppState) return
+    let appFocused: boolean
+    switch (s.mobileAppState) {
+      case 'active':
+        appFocused = true
+        break
+      case 'background':
+        appFocused = false
+        persistRoute(false, true, () => useConfigState.getState().startup.loaded)
+        break
+      case 'inactive':
+        appFocused = false
+        break
+      default:
+        appFocused = false
+    }
+
+    // Native reports the app state to Go and to JS from the same callbacks; JS only mirrors it.
+    logger.info(`app focus changed: ${s.mobileAppState}`)
+    s.dispatch.changedFocus(appFocused)
+
+    if (s.mobileAppState === 'active') {
+      // only reload on foreground
+      useSettingsContactsState.getState().dispatch.loadContactPermissions()
+    }
+  }))
+
+  const configureAndroidCacheDir = () => {
+    const {fsCacheDir, fsDownloadDir} = _getNativeSync()
+    if (isAndroid && fsCacheDir && fsDownloadDir) {
+      ignorePromise(
+        T.RPCChat.localConfigureFileAttachmentDownloadLocalRpcPromise({
+          // Android's cache dir is (when I tried) [app]/cache but Go side uses
+          // [app]/.cache by default, which can't be used for sharing to other apps.
+          cacheDirOverride: fsCacheDir,
+          downloadDirOverride: fsDownloadDir,
+        })
+          .catch((e: unknown) => {
+            logger.error(`[Android cache override] Failed to configure: ${String(e)}`)
+          })
+      )
+    } else if (isAndroid) {
+      logger.warn(
+        `[Android cache override] Missing dirs - cacheDir: ${fsCacheDir}, downloadDir: ${fsDownloadDir}`
+      )
+    }
+  }
+
+  _platformUnsubs.push(useConfigState.subscribe((s, old) => {
+    if (s.loggedIn === old.loggedIn) return
+    const f = async () => {
+      const type = await _getNative().Network.getConnectionType()
+      useShellState.getState().dispatch.osNetworkStatusChanged(type !== 'none', type, true)
+    }
+    ignorePromise(f())
+  }))
+
+  _platformUnsubs.push(useShellState.subscribe((s, old) => {
+    if (s.networkStatus === old.networkStatus) return
+    const type = s.networkStatus?.type
+    if (!type) return
+    const f = async () => {
+      try {
+        await T.RPCGen.appStateUpdateMobileNetStateRpcPromise({state: type})
+      } catch (err) {
+        console.warn('Error sending mobileNetStateUpdate', err)
+      }
+    }
+    ignorePromise(f())
+  }))
+
+  _platformUnsubs.push(useRouterState.subscribe((s, old) => {
+    if (s.navState === old.navState) return
+    persistRoute(false, false, () => useConfigState.getState().startup.loaded)
+  }))
+
+  // Default to screen capture prevention on Android (matches native default of secure).
+  // Once daemon is ready, sync with the user's saved preference.
+  if (isAndroid) {
+    ignorePromise(ScreenCapture.preventScreenCaptureAsync('screenprotector'))
+    _platformUnsubs.push(useDaemonState.subscribe((s, old) => {
+      if (s.handshakeState !== 'done' || old.handshakeState === 'done') return
+      const f = async () => {
+        const {getSecureFlagSetting} = await import('@/constants/platform')
+        const secure = await getSecureFlagSetting()
+        if (!secure) {
+          const SC = await import('expo-screen-capture')
+          await SC.allowScreenCaptureAsync('screenprotector')
+        }
+      }
+      ignorePromise(f())
+    }))
+  }
+
+  // Start this immediately instead of waiting so we can do more things in parallel
+  ignorePromise(loadStartupDetails())
+
+  _platformUnsubs.push(...initPushListener())
+
+  initIOSLocation()
+
+  _platformUnsubs.push(_getNative().Network.addConnectionTypeListener(type => {
+    useShellState.getState().dispatch.osNetworkStatusChanged(type !== 'none', type)
+  }))
+
+  const {setupAudioMode} = _getNative()
+  ignorePromise(setupAudioMode(false))
+
+  purgeStaleSharedTextFiles()
+
+  if (isAndroid) {
+    // HMR re-init after the handshake already finished: the bootstrap step won't run again
+    if (useDaemonState.getState().handshakeState === 'done') {
+      configureAndroidCacheDir()
+    }
+    afterKbfsDaemonRpcStatusChanged()
+  }
+
+  initSharedSubscriptions(
+    isAndroid
+      ? [
+          async () => {
+            configureAndroidCacheDir()
+            return Promise.resolve()
+          },
+        ]
+      : []
+  )
+}
+
+const _initDesktopPlatformListener = () => {
+  // HMR cleanup: unsubscribe old store subscriptions before re-subscribing
+  for (const unsub of _platformUnsubs) unsub()
+  _platformUnsubs.length = 0
+  _platformUnsubs.push(...registerPlatformAnswerers())
+
+  const {isLinux, isWindows} = _getDesktop()
+
+  const openAtLoginKey = _getOpenAtLoginKey()
+  const {KB2, skipAppFocusActions, InputMonitor} = _getDesktop()
+  const {setOpenAtLogin} = KB2.functions
+
+  _platformUnsubs.push(useConfigState.subscribe((s, old) => {
+    if (s.loggedIn !== old.loggedIn) {
+      useShellState.getState().dispatch.osNetworkStatusChanged(navigator.onLine, 'notavailable', true)
+    }
+  }))
+
+  _platformUnsubs.push(useShellState.subscribe((s, old) => {
+    if (s.appFocused !== old.appFocused) {
+      maybePauseVideos()
+    }
+
+    if (s.openAtLogin !== old.openAtLogin) {
+      const {openAtLogin} = s
+      const f = async () => {
+        if (__DEV__) {
+          console.log('onSetOpenAtLogin disabled for dev mode')
+          return
+        } else {
+          await T.RPCGen.configGuiSetValueRpcPromise({
+            path: openAtLoginKey,
+            value: {b: openAtLogin, isNull: false},
+          })
+        }
+        if (isLinux || isWindows) {
+          const enabled =
+            (await T.RPCGen.ctlGetOnLoginStartupRpcPromise()) === T.RPCGen.OnLoginStartupStatus.enabled
+          if (enabled !== openAtLogin) {
+            try {
+              await T.RPCGen.ctlSetOnLoginStartupRpcPromise({enabled: openAtLogin})
+            } catch (error_) {
+              const error = error_ as {message?: string}
+              logger.warn(`Error in sending ctlSetOnLoginStartup: ${error.message}`)
+            }
+          }
+        } else {
+          logger.info(`Login item settings changed! now ${openAtLogin ? 'on' : 'off'}`)
+          await setOpenAtLogin?.(openAtLogin)
+        }
+      }
+      ignorePromise(f())
+    }
+  }))
+
+  if (!_oneTimeInitDone) {
+    _oneTimeInitDone = true
+    if (__DEV__) globalThis.__hmr_oneTimeInitDone = true
+
+    const handle = (appFocused: boolean) => {
+      if (skipAppFocusActions) {
+        console.log('Skipping app focus actions!')
+      } else {
+        useShellState.getState().dispatch.changedFocus(appFocused)
+      }
+    }
+    setupWindowEventListeners(
+      () => handle(true),
+      () => handle(false),
+      () => useShellState.getState().dispatch.osNetworkStatusChanged(true, 'notavailable'),
+      () => useShellState.getState().dispatch.osNetworkStatusChanged(false, 'notavailable')
+    )
+
+    if (isLinux) {
+      useShellState.getState().dispatch.initUseNativeFrame()
+    }
+
+    const initializeInputMonitor = () => {
+      const inputMonitor = new InputMonitor()
+      inputMonitor.notifyActive = (userActive: boolean) => {
+        if (skipAppFocusActions) {
+          console.log('Skipping app focus actions!')
+        } else {
+          useShellState.getState().dispatch.setActive(userActive)
+          KB2.functions.activeChanged?.(Date.now(), userActive)
+        }
+      }
+    }
+    initializeInputMonitor()
+  }
+
+  _platformUnsubs.push(useDaemonState.subscribe((s, old) => {
+    if (s.handshakeState !== old.handshakeState && s.handshakeState === 'done') {
+      useConfigState.getState().dispatch.setStartupDetails({
+        conversation: Chat.noConversationIDKey,
+        tab: undefined,
+      })
+    }
+  }))
+
+  const winPipeCheckStep = async () => {
+    try {
+      logger.info('Checking RPC ownership')
+      if (KB2.functions.winCheckRPCOwnership) {
+        await KB2.functions.winCheckRPCOwnership()
+      }
+    } catch (error_) {
+      getEngine().reset()
+      const error = error_ as {message?: string}
+      throw new FatalHandshakeError(error.message || 'windows pipe owner fail')
+    }
+  }
+
+  if (!isLinux) {
+    afterKbfsDaemonRpcStatusChanged()
+  }
+
+  initSharedSubscriptions(isWindows ? [winPipeCheckStep] : [])
+}
+
+export {onEngineConnected, onEngineDisconnected} from './shared'

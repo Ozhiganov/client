@@ -1,0 +1,64 @@
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+
+const siteIconToSrcSet = (siteIcon: T.Tracker.SiteIconSet) =>
+  `image-set(${siteIcon
+    .slice()
+    .sort((a, b) => a.width - b.width)
+    .map((si, idx) => `url(${si.path}) ${idx + 1}x`)
+    .join(', ')})`
+const siteIconToNativeSrcSet = (siteIcon: T.Tracker.SiteIconSet) =>
+  siteIcon.map(si => ({height: si.width, uri: si.path, width: si.width}))
+
+type SiteIconProps = {
+  full: boolean
+  set: T.Tracker.SiteIconSet
+  style?: Kb.Styles.StylesCrossPlatform
+}
+
+export const SiteIcon = (props: SiteIconProps) => {
+  const siteIconStyles = useSiteIconStyles()
+  const style = props.full ? siteIconStyles.siteIconFull : siteIconStyles.siteIcon
+  return isMobile ? (
+    <Kb.Image
+      src={siteIconToNativeSrcSet(props.set)}
+      style={Kb.Styles.collapseStyles([style, props.style])}
+    />
+  ) : (
+    <Kb.Box2
+      direction="vertical"
+      style={Kb.Styles.collapseStyles([
+        style,
+        props.style,
+        Kb.Styles.platformStyles({isElectron: {backgroundImage: siteIconToSrcSet(props.set)}}),
+      ])}
+    />
+  )
+}
+
+const useSiteIconStyles = Kb.Styles.createStyleHook(() => ({
+  siteIcon: Kb.Styles.platformStyles({
+    common: {
+      flexShrink: 0,
+    },
+    isElectron: {
+      backgroundSize: 'contain',
+      ...Kb.Styles.size(16),
+    },
+    isMobile: {
+      ...Kb.Styles.size(18),
+    },
+  }),
+  siteIconFull: Kb.Styles.platformStyles({
+    common: {
+      flexShrink: 0,
+    },
+    isElectron: {
+      backgroundSize: 'contain',
+      ...Kb.Styles.size(48),
+    },
+    isMobile: {
+      ...Kb.Styles.size(64),
+    },
+  }),
+}))

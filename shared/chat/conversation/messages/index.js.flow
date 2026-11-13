@@ -1,3 +1,0 @@
-// @flow
-const factory = (options: any) => {};
-export default factory

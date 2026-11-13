@@ -1,0 +1,116 @@
+import * as T from '@/constants/types'
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as Teams from '@/constants/teams'
+import {useNavigation} from '@react-navigation/native'
+import setRouteParamsIfPresent from './set-route-params-if-present'
+import {useLoadedTeamChannels} from '../common/use-loaded-team-channels'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {refreshConversationParticipants} from '@/chat/inbox/refresh-participants'
+
+type Props = {
+  members: string[]
+  conversationIDKey: T.Chat.ConversationIDKey
+  teamID: T.Teams.TeamID
+}
+
+// Removing from a channel changes its participants, and nothing recomputes them on its
+// own - see refreshConversationParticipants.
+export const removeMembersFromChannel = async (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  usernames: ReadonlyArray<string>
+) => {
+  await T.RPCChat.localRemoveFromConversationLocalRpcPromise({
+    convID: T.Chat.keyToConversationID(conversationIDKey),
+    usernames: [...usernames],
+  })
+  await refreshConversationParticipants([conversationIDKey])
+}
+
+const ConfirmRemoveFromChannel = (props: Props) => {
+  const styles = useStyles()
+  const members = props.members
+  const teamID = props.teamID
+  const conversationIDKey = props.conversationIDKey
+
+  const [waiting, setWaiting] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const {channels} = useLoadedTeamChannels(teamID)
+  const channelname = channels.get(conversationIDKey)?.channelname ?? ''
+
+  const nav = useSafeNavigation()
+  const navigation = useNavigation()
+  const removeFromChannel = C.useRPC(removeMembersFromChannel)
+
+  const onRemove = () => {
+    setWaiting(true)
+    setTimeout(() => setWaiting(false), 1000)
+    removeFromChannel(
+      [conversationIDKey, members],
+      () => {
+        setWaiting(false)
+        setRouteParamsIfPresent(navigation, 'teamChannel', {selectedMembers: undefined})
+        nav.safeNavigateUp()
+      },
+      err => {
+        setWaiting(false)
+        setError(err.message)
+      }
+    )
+  }
+
+  const prompt = `Remove ${Teams.stringifyPeople(members)} from #${channelname}?`
+  const header = (
+    <Kb.Box2 direction="vertical" relative={true}>
+      <Kb.AvatarLine usernames={members} size={64} layout="horizontal" maxShown={5} />
+      <Kb.Icon
+        type="iconfont-block"
+        style={Kb.Styles.collapseStyles([
+          styles.headerIcon,
+          styles.iconContainer,
+          members.length > 5 && styles.iconContainerMany,
+        ])}
+        sizeType="Small"
+      />
+    </Kb.Box2>
+  )
+  return (
+    <Kb.ConfirmModal
+      header={header}
+      prompt={prompt}
+      onCancel={nav.safeNavigateUp}
+      onConfirm={onRemove}
+      confirmText="Remove from channel"
+      waiting={waiting}
+      error={error}
+    />
+  )
+}
+export default ConfirmRemoveFromChannel
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  headerIcon: Kb.Styles.platformStyles({
+    common: {
+      backgroundColor: theme.red,
+      ...Kb.Styles.border(theme.white, 3),
+      color: theme.white,
+      padding: 3,
+    },
+    isElectron: {
+      backgroundClip: 'padding-box',
+      borderRadius: 50,
+    },
+    isMobile: {
+      borderRadius: 18,
+      marginRight: -20,
+      marginTop: -30,
+    },
+  }),
+  iconContainer: {
+    bottom: -3,
+    position: 'absolute',
+    right: 0,
+  },
+  iconContainerMany: {right: 20},
+}))

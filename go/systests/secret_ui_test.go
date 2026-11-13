@@ -4,12 +4,13 @@
 package systests
 
 import (
+	"context"
 	"testing"
 
 	"github.com/keybase/client/go/client"
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/service"
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
@@ -17,13 +18,11 @@ import (
 
 func TestSecretUI(t *testing.T) {
 	tc := setupTest(t, "secret_ui")
-	tc1 := cloneContext(tc)
-	tc2 := cloneContext(tc)
-
-	// Make sure we're not using G anywhere in our tests.
-	libkb.G.LocalDb = nil
-
 	defer tc.Cleanup()
+	tc1 := cloneContext(tc)
+	defer tc1.Cleanup()
+	tc2 := cloneContext(tc)
+	defer tc2.Cleanup()
 
 	stopCh := make(chan error)
 	svc := service.NewService(tc.G, false)
@@ -41,9 +40,7 @@ func TestSecretUI(t *testing.T) {
 
 	var err error
 	check := func() {
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 	}
 
 	sui := newSecretUI()
@@ -64,24 +61,20 @@ func TestSecretUI(t *testing.T) {
 	cmd := client.NewCmdLoginRunner(tc2.G)
 	cmd.SessionID = 19
 	err = cmd.Run()
-	if err == nil {
-		t.Fatal("login worked, when it should have failed")
-	}
+	require.Error(t, err,
+		"login worked, when it should have failed")
 
 	// check that delegate ui was called:
 	if !sui.getPassphrase {
 		t.Logf("secret ui: %+v", sui)
-		t.Error("delegate secret UI GetPassphrase was not called during login cmd")
+		require.Fail(t, "delegate secret UI GetPassphrase was not called during login cmd")
 	}
 
 	// check that delegate ui session id was correct:
-	if sui.getPassphraseSessionID != cmd.SessionID {
-		t.Errorf("delegate secret UI session ID: %d, expected %d", sui.getPassphraseSessionID, cmd.SessionID)
-	}
+	require.Equal(t, cmd.SessionID, sui.getPassphraseSessionID, "delegate secret UI session ID: %d, expected %d", sui.getPassphraseSessionID, cmd.SessionID)
 
-	if err := client.CtlServiceStop(tc1.G); err != nil {
-		t.Errorf("Error in stopping service: %v", err)
-	}
+	err = CtlStop(tc1.G)
+	require.NoError(t, err, "Error in stopping service: %v", err)
 
 	// If the server failed, it's also an error
 	err = <-stopCh
@@ -124,17 +117,46 @@ type loginUI struct {
 	libkb.Contextified
 }
 
+var _ libkb.LoginUI = (*loginUI)(nil)
+
 func (u *loginUI) DisplayPaperKeyPhrase(context.Context, keybase1.DisplayPaperKeyPhraseArg) error {
 	return nil
 }
+
 func (u *loginUI) DisplayPrimaryPaperKey(context.Context, keybase1.DisplayPrimaryPaperKeyArg) error {
 	return nil
 }
+
 func (u *loginUI) PromptRevokePaperKeys(context.Context, keybase1.PromptRevokePaperKeysArg) (bool, error) {
 	return false, nil
 }
+
 func (u *loginUI) GetEmailOrUsername(context.Context, int) (string, error) {
 	return "t_alice", nil
+}
+
+func (u *loginUI) PromptResetAccount(_ context.Context, arg keybase1.PromptResetAccountArg) (keybase1.ResetPromptResponse, error) {
+	return keybase1.ResetPromptResponse_NOTHING, nil
+}
+
+func (u *loginUI) DisplayResetProgress(_ context.Context, arg keybase1.DisplayResetProgressArg) error {
+	return nil
+}
+
+func (u *loginUI) ExplainDeviceRecovery(_ context.Context, arg keybase1.ExplainDeviceRecoveryArg) error {
+	return nil
+}
+
+func (u *loginUI) PromptPassphraseRecovery(_ context.Context, arg keybase1.PromptPassphraseRecoveryArg) (bool, error) {
+	return false, nil
+}
+
+func (u *loginUI) ChooseDeviceToRecoverWith(_ context.Context, arg keybase1.ChooseDeviceToRecoverWithArg) (keybase1.DeviceID, error) {
+	return "", nil
+}
+
+func (u *loginUI) DisplayResetMessage(_ context.Context, arg keybase1.DisplayResetMessageArg) error {
+	return nil
 }
 
 type provisionUI struct {
@@ -144,30 +166,39 @@ type provisionUI struct {
 func (u *provisionUI) ChooseProvisioningMethod(context.Context, keybase1.ChooseProvisioningMethodArg) (keybase1.ProvisionMethod, error) {
 	panic("deprecated")
 }
+
 func (u *provisionUI) ChooseGPGMethod(context.Context, keybase1.ChooseGPGMethodArg) (keybase1.GPGMethod, error) {
 	return keybase1.GPGMethod_GPG_IMPORT, nil
 }
+
 func (u *provisionUI) SwitchToGPGSignOK(context.Context, keybase1.SwitchToGPGSignOKArg) (bool, error) {
 	return true, nil
 }
+
 func (u *provisionUI) ChooseDevice(context.Context, keybase1.ChooseDeviceArg) (r keybase1.DeviceID, e error) {
 	return
 }
+
 func (u *provisionUI) ChooseDeviceType(context.Context, keybase1.ChooseDeviceTypeArg) (r keybase1.DeviceType, e error) {
 	return
 }
+
 func (u *provisionUI) DisplayAndPromptSecret(context.Context, keybase1.DisplayAndPromptSecretArg) (r keybase1.SecretResponse, e error) {
 	return
 }
+
 func (u *provisionUI) DisplaySecretExchanged(context.Context, int) error {
 	return nil
 }
+
 func (u *provisionUI) PromptNewDeviceName(context.Context, keybase1.PromptNewDeviceNameArg) (string, error) {
 	return "", nil
 }
+
 func (u *provisionUI) ProvisioneeSuccess(context.Context, keybase1.ProvisioneeSuccessArg) error {
 	return nil
 }
+
 func (u *provisionUI) ProvisionerSuccess(context.Context, keybase1.ProvisionerSuccessArg) error {
 	return nil
 }

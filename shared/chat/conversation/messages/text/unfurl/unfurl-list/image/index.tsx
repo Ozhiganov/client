@@ -1,0 +1,81 @@
+import type * as React from 'react'
+import * as Kb from '@/common-adapters/index'
+import {clampImageSize} from '@/constants/chat/helpers'
+import {maxWidth} from '@/chat/conversation/messages/attachment/shared'
+import {Video} from './video'
+import {openURL} from '@/util/misc'
+import {useSyncRowLayout} from '@/chat/conversation/messages/use-sync-row-layout'
+
+export type Props = {
+  autoplayVideo: boolean
+  height: number
+  isVideo: boolean
+  linkURL?: string
+  onClick?: () => void
+  style?: object
+  url: string
+  width: number
+  widthPadding?: number
+}
+
+const UnfurlImage = (p: Props) => {
+  const styles = useStyles()
+  const {autoplayVideo, isVideo, linkURL, onClick, url, style, widthPadding} = p
+
+  const onOpenURL = () => {
+    if (linkURL) {
+      void openURL(linkURL)
+    }
+  }
+  const maxSize = Math.min(maxWidth, 320) - (widthPadding || 0)
+  const {height, width} = clampImageSize(p.width, p.height, maxSize, 320)
+
+  // Usually the metadata dimensions are known at first paint, but if they arrive in a later update
+  // the image grows; flush the row measure so the list re-pins instead of parking above newest.
+  useSyncRowLayout(`${width}x${height}`)
+
+  return isVideo ? (
+    <Video
+      autoPlay={autoplayVideo}
+      height={height}
+      onClick={onClick}
+      style={
+        Kb.Styles.collapseStyles([
+          styles.image,
+          {height, minHeight: height, minWidth: width, width},
+          style,
+        ]) as React.CSSProperties
+      }
+      url={url}
+      width={width}
+    />
+  ) : (
+    <Kb.ClickableBox alignSelf="center" direction="vertical" onClick={onClick || onOpenURL}>
+      <Kb.Image
+        src={url}
+        style={Kb.Styles.collapseStyles([
+          styles.video,
+          {height, minHeight: height, minWidth: width, width},
+          style,
+        ])}
+      />
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      image: {
+        borderRadius: Kb.Styles.borderRadius,
+        flexGrow: 0,
+        flexShrink: 0,
+      },
+      video: {
+        flexGrow: 0,
+        flexShrink: 0,
+      },
+    }) as const
+)
+
+export default UnfurlImage

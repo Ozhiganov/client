@@ -1,0 +1,88 @@
+import Avatar from '.'
+import {Box2} from '../box'
+import Text from '../text'
+import * as Styles from '@/styles'
+
+type AvatarSize = 128 | 96 | 64 | 48 | 32 | 24 | 16
+const avatarSizes = [128, 96, 64, 48, 32, 24, 16] as const
+
+const Kb = {
+  Avatar,
+  Box2,
+  Styles,
+  Text,
+}
+
+type Props = {
+  usernames: ReadonlyArray<string>
+  maxShown: number
+  size: AvatarSize
+  layout: 'horizontal' | 'vertical'
+  alignSelf?: 'center' | 'flex-start' | 'flex-end' | 'stretch'
+}
+
+// TODO: consider making `diagonal` to replace MultiAvatar, but that's hard.
+
+const AvatarLine = (props: Props) => {
+  const usernamesToShow = props.usernames.slice(0, props.maxShown)
+  const extra = props.usernames.length - usernamesToShow.length
+  const reverse = {horizontal: 'horizontalReverse', vertical: 'verticalReverse'} as const
+  const styles = useStyleMap().get(props.size)?.[props.layout]
+  if (!styles) return null
+  return (
+    <Kb.Box2 direction={reverse[props.layout]} style={styles.container} alignSelf={props.alignSelf ?? 'center'}>
+      {!!extra && (
+        <Kb.Box2 alignSelf="center" direction={props.layout} alignItems="center" justifyContent="flex-end" style={styles.overflowBox}>
+          <Kb.Text type={getTextSize(props.size)} style={styles.text}>
+            +{extra}
+          </Kb.Text>
+        </Kb.Box2>
+      )}
+      {usernamesToShow
+        .map(username => (
+          <Kb.Avatar
+            size={props.size}
+            username={username}
+            key={username}
+            style={styles.avatar}
+          />
+        ))
+        .reverse()}
+    </Kb.Box2>
+  )
+}
+
+const getTextSize = (size: AvatarSize) => (size >= 48 ? 'BodySmallBold' : 'BodyTinyBold')
+
+const sizeStyles = (theme: Styles.Theme, size: AvatarSize) => ({
+  horizontal: {
+    avatar: {marginRight: -Math.round(size / 3)},
+    container: {marginLeft: 2, marginRight: Math.round(size / 3) + 2},
+    overflowBox: {
+      backgroundColor: theme.grey,
+      borderBottomRightRadius: size,
+      borderTopRightRadius: size,
+      height: size,
+      paddingLeft: Math.round(size / 2),
+    },
+    text: {color: theme.black_50, paddingRight: Math.round(size / 5)},
+  },
+  vertical: {
+    avatar: {marginBottom: -Math.round(size / 3)},
+    container: {marginBottom: Math.round(size / 3) + 2, marginTop: 2},
+    overflowBox: {
+      backgroundColor: theme.grey,
+      borderBottomLeftRadius: size,
+      borderBottomRightRadius: size,
+      paddingTop: Math.round(size / 2),
+      width: size,
+    },
+    text: {color: theme.black_50, paddingBottom: Math.round(size / 5)},
+  },
+})
+
+const useStyleMap = Kb.Styles.createThemedHook(
+  theme => new Map(avatarSizes.map(size => [size, sizeStyles(theme, size)]))
+)
+
+export default AvatarLine

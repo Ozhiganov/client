@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -11,13 +12,11 @@ import (
 	"testing"
 
 	"github.com/keybase/client/go/libkb"
+	"github.com/stretchr/testify/assert"
 )
 
 var runConc = flag.Bool("conc", false, "run (expensive) concurrency tests")
 
-// TestConcurrentLogin tries calling logout, login, and many of
-// the exposed methods in LoginState concurrently.  Use the
-// -race flag to test it.
 func TestConcurrentLogin(t *testing.T) {
 	if !*runConc {
 		t.Skip("Skipping ConcurrentLogin test")
@@ -32,13 +31,14 @@ func TestConcurrentLogin(t *testing.T) {
 
 	done := make(chan bool)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		lwg.Add(1)
 		go func(index int) {
 			defer lwg.Done()
-			for j := 0; j < 4; j++ {
+			for range 4 {
 				Logout(tc)
-				u.Login(tc.G)
+				err := u.Login(tc.G)
+				assert.NoError(t, err)
 			}
 			fmt.Printf("logout/login #%d done\n", index)
 		}(i)
@@ -52,21 +52,10 @@ func TestConcurrentLogin(t *testing.T) {
 					fmt.Printf("func caller %d done\n", index)
 					return
 				default:
-					tc.G.LoginState().LocalSession(func(s *libkb.Session) {
-						s.APIArgs()
-					}, "APIArgs")
-					tc.G.LoginState().Account(func(a *libkb.Account) {
-						a.UserInfo()
-					}, "UserInfo")
-					tc.G.LoginState().LocalSession(func(s *libkb.Session) {
-						s.GetUID()
-					}, "GetUID")
-					tc.G.LoginState().LocalSession(func(s *libkb.Session) {
-						s.Load()
-					}, "session Load")
-					tc.G.LoginState().LoggedIn()
-					tc.G.LoginState().LoggedInLoad()
-					// tc.G.LoginState.Shutdown()
+					_, err := tc.G.ActiveDevice.NIST(context.Background())
+					assert.NoError(t, err)
+					tc.G.ActiveDevice.UID()
+					tc.G.ActiveDevice.Valid()
 				}
 			}
 		}(i)
@@ -94,13 +83,14 @@ func TestConcurrentGetPassphraseStream(t *testing.T) {
 
 	done := make(chan bool)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		lwg.Add(1)
 		go func(index int) {
 			defer lwg.Done()
-			for j := 0; j < 4; j++ {
+			for range 4 {
 				Logout(tc)
-				u.Login(tc.G)
+				err := u.Login(tc.G)
+				assert.NoError(t, err)
 			}
 			fmt.Printf("logout/login #%d done\n", index)
 		}(i)
@@ -114,10 +104,7 @@ func TestConcurrentGetPassphraseStream(t *testing.T) {
 					fmt.Printf("func caller %d done\n", index)
 					return
 				default:
-					_, err := tc.G.LoginState().GetPassphraseStream(u.NewSecretUI())
-					if err != nil {
-						tc.G.Log.Warning("GetPassphraseStream err: %s", err)
-					}
+					tc.G.ActiveDevice.PassphraseStream()
 				}
 			}
 		}(i)
@@ -129,7 +116,7 @@ func TestConcurrentGetPassphraseStream(t *testing.T) {
 }
 
 // TestConcurrentLogin tries calling logout, login, and many of
-// the exposed methods in LoginState concurrently.  Use the
+// the exposed methods in ActiveDevice concurrently.  Use the
 // -race flag to test it.
 func TestConcurrentSignup(t *testing.T) {
 	if !*runConc {
@@ -145,13 +132,14 @@ func TestConcurrentSignup(t *testing.T) {
 
 	done := make(chan bool)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		lwg.Add(1)
 		go func(index int) {
 			defer lwg.Done()
-			for j := 0; j < 4; j++ {
+			for range 4 {
 				Logout(tc)
-				u.Login(tc.G)
+				err := u.Login(tc.G)
+				assert.NoError(t, err)
 				Logout(tc)
 			}
 			fmt.Printf("logout/login #%d done\n", index)
@@ -160,7 +148,8 @@ func TestConcurrentSignup(t *testing.T) {
 		mwg.Add(1)
 		go func(index int) {
 			defer mwg.Done()
-			CreateAndSignupFakeUserSafe(tc.G, "login")
+			_, err := CreateAndSignupFakeUserSafe(tc.G, "login")
+			assert.NoError(t, err)
 			Logout(tc)
 			fmt.Printf("func caller %d done\n", index)
 		}(i)
@@ -184,11 +173,11 @@ func TestConcurrentGlobals(t *testing.T) {
 		genv,
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		wg.Add(1)
-		go func(index int) {
-			for j := 0; j < 10; j++ {
-				f := fns[rand.Intn(len(fns))]
+		go func(_ int) {
+			for range 10 {
+				f := fns[rand.Intn(len(fns))] //nolint:gosec // G404: Test code with randomized function calls, not security-critical
 				f(tc.G)
 			}
 			wg.Done()
@@ -202,9 +191,5 @@ func genv(g *libkb.GlobalContext) {
 	g.Env.GetConfigWriter()
 	g.Env.GetCommandLine()
 	cf := libkb.NewJSONConfigFile(g, "")
-	g.Env.SetConfig(*cf, cf)
-}
-
-func gkeyring() {
-
+	g.Env.SetConfig(cf, cf)
 }

@@ -4,9 +4,8 @@
 package client
 
 import (
+	"context"
 	"errors"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -42,7 +41,6 @@ func NewCmdPaperProvisionRunner(g *libkb.GlobalContext) *CmdPaperProvision {
 }
 
 func (c *CmdPaperProvision) Run() (err error) {
-
 	client, err := GetPaperProvisionClient(c.G())
 	if err != nil {
 		return err
@@ -58,15 +56,13 @@ func (c *CmdPaperProvision) Run() (err error) {
 		return err
 	}
 
-	err = client.PaperProvision(context.TODO(),
+	return client.PaperProvision(context.TODO(),
 		keybase1.PaperProvisionArg{
 			Username:   c.username,
 			DeviceName: c.deviceName,
 			PaperKey:   c.paperKey,
 			SessionID:  c.SessionID,
 		})
-
-	return
 }
 
 func (c *CmdPaperProvision) ParseArgv(ctx *cli.Context) error {

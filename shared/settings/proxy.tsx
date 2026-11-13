@@ -1,0 +1,292 @@
+import * as React from 'react'
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {produce} from 'immer'
+import type {RPCError} from '@/util/errors'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const useConnect = () => {
+  const [allowTlsMitmToggle, setDidToggleCertificatePinning] = React.useState<boolean | undefined>(undefined)
+  const [proxyData, setProxyData] = React.useState<T.RPCGen.ProxyData | undefined>(undefined)
+  const [showDisableCertPinningWarning, setShowDisableCertPinningWarning] = React.useState(false)
+  const loadProxyData = C.useRPC(T.RPCGen.configGetProxyDataRpcPromise)
+  const saveProxyData = C.useRPC(T.RPCGen.configSetProxyDataRpcPromise)
+  const onDisableCertPinning = () => {
+    setShowDisableCertPinningWarning(true)
+  }
+  const onCancelDisableCertPinning = () => {
+    setShowDisableCertPinningWarning(false)
+  }
+  const onConfirmDisableCertPinning = () => {
+    setDidToggleCertificatePinning(true)
+    setShowDisableCertPinningWarning(false)
+  }
+  const onEnableCertPinning = () => {
+    setDidToggleCertificatePinning(false)
+  }
+  const props = {
+    allowTlsMitmToggle,
+    loadProxyData,
+    onCancelDisableCertPinning,
+    onConfirmDisableCertPinning,
+    onDisableCertPinning,
+    onEnableCertPinning,
+    proxyData,
+    saveProxyData,
+    setProxyData,
+    showDisableCertPinningWarning,
+  }
+
+  return props
+}
+
+// Export the popup as the default export so it is easy to make a route pointing to it
+const Container = () => {
+  const props = useConnect()
+  return <ProxySettingsPopup {...props} />
+}
+
+// The proxy settings component used in the advanced settings screen
+const ProxySettings = () => {
+  const props = useConnect()
+  return <ProxySettingsComponent {...props} showHeader={true} />
+}
+
+// A list so the order of the elements is fixed
+const proxyTypeList = ['noProxy', 'httpConnect', 'socks'] as const
+const proxyTypeToDisplayName = {
+  httpConnect: 'HTTP(s) Connect',
+  noProxy: 'No proxy',
+  socks: 'SOCKS5',
+}
+type ProxyType = (typeof proxyTypeList)[number]
+type ProxyFormState = {
+  address: string
+  port: string
+  proxyData?: T.RPCGen.ProxyData
+  proxyType: ProxyType
+}
+
+const proxyDataToFormState = (proxyData: T.RPCGen.ProxyData): ProxyFormState => {
+  const addressPort = proxyData.addressWithPort.split(':')
+  return {
+    address: addressPort.slice(0, addressPort.length - 1).join(':'),
+    port: addressPort.length >= 2 ? (addressPort.at(-1) ?? '') : '8080',
+    proxyData,
+    proxyType: T.RPCGen.ProxyType[proxyData.proxyType] as ProxyType,
+  }
+}
+
+type Props = {
+  allowTlsMitmToggle?: boolean
+  loadProxyData: (
+    args: [undefined],
+    setResult: (result: T.RPCGen.ProxyData) => void,
+    setError: (error: RPCError) => void
+  ) => void
+  onCancelDisableCertPinning: () => void
+  onConfirmDisableCertPinning: () => void
+  onDisableCertPinning: () => void
+  onEnableCertPinning: () => void
+  proxyData?: T.RPCGen.ProxyData
+  saveProxyData: (
+    args: [{proxyData: T.RPCGen.ProxyData}],
+    setResult: () => void,
+    setError: (error: RPCError) => void
+  ) => void
+  setProxyData: React.Dispatch<React.SetStateAction<T.RPCGen.ProxyData | undefined>>
+  showDisableCertPinningWarning: boolean
+}
+
+// the modal titles itself in its header; the advanced settings page shows the heading
+const ProxySettingsComponent = (props: Props & {showHeader: boolean}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {
+    showHeader,
+    loadProxyData,
+    proxyData,
+    setProxyData,
+    allowTlsMitmToggle,
+    onCancelDisableCertPinning,
+    onConfirmDisableCertPinning,
+    onDisableCertPinning,
+    onEnableCertPinning,
+    saveProxyData,
+    showDisableCertPinningWarning,
+  } = props
+  const [proxyForm, setProxyForm] = React.useState<ProxyFormState>(() =>
+    proxyData ? proxyDataToFormState(proxyData) : {address: '', port: '', proxyType: 'noProxy'}
+  )
+  let nextProxyForm = proxyForm
+  if (proxyData && nextProxyForm.proxyData !== proxyData) {
+    nextProxyForm = proxyDataToFormState(proxyData)
+    setProxyForm(nextProxyForm)
+  }
+  const {address, port, proxyType} = nextProxyForm
+
+  React.useEffect(() => {
+    loadProxyData(
+      [undefined],
+      result => {
+        setProxyData(result)
+      },
+      error => {
+        logger.warn('Error loading proxy data', error)
+      }
+    )
+  }, [loadProxyData, setProxyData])
+
+  const certPinning = (): boolean => {
+    if (allowTlsMitmToggle === undefined) {
+      return proxyData ? proxyData.certPinning : true
+    } else {
+      return !allowTlsMitmToggle
+    }
+  }
+
+  const toggleCertPinning = () => {
+    if (certPinning()) {
+      onDisableCertPinning()
+    } else {
+      onEnableCertPinning()
+    }
+  }
+
+  const saveProxySettings = (nextProxyType = proxyType) => {
+    const nextProxyData = {
+      addressWithPort: address + ':' + port,
+      certPinning: certPinning(),
+      proxyType: T.RPCGen.ProxyType[nextProxyType],
+    }
+    saveProxyData(
+      [{proxyData: nextProxyData}],
+      () => {
+        setProxyData(nextProxyData)
+      },
+      error => {
+        logger.warn('Error in saving proxy data', error)
+      }
+    )
+  }
+
+  const proxyTypeSelected = (newProxyType: ProxyType) => {
+    setProxyForm(
+      produce(draft => {
+        draft.proxyType = newProxyType
+      })
+    )
+    if (newProxyType === 'noProxy') {
+      saveProxySettings(newProxyType)
+    }
+  }
+
+  if (showDisableCertPinningWarning) {
+    return (
+      <Kb.Box2
+        direction="vertical"
+        centerChildren={true}
+        fullWidth={true}
+        flex={1}
+        gap="small"
+        padding="medium"
+      >
+        <Kb.Icon type="iconfont-exclamation" sizeType="Big" color={theme.red} />
+        <Kb.Text center={true} type="Header" style={styles.warningHeader}>
+          Are you sure you want to allow TLS interception?
+        </Kb.Text>
+        <Kb.Text center={true} type="Body" style={styles.warningBody}>
+          This means your proxy or your ISP will be able to view all traffic between you and Keybase servers.
+          It is not recommended to use this option unless absolutely required.
+        </Kb.Text>
+        <Kb.ButtonBar>
+          <Kb.Button type="Dim" label="Cancel" onClick={onCancelDisableCertPinning} />
+          <Kb.Button type="Danger" label="Yes, I am sure" onClick={onConfirmDisableCertPinning} />
+        </Kb.ButtonBar>
+      </Kb.Box2>
+    )
+  }
+
+  return (
+    <>
+      {showHeader && (
+        <Kb.Text type="Header" style={styles.text}>
+          Proxy settings
+        </Kb.Text>
+      )}
+      {proxyTypeList.map(pt => (
+        <Kb.RadioButton
+          onSelect={() => proxyTypeSelected(pt)}
+          selected={proxyType === pt}
+          key={pt}
+          label={proxyTypeToDisplayName[pt]}
+          style={styles.radioButton}
+        />
+      ))}
+      {proxyType === 'noProxy' ? null : (
+        <>
+          <Kb.Text type="BodySmall">Proxy Address</Kb.Text>
+          <Kb.Input3
+            textType="BodySemibold"
+            placeholder="127.0.0.1"
+            onChangeText={address =>
+              setProxyForm(
+                produce(draft => {
+                  draft.address = address
+                })
+              )
+            }
+            value={address}
+          />
+          <Kb.Text type="BodySmall">Proxy Port</Kb.Text>
+          <Kb.Input3
+            textType="BodySemibold"
+            placeholder="8080"
+            onChangeText={port =>
+              setProxyForm(
+                produce(draft => {
+                  draft.port = port
+                })
+              )
+            }
+            value={port}
+          />
+        </>
+      )}
+      <Kb.Checkbox
+        checked={!certPinning()}
+        onCheck={toggleCertPinning}
+        label="Allow TLS Interception"
+        style={styles.proxySetting}
+      />
+      <Kb.Button
+        onClick={() => saveProxySettings()}
+        label="Save Proxy Settings"
+        testID={proxyData ? TestIDs.SETTINGS_PROXY_SAVE : `${TestIDs.SETTINGS_PROXY_SAVE}${TestIDs.SETTING_PENDING}`}
+      />
+    </>
+  )
+}
+
+const ProxySettingsPopup = (props: Props) => (
+  <Kb.ModalScreen>
+    <ProxySettingsComponent {...props} showHeader={false} />
+  </Kb.ModalScreen>
+)
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  proxySetting: {marginBottom: Kb.Styles.globalMargins.small},
+  radioButton: {marginRight: Kb.Styles.globalMargins.medium},
+  text: Kb.Styles.platformStyles({
+    isElectron: {
+      cursor: 'default',
+    },
+  }),
+  warningBody: {maxWidth: 420},
+  warningHeader: {maxWidth: 420},
+}))
+
+export {ProxySettings}
+export default Container

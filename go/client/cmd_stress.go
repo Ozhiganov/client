@@ -1,19 +1,18 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build !production
+//go:build !production
 
 // this command is only for testing purposes
 package client
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -22,12 +21,12 @@ import (
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
 )
 
-func NewCmdStress(cl *libcmdline.CommandLine) cli.Command {
+func NewCmdStress(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Command {
 	return cli.Command{
 		Name:  "stress",
 		Usage: "Run some stressful commands on the service (devel only)",
 		Action: func(c *cli.Context) {
-			cl.ChooseCommand(&CmdStress{}, "stress", c)
+			cl.ChooseCommand(&CmdStress{Contextified: libkb.NewContextified(g)}, "stress", c)
 		},
 		Flags: []cli.Flag{
 			cli.IntFlag{
@@ -41,23 +40,24 @@ func NewCmdStress(cl *libcmdline.CommandLine) cli.Command {
 // CmdStress is used for testing concurrency in the daemon.
 // Build the daemon with `-race`, then run this command.
 type CmdStress struct {
+	libkb.Contextified
 	numUsers   int
 	passphrase string
 }
 
 func (c *CmdStress) rpcClient() (*rpc.Client, error) {
-	cli, _, err := GetRPCClient()
+	cli, _, err := GetRPCClientWithContext(c.G())
 	if err != nil {
 		return nil, err
 	}
 	protocols := []rpc.Protocol{
-		NewStreamUIProtocol(G),
+		NewStreamUIProtocol(c.G()),
 		c.secretUIProtocol(),
-		NewIdentifyUIProtocol(G),
+		NewIdentifyUIProtocol(c.G()),
 		c.gpgUIProtocol(),
-		NewLoginUIProtocol(G),
+		NewLoginUIProtocol(c.G()),
 	}
-	if err := RegisterProtocols(protocols); err != nil {
+	if err := RegisterProtocolsWithContext(protocols, c.G()); err != nil {
 		return nil, err
 	}
 	return cli, nil
@@ -76,11 +76,9 @@ func (c *CmdStress) Run() error {
 
 	var wg sync.WaitGroup
 	for i := 0; i < c.numUsers; i++ {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			c.simulate(username, passphrase)
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -116,7 +114,7 @@ func (c *CmdStress) signup(cli *rpc.Client) (username, passphrase string, err er
 	}
 	c.passphrase = hex.EncodeToString(buf)
 
-	G.Log.Info("username: %q, email: %q, passphrase: %q", username, email, c.passphrase)
+	c.G().Log.Info("username: %q, email: %q, passphrase: %q", username, email, c.passphrase)
 
 	scli := keybase1.SignupClient{Cli: cli}
 	res, err := scli.Signup(context.TODO(), keybase1.SignupArg{
@@ -129,7 +127,7 @@ func (c *CmdStress) signup(cli *rpc.Client) (username, passphrase string, err er
 	if err != nil {
 		return "", "", err
 	}
-	G.Log.Info("signup res: %+v", res)
+	c.G().Log.Info("signup res: %+v", res)
 	return
 }
 
@@ -143,14 +141,14 @@ func (c *CmdStress) simulate(username, passphrase string) {
 		c.status,
 		c.trackSomeone,
 	}
-	for i := 0; i < 10; i++ {
-		f := funcs[libkb.RandIntn(len(funcs))]
+	for range 10 {
+		f := funcs[libkb.RandIntn(len(funcs))] //nolint:gosec // G602: RandIntn returns value in [0, n) via modulo, array access is safe
 		f()
 	}
 
 	// now add logout to the mix
 	funcs = append(funcs, c.logout)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		f := funcs[libkb.RandIntn(len(funcs))]
 		f()
 	}
@@ -159,33 +157,33 @@ func (c *CmdStress) simulate(username, passphrase string) {
 func (c *CmdStress) idSelf() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	icli := keybase1.IdentifyClient{Cli: cli}
-	_, err = icli.Identify(context.TODO(), keybase1.IdentifyArg{})
+	_, err = icli.Identify2(context.TODO(), keybase1.Identify2Arg{})
 	if err != nil {
-		G.Log.Warning("id self error: %s", err)
+		c.G().Log.Warning("id self error: %s", err)
 	}
 }
 
 func (c *CmdStress) idAlice() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	icli := keybase1.IdentifyClient{Cli: cli}
-	_, err = icli.Identify(context.TODO(), keybase1.IdentifyArg{UserAssertion: "t_alice"})
+	_, err = icli.Identify2(context.TODO(), keybase1.Identify2Arg{UserAssertion: "t_alice"})
 	if err != nil {
-		G.Log.Warning("id t_alice error: %s", err)
+		c.G().Log.Warning("id t_alice error: %s", err)
 	}
 }
 
 func (c *CmdStress) trackSomeone() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 
@@ -194,73 +192,72 @@ func (c *CmdStress) trackSomeone() {
 
 	tcli := keybase1.TrackClient{Cli: cli}
 	options := keybase1.TrackOptions{LocalOnly: false, BypassConfirm: true}
-	err = tcli.Track(context.TODO(), keybase1.TrackArg{UserAssertion: username, Options: options})
+	_, err = tcli.Track(context.TODO(), keybase1.TrackArg{UserAssertion: username, Options: options})
 	if err != nil {
-		G.Log.Warning("follow %s error: %s", username, err)
-
+		c.G().Log.Warning("follow %s error: %s", username, err)
 	}
 	if libkb.RandIntn(2) == 0 {
 		return
 	}
 	err = tcli.Untrack(context.TODO(), keybase1.UntrackArg{Username: username})
 	if err != nil {
-		G.Log.Warning("unfollow %s error: %s", username, err)
+		c.G().Log.Warning("unfollow %s error: %s", username, err)
 	}
 }
 
 func (c *CmdStress) listTrackers() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	ucli := keybase1.UserClient{Cli: cli}
-	_, err = ucli.ListTrackers2(context.TODO(), keybase1.ListTrackers2Arg{})
+	_, err = ucli.ListTrackersUnverified(context.TODO(), keybase1.ListTrackersUnverifiedArg{})
 	if err != nil {
-		G.Log.Warning("list followers error: %s", err)
+		c.G().Log.Warning("list followers error: %s", err)
 	}
 }
 
 func (c *CmdStress) listTracking() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	ucli := keybase1.UserClient{Cli: cli}
 	_, err = ucli.ListTracking(context.TODO(), keybase1.ListTrackingArg{})
 	if err != nil {
-		G.Log.Warning("list following error: %s", err)
+		c.G().Log.Warning("list following error: %s", err)
 	}
 }
 
 func (c *CmdStress) deviceList() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	dcli := keybase1.DeviceClient{Cli: cli}
 	_, err = dcli.DeviceList(context.TODO(), 0)
 	if err != nil {
-		G.Log.Warning("device list error: %s", err)
+		c.G().Log.Warning("device list error: %s", err)
 	}
 }
 
 func (c *CmdStress) status() {
 	cli, err := c.rpcClient()
 	if err != nil {
-		G.Log.Warning("rpcClient error: %s", err)
+		c.G().Log.Warning("rpcClient error: %s", err)
 		return
 	}
 	ccli := keybase1.ConfigClient{Cli: cli}
 	currentStatus, err := ccli.GetCurrentStatus(context.TODO(), 0)
 	if err != nil {
-		G.Log.Warning("status error: %s", err)
+		c.G().Log.Warning("status error: %s", err)
 		return
 	}
 	if !currentStatus.LoggedIn {
-		G.Log.Warning("Not logged in.")
+		c.G().Log.Warning("Not logged in.")
 		return
 	}
 	myUID := currentStatus.User.Uid
@@ -268,19 +265,19 @@ func (c *CmdStress) status() {
 	ucli := keybase1.UserClient{Cli: cli}
 	_, err = ucli.LoadUser(context.TODO(), keybase1.LoadUserArg{Uid: myUID})
 	if err != nil {
-		G.Log.Warning("load user error: %s", err)
+		c.G().Log.Warning("load user error: %s", err)
 	}
 }
 
 func (c *CmdStress) logout() {
-	cli, err := GetLoginClient(G)
+	cli, err := GetLoginClient(c.G())
 	if err != nil {
-		G.Log.Warning("GetLoginClient error: %s", err)
+		c.G().Log.Warning("GetLoginClient error: %s", err)
 		return
 	}
-	err = cli.Logout(context.TODO(), 0)
+	err = cli.Logout(context.TODO(), keybase1.LogoutArg{})
 	if err != nil {
-		G.Log.Warning("Logout error: %s", err)
+		c.G().Log.Warning("Logout error: %s", err)
 		return
 	}
 }
@@ -292,13 +289,20 @@ func (c *CmdStress) gpgUIProtocol() rpc.Protocol {
 func (c *CmdStress) SelectKey(_ context.Context, arg keybase1.SelectKeyArg) (string, error) {
 	return "", nil
 }
+
 func (c *CmdStress) SelectKeyAndPushOption(_ context.Context, arg keybase1.SelectKeyAndPushOptionArg) (res keybase1.SelectKeyRes, err error) {
 	return
 }
+
 func (c *CmdStress) WantToAddGPGKey(_ context.Context, _ int) (bool, error) {
 	return false, nil
 }
+
 func (c *CmdStress) ConfirmDuplicateKeyChosen(_ context.Context, _ int) (bool, error) {
+	return false, nil
+}
+
+func (c *CmdStress) ConfirmImportSecretToExistingKey(_ context.Context, _ int) (bool, error) {
 	return false, nil
 }
 
@@ -309,9 +313,11 @@ func (c *CmdStress) secretUIProtocol() rpc.Protocol {
 func (c *CmdStress) GetPassphrase(_ context.Context, arg keybase1.GetPassphraseArg) (res keybase1.GetPassphraseRes, err error) {
 	return
 }
+
 func (c *CmdStress) Sign(_ context.Context, arg keybase1.SignArg) (string, error) {
 	return "", nil
 }
+
 func (c *CmdStress) GetTTY(_ context.Context) (string, error) {
 	return "", nil
 }

@@ -1,0 +1,21 @@
+import Menubar from './index.desktop'
+import loadRemoteComponent from '../desktop/remote/component-loader.desktop'
+import type {Props} from './index.desktop'
+
+// This is to keep that arrow and gap on top w/ transparency
+const style = {
+  borderTopLeftRadius: 4,
+  borderTopRightRadius: 4,
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  marginTop: 0,
+  position: 'relative',
+} as const
+
+loadRemoteComponent<Props>({
+  Component: Menubar,
+  component: 'menubar',
+  showOnProps: false,
+  style,
+})

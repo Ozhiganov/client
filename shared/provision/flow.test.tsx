@@ -1,0 +1,584 @@
+/** @jest-environment jsdom */
+/// <reference types="jest" />
+import * as T from '@/constants/types'
+import {resetAllStores} from '@/util/zustand'
+import {fakeError, installFakeEngine, type FakeEngine} from '@/test/fake-engine'
+import {settle as settleTimers, tick} from '@/test/flush'
+import {installNavigation, makeRootState, type InstalledNavigation} from '@/test/navigation'
+
+import {
+  cancelProvision,
+  pauseProvision,
+  startAddNewDevice,
+  submitProvisionDeviceName,
+  submitProvisionDeviceSelect,
+  submitProvisionPassphrase,
+  submitProvisionTextCode,
+  submitProvisionUsername,
+  startProvision,
+} from './flow'
+
+const login = 'keybase.1.login.login'
+const deviceAdd = 'keybase.1.device.deviceAdd'
+const bootstrap = 'keybase.1.config.getBootstrapStatus'
+const deviceName = 'keybase.1.provisionUi.PromptNewDeviceName'
+const chooseDevice = 'keybase.1.provisionUi.chooseDevice'
+const getPassphrase = 'keybase.1.secretUi.getPassphrase'
+const secret = 'keybase.1.provisionUi.DisplayAndPromptSecret'
+const inputCanceled = {code: T.RPCGen.StatusCode.scinputcanceled, desc: 'Input canceled'}
+
+let nav: InstalledNavigation
+let fake: FakeEngine
+
+// Provisioning runs from a modal, so the tree starts with one open under the username screen the
+// attempt is submitted from: clearModals only has something to remove when a modal is on screen.
+const openModal = 'deviceAdd'
+
+beforeEach(() => {
+  // The flow navigates from its own async work, as in the app, not from inside act(); test/flush
+  // pulls in testing-library, which would otherwise make this an act environment.
+  ;(globalThis as {IS_REACT_ACT_ENVIRONMENT?: boolean}).IS_REACT_ACT_ENVIRONMENT = false
+  nav = installNavigation({
+    rootState: makeRootState({above: [{name: openModal}, {name: 'username', params: {username: 'testuser'}}]}),
+  })
+  fake = installFakeEngine()
+})
+
+afterEach(() => {
+  cancelProvision()
+  resetAllStores()
+})
+
+// What the flow asked for: each push or replace it dispatched.
+const navigations = () =>
+  nav.actions
+    .filter(a => a.type === 'PUSH' || a.type === 'REPLACE')
+    .map(a => ({name: a.payload?.['name'], params: a.payload?.['params'], replace: a.type === 'REPLACE'}))
+// The root stack's screens, from the library's state.
+const rootNames = () => nav.getRootState()?.routes?.map(r => r.name)
+const modalsCleared = () => !rootNames()?.includes(openModal)
+
+// What the service sent crosses IPC, the listener hands incoming calls to their handlers on a timer,
+// and a flow reading a dialog's events sees its end on another
+const settle = async () => settleTimers(2)
+
+const makeRpcDevice = (name: string, deviceID: string, type: 'mobile' | 'desktop' | 'backup') => ({
+  deviceID,
+  deviceNumberOfType: 1,
+  name,
+  type,
+})
+
+// Every login attempt is held until the test replies to it, like the real RPC waiting on prompts
+const startLogin = async () => {
+  const held = fake.hold(login)
+  // A login that returns reads the session again
+  fake.hold(bootstrap)
+  submitProvisionUsername('testuser')
+  await tick()
+  return held
+}
+const loginCalls = () => fake.calls.filter(c => c.method === login)
+const sessionOf = (attempt: number) => loginCalls()[attempt]!.params.sessionID as number
+
+// Resolves with what the GUI answered; settle() lets the flow see it first
+const push = async (method: string, params: object, attempt: number) =>
+  fake.push(method, params, {sessionID: sessionOf(attempt)})
+const pushDeviceName = async (attempt: number, errorMessage = '') =>
+  push(deviceName, {errorMessage, existingDevices: []}, attempt)
+const pushPassword = async (attempt: number) =>
+  push(getPassphrase, {pinentry: {retryLabel: '', type: T.RPCGen.PassphraseType.passPhrase}}, attempt)
+
+test('startProvision navigates to the username screen', () => {
+  startProvision('alice', true)
+  expect(navigations()).toContainEqual({
+    name: 'username',
+    params: {fromReset: true, username: 'alice'},
+    replace: false,
+  })
+})
+
+describe('login', () => {
+  test('chooseDevice navigates with the devices and the selection answers once; a second tap starts over', async () => {
+    const held = await startLogin()
+    expect(held).toHaveLength(1)
+
+    const answered = push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 0)
+    await settle()
+
+    expect(navigations()).toContainEqual({
+      name: 'selectOtherDevice',
+      params: {
+        devices: [
+          expect.objectContaining({id: T.Devices.stringToDeviceID('device-1'), name: 'phone', type: 'mobile'}),
+        ],
+        username: 'testuser',
+      },
+      replace: false,
+    })
+
+    submitProvisionDeviceSelect('phone')
+    await expect(answered).resolves.toEqual({result: T.Devices.stringToDeviceID('device-1')})
+
+    // Nothing is waiting on a selection any more, so this records it and runs the login again
+    submitProvisionDeviceSelect('phone')
+    await settle()
+    expect(held).toHaveLength(2)
+    // The device prompt of the new attempt is answered from the record, without a screen
+    nav.clearActions()
+    const replayed = push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 1)
+    await expect(replayed).resolves.toEqual({result: T.Devices.stringToDeviceID('device-1')})
+    expect(nav.actions).toEqual([])
+    held[1]!.reply(undefined)
+    await settle()
+  })
+
+  test('changing an earlier answer restarts the RPC and replays the recorded answers in order', async () => {
+    const held = await startLogin()
+
+    // first attempt: the user names the device and picks the other device, then gets the password screen
+    const name1 = push(deviceName, {errorMessage: '', existingDevices: []}, 0)
+    await settle()
+    expect(navigations()).toContainEqual({
+      name: 'setPublicName',
+      params: {devices: [], error: undefined},
+      replace: false,
+    })
+    submitProvisionDeviceName('dev1')
+    await expect(name1).resolves.toEqual({result: 'dev1'})
+
+    const choose1 = push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 0)
+    await settle()
+    submitProvisionDeviceSelect('phone')
+    await expect(choose1).resolves.toEqual({result: T.Devices.stringToDeviceID('device-1')})
+
+    const password = pushPassword(0)
+    await settle()
+    expect(navigations()).toContainEqual({
+      name: 'password',
+      params: {error: undefined, username: 'testuser'},
+      replace: false,
+    })
+
+    // the user goes back and submits a different device name: the pending password prompt is
+    // refused and the RPC starts over
+    submitProvisionDeviceName('dev2')
+    await expect(password).resolves.toEqual({error: inputCanceled})
+    await settle()
+    expect(held).toHaveLength(2)
+
+    // the new attempt answers the device name with the new answer without showing it; the answers
+    // after the changed step are dropped, so the device choice is shown again
+    nav.clearActions()
+    await expect(pushDeviceName(1)).resolves.toEqual({result: 'dev2'})
+    expect(nav.actions).toEqual([])
+    void push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 1)
+    await settle()
+    expect(navigations()).toEqual([
+      {name: 'selectOtherDevice', params: {devices: [expect.objectContaining({name: 'phone'})], username: 'testuser'}, replace: false},
+    ])
+    held[1]!.reply(undefined)
+    await settle()
+    // the login returned: the session is read again
+    expect(fake.calls.filter(c => c.method === bootstrap)).toHaveLength(1)
+  })
+
+  test('a later step resubmitted replays every earlier answer in order, then answers it', async () => {
+    const held = await startLogin()
+    const name1 = pushDeviceName(0)
+    await settle()
+    submitProvisionDeviceName('dev1')
+    await expect(name1).resolves.toEqual({result: 'dev1'})
+    const choose1 = push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 0)
+    await settle()
+    submitProvisionDeviceSelect('phone')
+    await expect(choose1).resolves.toEqual({result: T.Devices.stringToDeviceID('device-1')})
+    const password1 = pushPassword(0)
+    await settle()
+    submitProvisionPassphrase('wrong')
+    await expect(password1).resolves.toEqual({result: {passphrase: 'wrong', storeSecret: false}})
+
+    // the service is slow; the user backs out and submits the password screen again
+    pauseProvision()
+    await settle()
+    submitProvisionPassphrase('hunter2')
+    await settle()
+    expect(held).toHaveLength(2)
+
+    nav.clearActions()
+    await expect(pushDeviceName(1)).resolves.toEqual({result: 'dev1'})
+    await expect(
+      push(chooseDevice, {devices: [makeRpcDevice('phone', 'device-1', 'mobile')]}, 1)
+    ).resolves.toEqual({result: T.Devices.stringToDeviceID('device-1')})
+    await expect(pushPassword(1)).resolves.toEqual({result: {passphrase: 'hunter2', storeSecret: false}})
+    expect(nav.actions).toEqual([])
+    held[1]!.reply(undefined)
+    await settle()
+  })
+
+  // The error retry doesn't move past the replayed step, so the recorded answer is sent again
+  test('a replayed step the service asks again with an error is answered again from the record', async () => {
+    const held = await startLogin()
+    const name1 = pushDeviceName(0)
+    await settle()
+    submitProvisionDeviceName('dev1')
+    await name1
+    // a later step is changed, so the attempt starts over with the device name recorded
+    submitProvisionPassphrase('hunter2')
+    await settle()
+    expect(held).toHaveLength(2)
+
+    await expect(pushDeviceName(1)).resolves.toEqual({result: 'dev1'})
+    nav.clearActions()
+    await expect(pushDeviceName(1, 'name taken')).resolves.toEqual({result: 'dev1'})
+    expect(nav.actions).toEqual([])
+  })
+
+  test('pause during server work cancels the attempt and parks the run', async () => {
+    const held = await startLogin()
+
+    // no prompt pending: the service is mid-work (or hung)
+    pauseProvision()
+    await settle()
+
+    // parked: no restart, no error navigation
+    expect(held).toHaveLength(1)
+    expect(navigations()).toEqual([])
+  })
+
+  test('resubmit while parked restarts and replays the recorded answers', async () => {
+    const held = await startLogin()
+
+    // answer the device-name prompt, then the service hangs before the next prompt
+    const name1 = pushDeviceName(0)
+    await settle()
+    submitProvisionDeviceName('dev1')
+    await expect(name1).resolves.toEqual({result: 'dev1'})
+
+    pauseProvision()
+    await settle()
+    expect(held).toHaveLength(1)
+
+    // user resubmits from the (still-mounted) device name screen
+    submitProvisionDeviceName('dev2')
+    await settle()
+    expect(held).toHaveLength(2)
+
+    // the new attempt answers with the replayed answer without navigating
+    nav.clearActions()
+    await expect(pushDeviceName(1)).resolves.toEqual({result: 'dev2'})
+    expect(nav.actions).toEqual([])
+
+    held[1]!.reply(undefined)
+    await settle()
+  })
+
+  test('cancel while parked tears the run down', async () => {
+    const held = await startLogin()
+    pauseProvision()
+    await settle()
+
+    cancelProvision()
+    await settle()
+
+    // dead run: submits are no-ops, nothing restarts, no error screen
+    submitProvisionDeviceName('dev1')
+    submitProvisionPassphrase('hunter2')
+    await settle()
+    expect(held).toHaveLength(1)
+    expect(navigations()).toEqual([])
+  })
+
+  test('cancel with a prompt open refuses it and ends the run', async () => {
+    const held = await startLogin()
+    const password = pushPassword(0)
+    await settle()
+
+    cancelProvision()
+    await expect(password).resolves.toEqual({error: inputCanceled})
+    // the service's next prompt on that session is refused too
+    await expect(pushPassword(0)).resolves.toEqual({error: inputCanceled})
+
+    submitProvisionPassphrase('hunter2')
+    await settle()
+    expect(held).toHaveLength(1)
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scinputcanceled, 'Input canceled'))
+    await settle()
+    expect(navigations()).toEqual([{name: 'password', params: {error: undefined, username: 'testuser'}, replace: false}])
+  })
+
+  test('a prompt arriving after pause is refused and does not navigate', async () => {
+    await startLogin()
+
+    pauseProvision()
+    await settle()
+
+    nav.clearActions()
+    await expect(pushPassword(0)).resolves.toEqual({error: inputCanceled})
+    expect(nav.actions).toEqual([])
+  })
+
+  test('pause with a pending prompt still resumes when the same step is resubmitted', async () => {
+    const held = await startLogin()
+
+    // the service prompts for a device name and the user is looking at it (unanswered) when they
+    // back out mid-prompt
+    const name1 = pushDeviceName(0)
+    await settle()
+
+    pauseProvision()
+    await expect(name1).resolves.toEqual({error: inputCanceled})
+    await settle()
+    expect(held).toHaveLength(1)
+
+    // user resubmits the same step that was pending at pause time
+    submitProvisionDeviceName('dev1')
+    await settle()
+    expect(held).toHaveLength(2)
+
+    // the new attempt answers with the replayed answer without navigating
+    nav.clearActions()
+    await expect(pushDeviceName(1)).resolves.toEqual({result: 'dev1'})
+    expect(nav.actions).toEqual([])
+
+    held[1]!.reply(undefined)
+    await settle()
+  })
+
+  test('a new username starts a new run and the old one is refused', async () => {
+    const held = await startLogin()
+    const password = pushPassword(0)
+    await settle()
+
+    submitProvisionUsername('testuser2')
+    await expect(password).resolves.toEqual({error: inputCanceled})
+    await settle()
+    expect(held).toHaveLength(2)
+    expect(loginCalls()[1]!.params.username).toBe('testuser2')
+
+    // the old run is over: its own end shows nothing and the new run owns the screens
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scinputcanceled, 'Input canceled'))
+    await settle()
+    nav.clearActions()
+    const password2 = pushPassword(1)
+    await settle()
+    expect(navigations()).toEqual([{name: 'password', params: {error: undefined, username: 'testuser2'}, replace: false}])
+    submitProvisionPassphrase('hunter2')
+    await expect(password2).resolves.toEqual({result: {passphrase: 'hunter2', storeSecret: false}})
+  })
+
+  test('the service cancelling the secret prompt, then the provisionee success, ends the login', async () => {
+    const held = await startLogin()
+    const shown = push(secret, {phrase: 'one two three', previousErr: ''}, 0)
+    await settle()
+    expect(navigations()).toContainEqual(expect.objectContaining({name: 'codePage', replace: false}))
+
+    // the other device entered the code: the service stops asking this one
+    fake.cancelPush(secret)
+    await expect(shown).resolves.toEqual({
+      error: {code: T.RPCGen.StatusCode.sccanceled, desc: 'fake engine: the service cancelled it'},
+    })
+    await settle()
+    await push('keybase.1.provisionUi.ProvisioneeSuccess', {deviceName: 'dev1', username: 'testuser'}, 0)
+    await settle()
+
+    // a code typed in the meantime goes nowhere and starts nothing over
+    submitProvisionTextCode('one two three')
+    await settle()
+    expect(held).toHaveLength(1)
+
+    held[0]!.reply(undefined)
+    await settle()
+    expect(fake.calls.filter(c => c.method === bootstrap)).toHaveLength(1)
+    expect(navigations().filter(n => n.name === 'error')).toEqual([])
+  })
+
+  test('the gpg and email prompts are refused, once each', async () => {
+    await startLogin()
+    for (const method of [
+      'keybase.1.gpgUi.selectKey',
+      'keybase.1.loginUi.getEmailOrUsername',
+      'keybase.1.provisionUi.chooseGPGMethod',
+      'keybase.1.provisionUi.switchToGPGSignOK',
+    ]) {
+      await expect(push(method, {}, 0)).resolves.toEqual({error: inputCanceled})
+    }
+    expect(navigations()).toEqual([])
+  })
+
+  test('the reset prompt during login is answered nothing, once', async () => {
+    await startLogin()
+    await expect(
+      push('keybase.1.loginUi.promptResetAccount', {prompt: {t: T.RPCGen.ResetPromptType.enterNoDevices}}, 0)
+    ).resolves.toEqual({result: T.RPCGen.ResetPromptResponse.nothing})
+    expect(navigations()).toEqual([])
+  })
+
+  test('the primary paper key notice and the success notices show nothing', async () => {
+    await startLogin()
+    await push('keybase.1.loginUi.displayPrimaryPaperKey', {phrase: 'a b c'}, 0)
+    await push('keybase.1.provisionUi.ProvisionerSuccess', {deviceName: 'dev1', deviceType: 'mobile'}, 0)
+    expect(navigations()).toEqual([])
+  })
+})
+
+describe('add device', () => {
+  const startAdd = async (otherDeviceType: 'desktop' | 'mobile' = 'mobile') => {
+    startAddNewDevice(otherDeviceType)
+    await tick()
+  }
+  const addSession = (attempt: number) =>
+    fake.calls.filter(c => c.method === deviceAdd)[attempt]!.params.sessionID as number
+  const pushAdd = async (method: string, params: object, attempt: number) =>
+    fake.push(method, params, {sessionID: addSession(attempt)})
+
+  test('the device type is answered from the button the user picked', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd('desktop')
+    await expect(
+      pushAdd('keybase.1.provisionUi.chooseDeviceType', {kind: T.RPCGen.ChooseType.newDevice}, 0)
+    ).resolves.toEqual({result: T.RPCGen.DeviceType.desktop})
+    held[0]!.reply(undefined)
+    await settle()
+
+    await startAdd('mobile')
+    await expect(
+      pushAdd('keybase.1.provisionUi.chooseDeviceType', {kind: T.RPCGen.ChooseType.newDevice}, 1)
+    ).resolves.toEqual({result: T.RPCGen.DeviceType.mobile})
+    held[1]!.reply(undefined)
+    await settle()
+  })
+
+  test('the secret prompt shows the code page and the typed code answers it, normalized', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+    const answered = pushAdd(secret, {phrase: 'one two three', previousErr: ''}, 0)
+    await settle()
+    expect(navigations()).toEqual([
+      {
+        name: 'codePage',
+        params: {error: undefined, otherDevice: expect.objectContaining({name: '', type: 'mobile'}), textCode: 'one two three'},
+        replace: false,
+      },
+    ])
+    submitProvisionTextCode('  one,two\n\nthree  ')
+    await expect(answered).resolves.toEqual({result: {phrase: 'one two three', secret: null}})
+
+    await pushAdd('keybase.1.provisionUi.ProvisionerSuccess', {deviceName: 'phone', deviceType: 'mobile'}, 0)
+    held[0]!.reply(undefined)
+    await settle()
+    expect(modalsCleared()).toBe(true)
+  })
+
+  test('a previous error replaces the code page', async () => {
+    fake.hold(deviceAdd)
+    await startAdd()
+    void pushAdd(secret, {phrase: 'four five six', previousErr: 'nope'}, 0)
+    await settle()
+    expect(navigations()).toEqual([
+      expect.objectContaining({name: 'codePage', params: expect.objectContaining({error: 'nope'}), replace: true}),
+    ])
+  })
+
+  test('a cancelled add-device run does not clear modals out from under a retry', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+    const answered1 = pushAdd(secret, {phrase: 'one two three', previousErr: ''}, 0)
+    await settle()
+    expect(navigations()).toContainEqual(expect.objectContaining({name: 'codePage', replace: false}))
+
+    // the user cancels, then tries again: the dead run must not clear modals or eat the new run's UI
+    startAddNewDevice('mobile')
+    await expect(answered1).resolves.toEqual({error: inputCanceled})
+    await settle()
+    expect(modalsCleared()).toBe(false)
+    expect(held).toHaveLength(2)
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scinputcanceled, 'Input canceled'))
+    await settle()
+    expect(modalsCleared()).toBe(false)
+
+    nav.clearActions()
+    const answered2 = pushAdd(secret, {phrase: 'four five six', previousErr: ''}, 1)
+    await settle()
+    expect(navigations()).toContainEqual(expect.objectContaining({name: 'codePage', replace: false}))
+    submitProvisionTextCode('four five six')
+    await expect(answered2).resolves.toEqual({result: {phrase: 'four five six', secret: null}})
+
+    held[1]!.reply(undefined)
+    await settle()
+    // the successful run still clears modals when it finishes
+    expect(modalsCleared()).toBe(true)
+  })
+
+  test('cancel before any prompt kills the RPC at its first prompt', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+
+    // user cancels while the service is still working, before any prompt
+    cancelProvision()
+
+    await expect(pushAdd(secret, {phrase: 'one two three', previousErr: ''}, 0)).resolves.toEqual({
+      error: inputCanceled,
+    })
+    expect(navigations()).toEqual([])
+
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scinputcanceled, 'Input canceled'))
+    await settle()
+    expect(modalsCleared()).toBe(false)
+  })
+
+  test('pause is a full cancel', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+    const answered = pushAdd(secret, {phrase: 'one two three', previousErr: ''}, 0)
+    await settle()
+
+    pauseProvision()
+    await expect(answered).resolves.toEqual({error: inputCanceled})
+    // nothing to resume: a code submitted now answers nothing
+    submitProvisionTextCode('one two three')
+    await settle()
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scinputcanceled, 'Input canceled'))
+    await settle()
+    expect(held).toHaveLength(1)
+    expect(modalsCleared()).toBe(false)
+  })
+
+  test('a failure clears modals and shows nothing else', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+    held[0]!.reply(fakeError(T.RPCGen.StatusCode.scgeneric, 'kex failed'))
+    await settle()
+    expect(modalsCleared()).toBe(true)
+    expect(rootNames()).toEqual(['loggedIn'])
+    expect(navigations()).toEqual([])
+  })
+
+  test('the service cancelling the secret prompt, then the provisioner success, closes the modals', async () => {
+    const held = fake.hold(deviceAdd)
+    await startAdd()
+    const shown = pushAdd(secret, {phrase: 'one two three', previousErr: ''}, 0)
+    await settle()
+    fake.cancelPush(secret)
+    await shown
+    await settle()
+    await pushAdd('keybase.1.provisionUi.ProvisionerSuccess', {deviceName: 'phone', deviceType: 'mobile'}, 0)
+    submitProvisionTextCode('one two three')
+    held[0]!.reply(undefined)
+    await settle()
+    expect(modalsCleared()).toBe(true)
+  })
+
+  test('starting add-device ends a running login', async () => {
+    const held = await startLogin()
+    const password = pushPassword(0)
+    await settle()
+    fake.hold(deviceAdd)
+    await startAdd()
+    await expect(password).resolves.toEqual({error: inputCanceled})
+    // its submits now reach nothing
+    submitProvisionPassphrase('hunter2')
+    await settle()
+    expect(held).toHaveLength(1)
+  })
+})

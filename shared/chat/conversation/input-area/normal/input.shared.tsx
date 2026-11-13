@@ -1,0 +1,64 @@
+import type * as React from 'react'
+import type * as T from '@/constants/types'
+import type * as Styles from '@/styles'
+import type {TextType} from '@/common-adapters/text.shared'
+import type {TextInputProps} from 'react-native'
+import type {MeasureRef} from '@/common-adapters/measure-ref'
+import type {ComposerInput} from '../composer'
+
+export type Selection = {
+  start: number
+  end?: number
+}
+
+export type RefType = ComposerInput & {
+  blur: () => void
+  // desktop: the text field itself, for popups placed against it
+  anchor?: MeasureRef | null
+}
+
+export type TextInfo = {
+  text: string
+  selection?: Selection
+}
+
+export type Props = {
+  allowKeyboardEvents?: boolean
+  disabled?: boolean
+  autoFocus?: boolean
+  autoCorrect?: boolean
+  onBlur?: TextInputProps['onBlur']
+  onFocus?: TextInputProps['onFocus']
+  onSelectionChange?: TextInputProps['onSelectionChange']
+  autoCapitalize?: TextInputProps['autoCapitalize']
+  onKeyDown?: (e: React.KeyboardEvent) => void
+  placeholder?: string
+  className?: string
+  ref?: React.Ref<RefType | null>
+  textType?: TextType
+  style?: Styles.StylesCrossPlatform
+  onChangeText?: (value: string) => void
+  onPasteImage?: (uris: Array<string>) => void
+  multiline?: boolean
+  rowsMin?: number
+  rowsMax?: number
+  padding?: keyof typeof Styles.globalMargins | 0
+}
+
+export type PlatformInputProps = {
+  cannotWrite: boolean
+  explodingModeSeconds: number
+  setExplodingMode: (mode: number) => void
+  hintText: string
+  // attaches the input to the composer, which is what everything else asks about it
+  setInputRef: (r: RefType | null) => void
+  isEditing: boolean
+  isExploding: boolean
+  minWriterRole: T.Teams.TeamRoleType
+  onCancelEditing: () => void
+  onChangeText: (newText: string) => void
+  // true when it sent: false for an empty composer, or where the user can't post
+  onSubmit: () => boolean
+  showReplyPreview: boolean
+  suggestionOverlayStyle: Styles.StylesCrossPlatform
+}

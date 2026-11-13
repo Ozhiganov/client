@@ -1,0 +1,92 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import {makePhoneError} from '@/stores/settings-phone'
+import * as PhoneUtil from '@/util/phone-numbers'
+import {useSafeNavigation} from '@/util/safe-navigation'
+
+type OwnProps = {
+  address: string
+  searchable: boolean
+  type: 'email' | 'phone'
+  lastEmail?: boolean
+}
+
+const DeleteModal = (props: OwnProps) => {
+  const nav = useSafeNavigation()
+  const itemAddress = props.address
+  const itemType = props.type
+  const itemSearchable = props.searchable
+  const lastEmail = props.lastEmail ?? false
+
+  const onCancel = () => nav.safeNavigateUp()
+  const deletePhoneNumber = C.useRPC(T.RPCGen.phoneNumbersDeletePhoneNumberRpcPromise)
+  const deleteEmail = C.useRPC(T.RPCGen.emailsDeleteEmailRpcPromise)
+  const [error, setError] = React.useState('')
+  const onConfirm = () => {
+    if (itemType === 'phone') {
+      setError('')
+      deletePhoneNumber(
+        [{phoneNumber: itemAddress}],
+        () => {
+          nav.safeNavigateUp()
+        },
+        error_ => {
+          logger.warn('Error deleting phone number', error_)
+          setError(makePhoneError(error_))
+        }
+      )
+    } else {
+      deleteEmail(
+        [{email: itemAddress}],
+        () => {},
+        error_ => {
+          logger.warn('Error deleting email', error_)
+        }
+      )
+      nav.safeNavigateUp()
+    }
+  }
+
+  const icon =
+    itemType === 'email'
+      ? isMobile
+        ? 'icon-email-remove-96'
+        : 'icon-email-remove-64'
+      : isMobile
+        ? 'icon-phone-number-remove-96'
+        : 'icon-phone-number-remove-64'
+
+  const prompt = `Delete ${itemType === 'email' ? props.address : PhoneUtil.e164ToDisplay(props.address)}?`
+
+  const description = [
+    ...(lastEmail
+      ? [
+          `Since you'll have deleted all email addresses, you won't get email notifications from Keybase anymore.`,
+        ]
+      : []),
+    ...(itemSearchable
+      ? [
+          `Your friends will no longer be able to find you by this ${
+            props.type === 'email' ? 'email address' : 'number'
+          }.`,
+        ]
+      : []),
+  ].join(' ')
+
+  return (
+    <Kb.ConfirmModal
+      icon={icon}
+      prompt={prompt}
+      description={description}
+      error={error}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      confirmText="Yes, delete"
+    />
+  )
+}
+
+export default DeleteModal

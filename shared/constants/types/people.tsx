@@ -1,0 +1,59 @@
+import type * as RPCTypes from '@/constants/rpc/rpc-gen'
+import type {IconType} from '@/common-adapters/icon.constants-gen'
+
+export type TodoTypeEnum = RPCTypes.HomeScreenTodoType
+export type TodoType = keyof typeof RPCTypes.HomeScreenTodoType
+
+type TodoMetaEmail = {
+  type: 'email'
+  email: string
+  lastVerifyEmailDate: number // unix time in seconds
+}
+type TodoMetaPhone = {type: 'phone'; phone: string}
+
+export type TodoMeta = TodoMetaEmail | TodoMetaPhone | undefined
+
+type Todo = {
+  type: 'todo'
+  badged: boolean
+  todoType: TodoType
+  instructions: string
+  confirmLabel: string
+  dismissable: boolean
+  icon: IconType
+  metadata: TodoMeta
+}
+
+export type FollowedNotification = {
+  contactDescription?: string
+  username: string
+}
+
+export type FollowedNotificationItem = {
+  type: 'follow' | 'contact'
+  newFollows: ReadonlyArray<FollowedNotification>
+  notificationTime: Date
+  badged: boolean
+  numAdditional?: number
+}
+
+type Announcement = {
+  appLink?: RPCTypes.AppLinkType
+  badged: boolean
+  confirmLabel?: string
+  dismissable: boolean
+  id: RPCTypes.HomeScreenAnnouncementID
+  iconUrl?: string
+  text: string
+  type: 'announcement'
+  url?: string
+}
+
+export type PeopleScreenItem = Todo | FollowedNotificationItem | Announcement
+
+export type FollowSuggestion = {
+  followsMe: boolean
+  fullName?: string
+  iFollow: boolean
+  username: string
+}

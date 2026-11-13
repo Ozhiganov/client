@@ -1,0 +1,59 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+
+const TeamsFooter = (props: {empty: boolean}) => {
+  const styles = useStyles()
+  const isLoadingTeams = C.Waiting.useAnyWaiting(C.waitingKeyTeamsLoaded)
+  // only show the spinner when there's nothing to look at yet; background
+  // refreshes with teams loaded shouldn't flash the footer
+  const showSpinner = isLoadingTeams && props.empty
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} centerChildren={true} style={styles.container}>
+      {showSpinner ? (
+        <Kb.ProgressIndicator type="Large" />
+      ) : (
+        <>
+          {props.empty && (
+            <Kb.Box2
+              direction="vertical"
+              alignItems="center"
+              justifyContent="center"
+              gap="tiny"
+              style={styles.empty}
+            >
+              <Kb.ImageIcon type="icon-dark-empty-lone-wolf-116-96" />
+              <Kb.Text type="BodySmall">You are not a part of any team, lone wolf.</Kb.Text>
+            </Kb.Box2>
+          )}
+          <Kb.Box2 direction="vertical" flex={1} />
+          {(isMobile || !props.empty) && (
+            <Kb.Text type="BodySmall" center={true}>
+              Keybase team chats are encrypted – unlike Slack – and work for any size group, from casual
+              friends to large communities.
+            </Kb.Text>
+          )}
+        </>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  container: Kb.Styles.platformStyles({
+    isElectron: Kb.Styles.padding(Kb.Styles.globalMargins.large),
+    isMobile: {
+      ...Kb.Styles.padding(
+        Kb.Styles.globalMargins.medium,
+        Kb.Styles.globalMargins.small,
+        Kb.Styles.globalMargins.small
+      ),
+      flex: 1,
+    },
+  }),
+  empty: Kb.Styles.platformStyles({
+    isElectron: {paddingTop: 80},
+    isMobile: {flex: 1, paddingBottom: Kb.Styles.globalMargins.small},
+  }),
+}))
+
+export default TeamsFooter

@@ -4,45 +4,40 @@ set -e -u -o pipefail # Fail on error
 
 dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 cd "$dir"
+# shellcheck source=packaging/lib.sh
+source "$dir/../lib.sh"
 
 build_dir=${BUILD_DIR:-/tmp/keybase}
-gopath=${GOPATH:-}
 
-kbfs_dir="$gopath/src/github.com/keybase/kbfs"
+kbfs_dir="$CLIENT_DIR/go/kbfs"
 cd "$kbfs_dir"
 
 mkdir -p "$build_dir"
 
-current_date=`date -u +%Y%m%d%H%M%S` # UTC
-commit_short=`git log -1 --pretty=format:%h`
-build="$current_date+$commit_short"
-kbfs_build=${KBFS_BUILD:-$build}
+kbfs_build=${KBFS_BUILD:-$(kb_build_id)}
 tags=${TAGS:-"prerelease production"}
-ldflags="-X github.com/keybase/kbfs/libkbfs.PrereleaseBuild=$kbfs_build"
-pkg="github.com/keybase/kbfs/kbfsfuse"
+ldflags="-X github.com/keybase/client/go/kbfs/libkbfs.PrereleaseBuild=$kbfs_build -s -w"
+pkg="github.com/keybase/client/go/kbfs/kbfsfuse"
+git_remote_helper_pkg="github.com/keybase/client/go/kbfs/kbfsgit/git-remote-keybase"
+redirector_pkg="github.com/keybase/client/go/kbfs/redirector"
+arch=${ARCH:-"amd64"}
 
-if [ "$PLATFORM" = "darwin" ]; then
-  # To get codesign to work you have to use -ldflags "-s ...", see https://github.com/golang/go/issues/11887
-  ldflags="-s $ldflags"
-elif [ "$PLATFORM" = "windows" ]; then
-  pkg="github.com/keybase/kbfs/kbfsdokan"
+if [ "$PLATFORM" = "windows" ]; then
+  pkg="github.com/keybase/client/go/kbfs/kbfsdokan"
 fi
 
-echo "Building $build_dir/kbfs ($kbfs_build)"
-go build -a -tags "$tags" -ldflags "$ldflags" -o "$build_dir/kbfs" $pkg
+echo "Building $build_dir/kbfs ($kbfs_build) with $(go version) on arch: $arch"
+GOARCH="$arch" go build -tags "$tags" -ldflags "$ldflags" -o "$build_dir/kbfs" $pkg
 
-if [ "$PLATFORM" = "darwin" ]; then
-  echo "Signing binary..."
-  code_sign_identity="Developer ID Application: Keybase, Inc. (99229SGT5K)"
-  codesign --verbose --force --deep --sign "$code_sign_identity" $build_dir/kbfs
-elif [ "$PLATFORM" = "linux" ]; then
-  echo "No codesigning for linux"
-elif [ "$PLATFORM" = "windows" ]; then
-  echo "No codesigning for windows"
-else
-  echo "Invalid PLATFORM"
-  exit 1
+echo "Building $build_dir/kbfs/kbfsgit ($kbfs_build) with $(go version) on arch: $arch"
+GOARCH="$arch" go build -tags "$tags" -ldflags "$ldflags" -o "$build_dir/git-remote-keybase" $git_remote_helper_pkg
+
+echo "Building $build_dir/kbfs/redirector ($kbfs_build) with $(go version) on arch: $arch"
+GOARCH="$arch" go build -tags "$tags" -ldflags "$ldflags" -o "$build_dir/keybase-redirector" $redirector_pkg
+
+kb_sign_binary "$build_dir/kbfs" "$build_dir/git-remote-keybase" "$build_dir/keybase-redirector"
+
+if [ ! "$PLATFORM" = "darwin-arm64" ]; then # we can't run the arm64 binary on the amd64 build machine!
+  kbfs_version=$("$build_dir"/kbfs -version)
+  echo "KBFS version: $kbfs_version"
 fi
-
-kbfs_version=`"$build_dir"/kbfs -version`
-echo "KBFS version: $kbfs_version"

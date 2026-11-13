@@ -1,0 +1,708 @@
+// Copyright 2016 Keybase Inc. All rights reserved.
+// Use of this source code is governed by a BSD
+// license that can be found in the LICENSE file.
+
+package libkbfs
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/keybase/client/go/kbfs/env"
+	"github.com/keybase/client/go/kbfs/idutil"
+	"github.com/keybase/client/go/kbfs/kbfscrypto"
+	"github.com/keybase/client/go/kbfs/test/clocktest"
+	"github.com/keybase/client/go/kbfs/tlf"
+	kbname "github.com/keybase/client/go/kbun"
+	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/go-framed-msgpack-rpc/rpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+)
+
+// If we cancel the RPC before the RPC returns, the call should error quickly.
+func TestKeybaseDaemonRPCIdentifyCanceled(t *testing.T) {
+	serverConn, conn := rpc.MakeConnectionForTest(t)
+	daemon := newKeybaseDaemonRPCWithClient(
+		nil,
+		conn.GetClient(),
+		logger.NewTestLogger(t))
+
+	f := func(ctx context.Context) error {
+		_, _, err := daemon.Identify(
+			ctx, "", "", keybase1.OfflineAvailability_NONE)
+		return err
+	}
+	testRPCWithCanceledContext(t, serverConn, f)
+}
+
+// If we cancel the RPC before the RPC returns, the call should error quickly.
+func TestKeybaseDaemonRPCGetCurrentSessionCanceled(t *testing.T) {
+	serverConn, conn := rpc.MakeConnectionForTest(t)
+	daemon := newKeybaseDaemonRPCWithClient(
+		nil,
+		conn.GetClient(),
+		logger.NewTestLogger(t))
+
+	f := func(ctx context.Context) error {
+		_, err := daemon.CurrentSession(ctx, 0)
+		return err
+	}
+	testRPCWithCanceledContext(t, serverConn, f)
+}
+
+// NewKeybaseDaemonRPC gates the additional protocols (SimpleFS/git/fs) on
+// init, since the service can call them as soon as the connection is up.
+func TestKeybaseDaemonRPCGatesAdditionalProtocolsOnInit(t *testing.T) {
+	config := MakeTestConfigOrBust(t, "testuser")
+	origKBFSOps := config.KBFSOps()
+	initDoneCh := make(chan struct{})
+	kbfsOps := NewKBFSOpsStandard(env.EmptyAppStateUpdater{}, config, initDoneCh)
+	config.SetKBFSOps(kbfsOps)
+	defer func() {
+		config.SetKBFSOps(origKBFSOps)
+		require.NoError(t, kbfsOps.Shutdown(context.Background()))
+		CheckConfigAndShutdown(context.Background(), t, config)
+	}()
+
+	var calls int
+	daemon := NewKeybaseDaemonRPC(
+		config, newInitTestContext(t), logger.NewTestLogger(t), false,
+		[]rpc.Protocol{newGatedTestProtocol(&calls)})
+	defer daemon.Shutdown()
+	var handler func(context.Context, any) (any, error)
+	daemon.lock.Lock()
+	for _, p := range daemon.protocols {
+		if p.Name == "gatedTest" {
+			handler = p.Methods["method"].Handler
+		}
+	}
+	daemon.lock.Unlock()
+	require.NotNil(t, handler)
+
+	// Init still running: the request waits, and the handler doesn't run.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := handler(ctx, nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Zero(t, calls)
+
+	// Init becoming ready mid-wait lets the request through, without the
+	// rest of init having finished.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		kbfsOps.initReady()
+	}()
+	readyCtx, readyCancel := context.WithTimeout(
+		context.Background(), 5*time.Second)
+	defer readyCancel()
+	_, err = handler(readyCtx, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+}
+
+// TODO: Add tests for Favorite* methods, too.
+
+type fakeKeybaseClient struct {
+	session                     idutil.SessionInfo
+	users                       map[keybase1.UID]idutil.UserInfo
+	currentSessionCalled        bool
+	identifyCalled              bool
+	loadUserPlusKeysCalled      bool
+	loadAllPublicKeysUnverified bool
+	editResponse                keybase1.FSEditListArg
+	// currentSessionGate, when set, blocks currentSession until it is
+	// closed. Tests use it to hold a session RPC across login.
+	currentSessionGate chan struct{}
+}
+
+var _ rpc.GenericClient = (*fakeKeybaseClient)(nil)
+
+func (c *fakeKeybaseClient) Call(ctx context.Context, s string, args any,
+	res any, _ time.Duration,
+) error {
+	return c.call(ctx, s, args, res)
+}
+
+func (c *fakeKeybaseClient) CallCompressed(ctx context.Context, s string, args any,
+	res any, _ rpc.CompressionType, _ time.Duration,
+) error {
+	return c.call(ctx, s, args, res)
+}
+
+func (c *fakeKeybaseClient) call(ctx context.Context, s string, args any, res any) error {
+	switch s {
+	case "keybase.1.session.currentSession":
+		if c.currentSessionGate != nil {
+			select {
+			case <-c.currentSessionGate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		username := string(c.session.Name)
+		if username == "" {
+			username = "fake username"
+		}
+		*res.(*keybase1.Session) = keybase1.Session{
+			Uid:             c.session.UID,
+			Username:        username,
+			DeviceSubkeyKid: c.session.CryptPublicKey.KID(),
+			DeviceSibkeyKid: c.session.VerifyingKey.KID(),
+		}
+
+		c.currentSessionCalled = true
+		return nil
+
+	case "keybase.1.identify.identifyLite":
+		arg := args.([]any)[0].(keybase1.IdentifyLiteArg)
+		uidStr := strings.TrimPrefix(arg.Assertion, "uid:")
+		if len(uidStr) == len(arg.Assertion) {
+			return fmt.Errorf("Non-uid assertion %s", arg.Assertion)
+		}
+
+		uid := keybase1.UID(uidStr)
+		userInfo, ok := c.users[uid]
+		if !ok {
+			return fmt.Errorf("Could not find user info for UID %s", uid)
+		}
+
+		*res.(*keybase1.IdentifyLiteRes) = keybase1.IdentifyLiteRes{
+			Ul: keybase1.UserOrTeamLite{
+				Id:   uid.AsUserOrTeam(),
+				Name: string(userInfo.Name),
+			},
+		}
+
+		c.identifyCalled = true
+		return nil
+
+	case "keybase.1.user.loadUserPlusKeysV2":
+		arg := args.([]any)[0].(keybase1.LoadUserPlusKeysV2Arg)
+
+		userInfo, ok := c.users[arg.Uid]
+		if !ok {
+			return fmt.Errorf("Could not find user info for UID %s", arg.Uid)
+		}
+
+		*res.(*keybase1.UserPlusKeysV2AllIncarnations) = keybase1.UserPlusKeysV2AllIncarnations{
+			Current: keybase1.UserPlusKeysV2{
+				Uid:      arg.Uid,
+				Username: string(userInfo.Name),
+			},
+		}
+
+		c.loadUserPlusKeysCalled = true
+		return nil
+
+	case "keybase.1.user.loadAllPublicKeysUnverified":
+		pk := keybase1.PublicKey{
+			KID: kbfscrypto.MakeFakeVerifyingKeyOrBust("foo").KID(),
+		}
+		*res.(*[]keybase1.PublicKey) = []keybase1.PublicKey{pk}
+
+		c.loadAllPublicKeysUnverified = true
+		return nil
+
+	case "keybase.1.kbfs.FSEditList":
+		c.editResponse = args.([]any)[0].(keybase1.FSEditListArg)
+		return nil
+
+	default:
+		return fmt.Errorf("Unknown call: %s %v %v", s, args, res)
+	}
+}
+
+func (c *fakeKeybaseClient) Notify(_ context.Context, s string, args any, timeout time.Duration) error {
+	return fmt.Errorf("Unknown notify: %s %v", s, args)
+}
+
+const (
+	expectCall   = true
+	expectCached = false
+)
+
+func testCurrentSession(
+	t *testing.T, client *fakeKeybaseClient, c *KeybaseDaemonRPC,
+	expectedSession idutil.SessionInfo, expectedCalled bool,
+) {
+	client.currentSessionCalled = false
+
+	ctx := context.Background()
+	sessionID := 0
+	session, err := c.CurrentSession(ctx, sessionID)
+	require.NoError(t, err)
+
+	assert.Equal(t, expectedSession, session)
+	assert.Equal(t, expectedCalled, client.currentSessionCalled)
+}
+
+// Test that the session cache works and is invalidated as expected.
+func TestKeybaseDaemonSessionCache(t *testing.T) {
+	name := kbname.NormalizedUsername("fake username")
+	k := idutil.MakeLocalUserCryptPublicKeyOrBust(name)
+	v := idutil.MakeLocalUserVerifyingKeyOrBust(name)
+	session := idutil.SessionInfo{
+		Name:           name,
+		UID:            keybase1.MakeTestUID(1),
+		CryptPublicKey: k,
+		VerifyingKey:   v,
+	}
+
+	client := &fakeKeybaseClient{session: session}
+	c := newKeybaseDaemonRPCWithClient(
+		nil, client, logger.NewTestLogger(t))
+
+	// Should fill cache.
+	testCurrentSession(t, client, c, session, expectCall)
+
+	// Should be cached.
+	testCurrentSession(t, client, c, session, expectCached)
+
+	// Should invalidate cache.
+	err := c.LoggedOut(context.Background())
+	require.NoError(t, err)
+
+	// Should fill cache again.
+	testCurrentSession(t, client, c, session, expectCall)
+
+	// Should be cached again.
+	testCurrentSession(t, client, c, session, expectCached)
+
+	// Should invalidate cache.
+	c.OnDisconnected(context.Background(), rpc.UsingExistingConnection)
+
+	// Should fill cache again.
+	testCurrentSession(t, client, c, session, expectCall)
+}
+
+func testLoadUserPlusKeys(
+	t *testing.T, client *fakeKeybaseClient, c *KeybaseDaemonRPC,
+	uid keybase1.UID, expectedName kbname.NormalizedUsername,
+	expectedCalled bool,
+) {
+	client.loadUserPlusKeysCalled = false
+
+	ctx := context.Background()
+	info, err := c.LoadUserPlusKeys(
+		ctx, uid, "", keybase1.OfflineAvailability_NONE)
+	require.NoError(t, err)
+
+	assert.Equal(t, expectedName, info.Name)
+	assert.Equal(t, expectedCalled, client.loadUserPlusKeysCalled)
+}
+
+func testIdentify(
+	t *testing.T, client *fakeKeybaseClient, c *KeybaseDaemonRPC,
+	uid keybase1.UID, expectedName kbname.NormalizedUsername,
+	expectedCalled bool,
+) {
+	client.identifyCalled = false
+
+	ctx := context.Background()
+	name, _, err := c.Identify(
+		ctx, "uid:"+string(uid), "", keybase1.OfflineAvailability_NONE)
+	require.NoError(t, err)
+
+	assert.Equal(t, expectedName, name)
+	assert.Equal(t, expectedCalled, client.identifyCalled)
+}
+
+// Test that the user cache works and is invalidated as expected.
+func TestKeybaseDaemonUserCache(t *testing.T) {
+	uid1 := keybase1.MakeTestUID(1)
+	uid2 := keybase1.MakeTestUID(2)
+	name1 := kbname.NewNormalizedUsername("name1")
+	name2 := kbname.NewNormalizedUsername("name2")
+	users := map[keybase1.UID]idutil.UserInfo{
+		uid1: {Name: name1},
+		uid2: {Name: name2},
+	}
+	client := &fakeKeybaseClient{users: users}
+	c := newKeybaseDaemonRPCWithClient(
+		nil, client, logger.NewTestLogger(t))
+
+	// Should fill cache.
+	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCall)
+
+	// Should be cached.
+	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCached)
+
+	// IdentifyLite doesn't fill the cache.
+	testIdentify(t, client, c, uid2, name2, expectCall)
+
+	// Shouldn't be cached yet after just an identify.
+	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCall)
+
+	// Should be cached.
+	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCached)
+
+	// Should not be cached.
+	testIdentify(t, client, c, uid2, name2, expectCall)
+
+	// Should invalidate cache for uid1.
+	err := c.KeyfamilyChanged(context.Background(), uid1)
+	require.NoError(t, err)
+
+	// Should fill cache again.
+	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCall)
+
+	// Should be cached again.
+	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCached)
+
+	// Should invalidate cache for uid2.
+	err = c.KeyfamilyChanged(context.Background(), uid2)
+	require.NoError(t, err)
+
+	// Should fill cache again.
+	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCall)
+
+	// Should be cached again.
+	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCached)
+
+	// Should invalidate cache for all users.
+	c.OnDisconnected(context.Background(), rpc.UsingExistingConnection)
+
+	// Should fill cache again.
+	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCall)
+	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCall)
+
+	// Test that CheckForRekey gets called only if the logged-in user
+	// changes.
+	session := idutil.SessionInfo{
+		UID: uid1,
+	}
+	c.setCachedCurrentSession(session)
+	ctr := NewSafeTestReporter(t)
+	mockCtrl := gomock.NewController(ctr)
+	config := NewConfigMock(mockCtrl, ctr)
+	c.config = config
+	defer func() {
+		config.ctr.CheckForFailures()
+		mockCtrl.Finish()
+	}()
+	errChan := make(chan error, 1)
+	config.mockMdserv.EXPECT().CheckForRekeys(gomock.Any()).Do(
+		func(ctx context.Context) {
+			errChan <- nil
+		}).Return(errChan)
+	err = c.KeyfamilyChanged(context.Background(), uid1)
+	require.NoError(t, err)
+	<-errChan
+	// This one shouldn't trigger CheckForRekeys; if it does, the mock
+	// controller will catch it during Finish.
+	err = c.KeyfamilyChanged(context.Background(), uid2)
+	require.NoError(t, err)
+}
+
+func TestKeybaseDaemonRPCEditList(t *testing.T) {
+	var userName1, userName2 kbname.NormalizedUsername = "u1", "u2"
+	config1, _, ctx, cancel := kbfsOpsConcurInit(t, userName1, userName2)
+	defer kbfsConcurTestShutdown(ctx, t, config1, cancel)
+	// kbfsOpsConcurInit turns off notifications, so turn them back on.
+	config1.SetMode(modeTest{NewInitModeFromType(InitDefault)})
+
+	clock, first := clocktest.NewTestClockAndTimeNow()
+	config1.SetClock(clock)
+
+	config2 := ConfigAsUser(config1, userName2)
+	defer CheckConfigAndShutdown(ctx, t, config2)
+
+	name := userName1.String() + "," + userName2.String()
+
+	rootNode1 := GetRootNodeOrBust(ctx, t, config1, name, tlf.Private)
+	rootNode2 := GetRootNodeOrBust(ctx, t, config2, name, tlf.Private)
+
+	// user 1 creates a file
+	kbfsOps1 := config1.KBFSOps()
+	_, _, err := kbfsOps1.CreateFile(
+		ctx, rootNode1, testPPS("a"), false, NoExcl)
+	require.NoError(t, err)
+	err = kbfsOps1.SyncAll(ctx, rootNode1.GetFolderBranch())
+	require.NoError(t, err)
+
+	kbfsOps2 := config2.KBFSOps()
+	err = kbfsOps2.SyncFromServer(ctx, rootNode2.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	clock.Add(1 * time.Minute)
+	second := clock.Now()
+
+	_, _, err = kbfsOps2.CreateFile(ctx, rootNode2, testPPS("b"), false, NoExcl)
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	err = kbfsOps2.SyncFromServer(ctx, rootNode2.GetFolderBranch(), nil)
+	require.NoError(t, err)
+	err = kbfsOps1.SyncFromServer(ctx, rootNode1.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	session1, err := config1.KBPKI().GetCurrentSession(context.Background())
+	require.NoError(t, err)
+	uid1 := session1.UID
+	session2, err := config2.KBPKI().GetCurrentSession(context.Background())
+	require.NoError(t, err)
+	uid2 := session2.UID
+
+	// We should see 1 create edit for each user.
+	expectedHistory := keybase1.FSFolderEditHistory{
+		Folder: keybase1.Folder{
+			Name:       name,
+			FolderType: keybase1.FolderType_PRIVATE,
+			Private:    true,
+		},
+		ServerTime: keybase1.ToTime(second),
+		History: []keybase1.FSFolderWriterEditHistory{
+			{
+				WriterName: "u2",
+				Edits: []keybase1.FSFolderWriterEdit{{
+					Filename:         "/keybase/private/u1,u2/b",
+					NotificationType: keybase1.FSNotificationType_FILE_MODIFIED,
+					ServerTime:       keybase1.ToTime(second),
+				}},
+				Deletes: []keybase1.FSFolderWriterEdit{},
+			},
+			{
+				WriterName: "u1",
+				Edits: []keybase1.FSFolderWriterEdit{{
+					Filename:         "/keybase/private/u1,u2/a",
+					NotificationType: keybase1.FSNotificationType_FILE_MODIFIED,
+					ServerTime:       keybase1.ToTime(first),
+				}},
+				Deletes: []keybase1.FSFolderWriterEdit{},
+			},
+		},
+	}
+
+	users := map[keybase1.UID]idutil.UserInfo{
+		uid1: {Name: userName1},
+		uid2: {Name: userName2},
+	}
+	client1 := &fakeKeybaseClient{users: users}
+	c1 := newKeybaseDaemonRPCWithClient(
+		nil, client1, logger.NewTestLogger(t))
+	c1.config = config1
+
+	reqID := 10
+	err = c1.FSEditListRequest(ctx, keybase1.FSEditListRequest{
+		Folder:    keybase1.Folder{Name: name, Private: true},
+		RequestID: reqID,
+	})
+	require.NoError(t, err)
+	history := client1.editResponse.Edits
+	require.Equal(t, expectedHistory, history)
+}
+
+func TestUnflushedEditUser(t *testing.T) {
+	atk := keybase1.MakeTestUID(1)
+	vic := keybase1.MakeTestUID(2)
+	require.Equal(t, "atk", unflushedEditUser(atk, "atk", atk))
+	require.Empty(t, unflushedEditUser(vic, "vic", atk))
+	require.Empty(t, unflushedEditUser(keybase1.UID(""), "atk", atk))
+	require.Empty(t, unflushedEditUser(atk, "", atk))
+	require.Empty(t, unflushedEditUser(atk, "atk", keybase1.UID("")))
+}
+
+func journalCurrentUID(j *JournalManager) keybase1.UID {
+	j.lock.RLock()
+	defer j.lock.RUnlock()
+	return j.currentUID
+}
+
+// Login must not enable the new user's journals while logout is still
+// waiting for the previous user's dirty sync. That overlap panics in
+// the edit history and rejects the in-flight block puts.
+func TestLoggedInWaitsForLoggedOut(t *testing.T) {
+	tempdir, ctx, cancel, config, _, jManager := setupJournalManagerTest(t)
+	defer teardownJournalManagerTest(ctx, t, tempdir, cancel, config)
+
+	user1 := keybase1.MakeTestUID(1)
+	user2Name := kbname.NormalizedUsername("test_user2")
+	user2 := keybase1.MakeTestUID(2)
+	require.Equal(t, user1, journalCurrentUID(jManager))
+
+	tlfID := tlf.FakeID(2, tlf.Private)
+	jManager.dirtyOpStart(tlfID)
+
+	daemon := newKeybaseDaemonRPCWithClient(
+		nil,
+		&fakeKeybaseClient{session: idutil.SessionInfo{
+			Name:           user2Name,
+			UID:            user2,
+			CryptPublicKey: idutil.MakeLocalUserCryptPublicKeyOrBust(user2Name),
+			VerifyingKey:   idutil.MakeLocalUserVerifyingKeyOrBust(user2Name),
+		}},
+		logger.NewTestLogger(t))
+	daemon.config = config
+
+	logoutErr := make(chan error, 1)
+	go func() {
+		logoutErr <- daemon.LoggedOut(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		daemon.sessionTransitionLock.Lock()
+		defer daemon.sessionTransitionLock.Unlock()
+		return daemon.sessionPhase == sessionLoggingOut
+	}, 5*time.Second, 5*time.Millisecond)
+
+	// The in-flight sync's session read must not enable the new user's
+	// journals or refresh auth while logout is still waiting.
+	session, err := daemon.CurrentSession(ctx, 0)
+	require.NoError(t, err)
+	require.Equal(t, user2, session.UID)
+	require.Equal(t, user2Name, session.Name)
+	require.Equal(t, user1, journalCurrentUID(jManager))
+	daemon.sessionTransitionLock.Lock()
+	phase := daemon.sessionPhase
+	daemon.sessionTransitionLock.Unlock()
+	require.Equal(t, sessionLoggingOut, phase)
+
+	loginErr := make(chan error, 1)
+	go func() {
+		loginErr <- daemon.LoggedIn(ctx, keybase1.LoggedInArg{
+			Username: string(user2Name),
+			SignedUp: true,
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		daemon.sessionTransitionLock.Lock()
+		defer daemon.sessionTransitionLock.Unlock()
+		return daemon.sessionPhaseWaiters > 0
+	}, 5*time.Second, 5*time.Millisecond)
+	require.Equal(t, user1, journalCurrentUID(jManager))
+	select {
+	case err := <-loginErr:
+		require.NoError(t, err)
+		t.Fatal("LoggedIn finished while logout was still waiting on a dirty sync")
+	default:
+	}
+
+	jManager.dirtyOpEnd(tlfID)
+
+	select {
+	case err := <-logoutErr:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case err := <-loginErr:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.Equal(t, user2, journalCurrentUID(jManager))
+}
+
+// A session RPC that started during logout can finish after login has
+// taken the phase. That call must not run the logged-in flow; LoggedIn
+// owns it until serviceLoggedIn returns.
+func TestCurrentSessionDuringLoginDoesNotEnableJournals(t *testing.T) {
+	tempdir, ctx, cancel, config, _, jManager := setupJournalManagerTest(t)
+	defer teardownJournalManagerTest(ctx, t, tempdir, cancel, config)
+
+	user1 := keybase1.MakeTestUID(1)
+	user2Name := kbname.NormalizedUsername("test_user2")
+	user2 := keybase1.MakeTestUID(2)
+	require.Equal(t, user1, journalCurrentUID(jManager))
+
+	tlfID := tlf.FakeID(2, tlf.Private)
+	jManager.dirtyOpStart(tlfID)
+
+	releaseSession := make(chan struct{})
+	daemon := newKeybaseDaemonRPCWithClient(
+		nil,
+		&fakeKeybaseClient{
+			session: idutil.SessionInfo{
+				Name:           user2Name,
+				UID:            user2,
+				CryptPublicKey: idutil.MakeLocalUserCryptPublicKeyOrBust(user2Name),
+				VerifyingKey:   idutil.MakeLocalUserVerifyingKeyOrBust(user2Name),
+			},
+			currentSessionGate: releaseSession,
+		},
+		logger.NewTestLogger(t))
+	daemon.config = config
+
+	logoutErr := make(chan error, 1)
+	go func() {
+		logoutErr <- daemon.LoggedOut(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		daemon.sessionTransitionLock.Lock()
+		defer daemon.sessionTransitionLock.Unlock()
+		return daemon.sessionPhase == sessionLoggingOut
+	}, 5*time.Second, 5*time.Millisecond)
+
+	sessionErr := make(chan error, 1)
+	go func() {
+		_, err := daemon.CurrentSession(ctx, 0)
+		sessionErr <- err
+	}()
+	require.Eventually(t, func() bool {
+		daemon.sessionCacheLock.Lock()
+		defer daemon.sessionCacheLock.Unlock()
+		return daemon.sessionInProgressCh != nil
+	}, 5*time.Second, 5*time.Millisecond)
+
+	loginErr := make(chan error, 1)
+	go func() {
+		loginErr <- daemon.LoggedIn(ctx, keybase1.LoggedInArg{
+			Username: string(user2Name),
+			SignedUp: true,
+		})
+	}()
+	require.Eventually(t, func() bool {
+		daemon.sessionTransitionLock.Lock()
+		defer daemon.sessionTransitionLock.Unlock()
+		return daemon.sessionPhaseWaiters > 0
+	}, 5*time.Second, 5*time.Millisecond)
+
+	jManager.dirtyOpEnd(tlfID)
+	require.Eventually(t, func() bool {
+		daemon.sessionTransitionLock.Lock()
+		defer daemon.sessionTransitionLock.Unlock()
+		return daemon.sessionPhase == sessionLoggingIn
+	}, 5*time.Second, 5*time.Millisecond)
+
+	// Hold the journal lock so LoggedIn's serviceLoggedIn cannot
+	// install the new UID before the assertion. Logout has already
+	// cleared it. CurrentSession itself must return without taking
+	// that lock.
+	jManager.lock.Lock()
+	close(releaseSession)
+	var sessionCallErr error
+	select {
+	case sessionCallErr = <-sessionErr:
+	case <-time.After(5 * time.Second):
+		jManager.lock.Unlock()
+		t.Fatal("CurrentSession during login ran the logged-in flow")
+	}
+	uid := jManager.currentUID
+	jManager.lock.Unlock()
+	require.NoError(t, sessionCallErr)
+	require.Equal(t, keybase1.UID(""), uid)
+
+	select {
+	case err := <-logoutErr:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case err := <-loginErr:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.Equal(t, user2, journalCurrentUID(jManager))
+}

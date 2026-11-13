@@ -1,0 +1,283 @@
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import {useFsDownloadIntent, useFsPathItem, useFsTlfs} from './hooks'
+import * as FS from '@/constants/fs'
+
+export type Size = 96 | 48 | 32 | 16
+type SizeString = '96' | '48' | '32' | '16'
+
+const getIconSizeString = (size: Size): SizeString => {
+  switch (size) {
+    case 16:
+      return '16'
+    case 32:
+      return '32'
+    case 48:
+      return '48'
+    case 96:
+      return '96'
+  }
+}
+
+const icons = {
+  file: {
+    '16': 'icon-file-16',
+    '32': 'icon-file-32',
+    '48': 'icon-file-48',
+    '96': 'icon-file-96',
+  },
+  folder: {
+    '16': 'icon-folder-16',
+    '32': 'icon-folder-32',
+    '48': 'icon-folder-48',
+    '96': 'icon-folder-64', // TODO: use 96 when we have it
+  },
+  tlfList: {
+    private: {
+      '16': 'icon-folder-private-16',
+      '32': 'icon-folder-private-32',
+      '48': 'icon-folder-private-48',
+      '96': 'icon-folder-private-64', // TODO: use 96 when we have it
+    },
+    public: {
+      '16': 'icon-folder-public-16',
+      '32': 'icon-folder-public-32',
+      '48': 'icon-folder-public-48',
+      '96': 'icon-folder-public-64', // TODO: use 96 when we have it
+    },
+    team: {
+      '16': 'icon-folder-team-16',
+      '32': 'icon-folder-team-32',
+      '48': 'icon-folder-team-48',
+      '96': 'icon-folder-team-64', // TODO: use 96 when we have it
+    },
+  },
+} as const
+
+export type TlfTypeIconProps = {
+  size: Size
+  style: Kb.Styles.StylesCrossPlatform
+  tlfType: T.FS.TlfType
+}
+
+const getTlfTypeIcon = (size: Size, tlfType: T.FS.TlfType) => {
+  switch (tlfType) {
+    case T.FS.TlfType.Private:
+      return <Kb.ImageIcon type={icons.tlfList.private[getIconSizeString(size)]} />
+    case T.FS.TlfType.Public:
+      return <Kb.ImageIcon type={icons.tlfList.public[getIconSizeString(size)]} />
+    case T.FS.TlfType.Team:
+      return <Kb.ImageIcon type={icons.tlfList.team[getIconSizeString(size)]} />
+  }
+}
+
+const TlfTypeIcon = (props: TlfTypeIconProps) => {
+  const styles = useStyles()
+  const tlfs = useFsTlfs()
+  const tlfList = FS.getTlfListFromType(tlfs, props.tlfType)
+  const badgeCount = FS.computeBadgeNumberForTlfList(tlfList)
+  const badgeStyle = badgeStyles[getIconSizeString(props.size)]
+  return (
+    <Kb.Box2 direction="vertical" style={props.style}>
+      {getTlfTypeIcon(props.size, props.tlfType)}
+      {!!badgeCount && (
+        <Kb.Box2 alignSelf="center" direction="vertical" relative={true} style={styles.badgeContainer}>
+          <Kb.Badge badgeNumber={badgeCount} badgeStyle={badgeStyle.numberBadge} />
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+}
+
+type TlfIconProps = {
+  size: Size
+  style?: Kb.Styles.StylesCrossPlatform
+  tlfTypeForFolderIconOverride?: T.FS.TlfType
+}
+
+const TlfIcon = (props: TlfIconProps) => {
+  return (
+    <Kb.Box2 direction="vertical" style={props.style}>
+      {props.tlfTypeForFolderIconOverride ? (
+        getTlfTypeIcon(props.size, props.tlfTypeForFolderIconOverride)
+      ) : (
+        <Kb.ImageIcon type={icons.folder[getIconSizeString(props.size)]} />
+      )}
+    </Kb.Box2>
+  )
+}
+
+type InTlfItemIconProps = {
+  loadOnMount?: boolean
+  path: T.FS.Path
+  size: Size
+  style?: Kb.Styles.StylesCrossPlatform
+  subscribe?: boolean
+  tlfTypeForFolderIconOverride?: T.FS.TlfType
+}
+
+const InTlfIcon = (props: InTlfItemIconProps) => {
+  const styles = useStyles()
+  const downloadIntent = useFsDownloadIntent(props.path)
+  const pathItem = useFsPathItem(props.path, {loadOnMount: props.loadOnMount, subscribe: props.subscribe})
+  const badgeStyle = badgeStyles[getIconSizeString(props.size)]
+  const badgeIcon = downloadIntent && 'icon-addon-file-downloading'
+  return (
+    <Kb.Box2 direction="vertical" style={props.style}>
+      {pathItem.type === T.FS.PathType.Folder ? (
+        props.tlfTypeForFolderIconOverride ? (
+          getTlfTypeIcon(props.size, props.tlfTypeForFolderIconOverride)
+        ) : (
+          <Kb.ImageIcon type={icons.folder[getIconSizeString(props.size)]} />
+        )
+      ) : (
+        <Kb.ImageIcon type={icons.file[getIconSizeString(props.size)]} />
+      )}
+      {badgeIcon ? (
+        <Kb.Box2 alignSelf="center" direction="vertical" relative={true} style={styles.badgeContainer}>
+          <Kb.ImageIcon
+            type={badgeIcon}
+            style={badgeStyle.rightBottomBadge}
+          />
+        </Kb.Box2>
+      ) : null}
+    </Kb.Box2>
+  )
+}
+
+export type ItemIconProps = {
+  loadOnMount?: boolean
+  mixedMode?: boolean
+  path: T.FS.Path
+  size: Size
+  style?: Kb.Styles.StylesCrossPlatform
+  subscribe?: boolean
+}
+
+const ItemIcon = (props: ItemIconProps) => {
+  const parsedPath = FS.parsePath(props.path)
+  switch (parsedPath.kind) {
+    case T.FS.PathKind.Root:
+      return <Kb.ImageIcon type={icons['folder'][getIconSizeString(props.size)]} />
+    case T.FS.PathKind.TlfList:
+      return (
+        <TlfTypeIcon
+          size={props.size}
+          style={props.style}
+          tlfType={parsedPath.tlfType}
+        />
+      )
+    case T.FS.PathKind.GroupTlf:
+    case T.FS.PathKind.TeamTlf:
+      return (
+        <TlfIcon
+          size={props.size}
+          style={props.style}
+          tlfTypeForFolderIconOverride={
+            props.mixedMode || parsedPath.tlfType === T.FS.TlfType.Public ? parsedPath.tlfType : undefined
+          }
+        />
+      )
+    case T.FS.PathKind.InGroupTlf:
+    case T.FS.PathKind.InTeamTlf:
+      return (
+        <InTlfIcon
+          loadOnMount={props.loadOnMount}
+          path={props.path}
+          size={props.size}
+          style={props.style}
+          subscribe={props.subscribe}
+          tlfTypeForFolderIconOverride={
+            parsedPath.tlfType === T.FS.TlfType.Public ? T.FS.TlfType.Public : undefined
+          }
+        />
+      )
+  }
+}
+
+export default ItemIcon
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      badgeContainer: {
+        // Make width/height explicit 0 so they don't affect nearby stuff.
+        ...Kb.Styles.size(0),
+      },
+    }) as const
+)
+
+const badgeStyles = {
+  '16': {
+    numberBadge: {
+      left: Kb.Styles.globalMargins.tiny + Kb.Styles.globalMargins.xxtiny,
+      position: 'absolute',
+      top: -(Kb.Styles.globalMargins.medium + Kb.Styles.globalMargins.xxtiny),
+    },
+    rightBottomBadge: Kb.Styles.platformStyles({
+      common: {
+        position: 'absolute',
+      },
+      isElectron: {
+        ...Kb.Styles.size(Kb.Styles.globalMargins.tiny),
+        left: Kb.Styles.globalMargins.xsmall - Kb.Styles.globalMargins.xxtiny,
+        top: -Kb.Styles.globalMargins.tiny,
+      },
+      isMobile: {
+        ...Kb.Styles.size(Kb.Styles.globalMargins.xsmall),
+        left: Kb.Styles.globalMargins.xsmall - Kb.Styles.globalMargins.xtiny,
+        top: -Kb.Styles.globalMargins.tiny,
+      },
+    }),
+  } as const,
+  '32': {
+    numberBadge: {
+      left: Kb.Styles.globalMargins.small + Kb.Styles.globalMargins.xtiny,
+      position: 'absolute',
+      top: -(Kb.Styles.globalMargins.mediumLarge + Kb.Styles.globalMargins.xtiny),
+    },
+    rightBottomBadge: Kb.Styles.platformStyles({
+      common: {
+        position: 'absolute',
+      },
+      isElectron: {
+        ...Kb.Styles.size(Kb.Styles.globalMargins.xsmall),
+        left: Kb.Styles.globalMargins.medium - Kb.Styles.globalMargins.xxtiny,
+        top: -(Kb.Styles.globalMargins.xsmall + Kb.Styles.globalMargins.xxtiny),
+      },
+      isMobile: {
+        ...Kb.Styles.size(Kb.Styles.globalMargins.small),
+        left: Kb.Styles.globalMargins.medium - Kb.Styles.globalMargins.xtiny,
+        top: -Kb.Styles.globalMargins.small,
+      },
+    }),
+  } as const,
+  '48': {
+    numberBadge: {
+      left: Kb.Styles.globalMargins.mediumLarge + Kb.Styles.globalMargins.xtiny,
+      position: 'absolute',
+      top: -(Kb.Styles.globalMargins.large + Kb.Styles.globalMargins.tiny),
+    },
+    rightBottomBadge: {
+      ...Kb.Styles.size(Kb.Styles.globalMargins.small),
+      left: Kb.Styles.globalMargins.mediumLarge - Kb.Styles.globalMargins.xxtiny,
+      position: 'absolute',
+      top: -Kb.Styles.globalMargins.small - Kb.Styles.globalMargins.xtiny,
+    },
+  } as const,
+  '96': {
+    numberBadge: {
+      left: Kb.Styles.globalMargins.large + Kb.Styles.globalMargins.tiny,
+      position: 'absolute',
+      top: -(Kb.Styles.globalMargins.large + Kb.Styles.globalMargins.small),
+    },
+    rightBottomBadge: {
+      // this doesn't work for the folder icon, but it's fine as we don't
+      // have such badge on folder icon of 96 size.
+      ...Kb.Styles.size(Kb.Styles.globalMargins.medium),
+      left: Kb.Styles.globalMargins.xlarge,
+      position: 'absolute',
+      top: -(Kb.Styles.globalMargins.medium + Kb.Styles.globalMargins.xtiny),
+    },
+  } as const,
+}

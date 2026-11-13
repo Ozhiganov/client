@@ -4,13 +4,13 @@
 package service
 
 import (
+	"context"
 	"errors"
 
 	"github.com/keybase/client/go/engine"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"golang.org/x/net/context"
 )
 
 type SecretKeysHandler struct {
@@ -20,22 +20,23 @@ type SecretKeysHandler struct {
 
 func NewSecretKeysHandler(xp rpc.Transporter, g *libkb.GlobalContext) *SecretKeysHandler {
 	return &SecretKeysHandler{
-		BaseHandler:  NewBaseHandler(xp),
+		BaseHandler:  NewBaseHandler(g, xp),
 		Contextified: libkb.NewContextified(g),
 	}
 }
 
-func (h *SecretKeysHandler) GetSecretKeys(_ context.Context, sessionID int) (keybase1.SecretKeys, error) {
+func (h *SecretKeysHandler) GetSecretKeys(ctx context.Context, sessionID int) (keybase1.SecretKeys, error) {
 	if h.G().Env.GetRunMode() == libkb.ProductionRunMode {
 		return keybase1.SecretKeys{}, errors.New("GetSecretKeys is a devel-only RPC")
 	}
-	ctx := engine.Context{
+	uis := libkb.UIs{
 		LogUI:     h.getLogUI(sessionID),
 		SecretUI:  h.getSecretUI(sessionID, h.G()),
 		SessionID: sessionID,
 	}
 	eng := engine.NewSecretKeysEngine(h.G())
-	err := engine.RunEngine(eng, &ctx)
+	m := libkb.NewMetaContext(ctx, h.G()).WithUIs(uis)
+	err := engine.RunEngine2(m, eng)
 	if err != nil {
 		return keybase1.SecretKeys{}, err
 	}

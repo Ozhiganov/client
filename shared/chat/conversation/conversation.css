@@ -1,0 +1,171 @@
+.WrapperMessage {
+  &.highlighted {
+    &,
+    &:hover,
+    &.WrapperMessage-hoverColor,
+    &.WrapperMessage-hoverColor:hover {
+      animation: highlightAnimation 0.3s ease-in forwards running;
+    }
+  }
+
+  /* Once the fade has played, swap to the static end state and drop the animation, so nothing can
+     restart it. Two things would: showing the chat tab again (it is display: none while another tab
+     is shown), and LegendList moving the row's container in the DOM to keep DOM order matching
+     visual order (it uses moveBefore, which keeps animation state, only where the browser has it). */
+  &.highlighted.highlight-settled {
+    &,
+    &:hover,
+    &.WrapperMessage-hoverColor,
+    &.WrapperMessage-hoverColor:hover {
+      animation: none;
+      background-color: var(--color-yellowOrYellowAlt);
+      border-radius: 4px;
+      box-shadow: 4px 4px 5px 1px rgb(0 0 0 / 38%);
+    }
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .WrapperMessage.highlighted .separator-text,
+  .WrapperMessage.highlighted .separator-text span {
+    color: rgba(0, 0, 0, 0.85) !important;
+  }
+
+  .WrapperMessage.highlighted:hover .explodingTimeContainer {
+    background-color: rgba(255, 255, 255, 0.85) !important;
+  }
+
+  .WrapperMessage.highlighted:hover .explodingTimeText {
+    color: rgba(0, 0, 0, 0.85) !important;
+  }
+
+  .WrapperMessage.highlighted:hover .explodingTimeIcon {
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+}
+
+@keyframes highlightAnimation {
+  from {
+    background-color: var(--color-transparent);
+    border-radius: 0px;
+    box-shadow: 0px 0px 0px 0px rgb(0 0 0 / 38%);
+  }
+  to {
+    background-color: var(--color-yellowOrYellowAlt);
+    border-radius: 4px;
+    box-shadow: 4px 4px 5px 1px rgb(0 0 0 / 38%);
+  }
+}
+
+/* LegendList 3.3.3 dropped the data-index attribute from its item containers, so target the
+   container as the div whose direct child is the WrapperMessage instead */
+.chat-message-list div:has(> .WrapperMessage-hoverBox:hover) {
+  contain: layout style !important;
+  overflow: visible !important;
+  z-index: 1;
+}
+
+.WrapperMessage-hoverBox {
+  padding: 3px 16px 3px 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  width: 100%;
+  contain: style;
+  .WrapperMessage-buttons {
+    display: none;
+    flex-direction: row;
+    justify-content: flex-end;
+    margin-left: 0;
+  }
+
+  .WrapperMessage-emojiButton {
+    transition: box-shadow 0.1s ease-out;
+  }
+
+  &:hover {
+    .WrapperMessage-emojiButton {
+      box-shadow: 0 1px 1px 0 light-dark(var(--color-black_10), transparent);
+      &.noShadow,
+      &:active {
+        box-shadow: none;
+      }
+    }
+    .WrapperMessage-newEmojiButton {
+      visibility: visible;
+    }
+    .WrapperMessage-emojiRow {
+      box-shadow: 0 1px 1px 0 rgba(0, 0, 0, 0.08);
+    }
+    .sendingStatus {
+      visibility: hidden;
+    }
+  }
+
+  .WrapperMessage-newEmojiButton {
+    visibility: hidden;
+  }
+}
+.WrapperMessage-hoverBox:hover .WrapperMessage-buttons,
+.WrapperMessage-decorated.active .WrapperMessage-buttons {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  margin-left: 0;
+}
+.WrapperMessage-hoverColor {
+  &:hover {
+    background-color: light-dark(var(--color-blueLighter2), var(--color-blueLighter3));
+  }
+}
+
+.TextAndSiblings {
+  &.noOverflow {
+    overflow: hidden;
+  }
+  &.systemMessage {
+    padding-left: 0;
+  }
+}
+
+.WrapperMessage-decorated {
+  min-height: 26px;
+  &.active {
+    background-color: light-dark(var(--color-blueLighter2), var(--color-blueLighter3));
+  }
+}
+
+.WrapperMessage-author {
+  padding-left: 0;
+  padding-top: 8px;
+}
+
+.ReplyBox {
+  &:hover {
+    background-color: light-dark(white, var(--color-blackOrBlack));
+    .text_BodySmall {
+      color: light-dark(var(--color-blackOrBlack), var(--color-whiteOrWhite)) !important;
+    }
+  }
+}
+
+.ashbox {
+  overflow: hidden;
+  transition: width 0s;
+  width: 0;
+
+  &.full-width {
+    overflow: visible;
+    transition: width 2000ms linear;
+    width: 100%;
+  }
+}
+
+.timer-icon-container {
+  &:hover,
+  &.expanded {
+    .timer-icon {
+      color: var(--color-black);
+    }
+  }
+}

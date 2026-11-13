@@ -6,6 +6,8 @@ package pvl
 import (
 	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestNamedRegsStore(t *testing.T) {
@@ -55,9 +57,9 @@ func TestNamedRegsStore(t *testing.T) {
 		var res string
 		useRes := false
 
-		fail := func(f string, args ...interface{}) {
+		fail := func(f string, args ...any) {
 			prefix := fmt.Sprintf("[%v] ", i)
-			t.Fatalf(prefix+f, args...)
+			require.FailNow(t, fmt.Sprintf(prefix+f, args...))
 		}
 
 		switch unit.op {
@@ -77,10 +79,8 @@ func TestNamedRegsStore(t *testing.T) {
 			if useRes && (res != unit.expected) {
 				fail("got '%v'; expected '%v'", res, unit.expected)
 			}
-		} else {
-			if unit.shouldwork {
-				fail("should have worked; got %v", err)
-			}
+		} else if unit.shouldwork {
+			fail("should have worked; got %v", err)
 		}
 	}
 }
@@ -89,16 +89,11 @@ func TestNamedRegsStoreCopy(t *testing.T) {
 	// Copying a store aliases its state.
 	// This should not be depended on but it's good to know.
 	regs1 := *newNamedRegsStore()
-	var regs2 namedRegsStore
-	regs2 = regs1
+	regs2 := regs1
 
 	err := regs1.Set("foo", "1")
-	if err != nil {
-		t.Fatal()
-	}
+	require.NoError(t, err, fmt.Sprint())
 
 	err = regs2.Set("foo", "1")
-	if err == nil {
-		t.Fatal()
-	}
+	require.Error(t, err, fmt.Sprint())
 }

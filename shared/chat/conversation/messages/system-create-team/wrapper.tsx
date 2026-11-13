@@ -1,0 +1,80 @@
+import * as C from '@/constants'
+import * as Teams from '@/constants/teams'
+import * as Kb from '@/common-adapters'
+import UserNotice from '../user-notice'
+import type * as T from '@/constants/types'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useChatTeam} from '../../team-hooks'
+import {makeAddMembersWizard} from '@/teams/add-members-wizard/state'
+import {useThreadMeta} from '../../thread-context'
+import {useConversationShowInfoPanel} from '../../thread-navigation'
+import {makeMessageWrapper} from '../wrapper/wrapper'
+
+type OwnProps = {message: T.Chat.MessageSystemCreateTeam}
+
+function SystemCreateTeamContainer(p: OwnProps) {
+  const {creator} = p.message
+  const {teamID, teamname} = useThreadMeta(
+    C.useShallow(m => ({teamID: m.teamID, teamname: m.teamname}))
+  )
+  const showInfoPanel = useConversationShowInfoPanel()
+  const {role} = useChatTeam(teamID, teamname)
+  const you = useCurrentUserState(s => s.username)
+  const isAdmin = Teams.isAdmin(role) || Teams.isOwner(role)
+  const team = teamname
+  const navigateAppend = C.Router2.navigateAppend
+  const onViewTeam = () => {
+    if (teamID) {
+      navigateAppend({name: 'team', params: {teamID}})
+    } else {
+      showInfoPanel(true, 'settings')
+    }
+  }
+
+  return (
+    <UserNotice>
+      <Kb.Text type="BodySmall">
+        {youOrUsername(creator, you)}created the team <Kb.Text type="BodySmallBold">{team}</Kb.Text>.
+      </Kb.Text>
+      <ManageComponent isAdmin={isAdmin} onViewTeam={onViewTeam} />
+      <AddInvite isAdmin={isAdmin} teamID={teamID} />
+    </UserNotice>
+  )
+}
+
+const ManageComponent = (props: {isAdmin: boolean; onViewTeam: () => void}) => {
+  const {isAdmin, onViewTeam} = props
+  const textType = 'BodySmallSemiboldPrimaryLink'
+  if (isAdmin) {
+    return (
+      <Kb.Text onClick={onViewTeam} type={textType}>
+        Manage team
+      </Kb.Text>
+    )
+  } else {
+    return null
+  }
+}
+const AddInvite = (props: {teamID: T.Teams.TeamID; isAdmin: boolean}) => {
+  const {teamID, isAdmin} = props
+  const navigateAppend = C.Router2.navigateAppend
+  const onAddInvite = () => {
+    if (teamID) {
+      navigateAppend({name: 'teamAddToTeamFromWhere', params: {wizard: makeAddMembersWizard(teamID)}})
+    }
+  }
+  const textType = 'BodySmallSemiboldPrimaryLink'
+  if (isAdmin) {
+    return (
+      <Kb.Text onClick={onAddInvite} type={textType}>
+        Add/invite people
+      </Kb.Text>
+    )
+  } else {
+    return null
+  }
+}
+
+const youOrUsername = (creator: string, you: string) => (creator === you ? 'You ' : '')
+
+export default makeMessageWrapper('systemCreateTeam', message => <SystemCreateTeamContainer message={message} />)

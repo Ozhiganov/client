@@ -1,0 +1,77 @@
+import type * as Styles from '@/styles'
+import {iconMeta, multsFor} from './icon.constants-gen'
+import type {IconType} from './icon.constants-gen'
+import {Image as RNImage, useColorScheme} from 'react-native'
+import {getAssetPath} from '@/constants/platform'
+
+export type ImageIconProps = {
+  type: IconType
+  style?: Styles.StylesCrossPlatform
+  className?: string
+  allowLazy?: boolean
+}
+
+const typeExtension = (type: IconType) => iconMeta[type].extension || 'png'
+const getImagesDir = (type: IconType) => iconMeta[type].imagesDir || 'icons'
+
+// Resolve dir/extension from the name being rendered, not from the light icon: a dark
+// variant is a separate asset and is free to differ.
+const makeSrcSet = (name: IconType) => {
+  const dir = getImagesDir(name)
+  const ext = typeExtension(name)
+  return multsFor(name)
+    .map(mult => `${getAssetPath('images', dir, name)}${mult > 1 ? `@${mult}x` : ''}.${ext} ${mult}x`)
+    .join(', ')
+}
+
+const pictureStyle = {display: 'contents'} as const
+const sourceStyle = {display: 'none'} as const
+
+const ImageIconDesktop = (props: ImageIconProps) => {
+  const {type, style, className, allowLazy = true} = props
+  const hasDarkVariant = !!iconMeta[type].nameDark
+
+  const srcSet = makeSrcSet(type)
+
+  const img = (
+    <img
+      loading={allowLazy ? 'lazy' : undefined}
+      draggable={false}
+      className={className}
+      style={style as React.CSSProperties}
+      srcSet={srcSet}
+    />
+  )
+
+  if (hasDarkVariant) {
+    const darkName = iconMeta[type].nameDark!
+    const darkSrcSet = makeSrcSet(darkName)
+
+    // display: contents so the img, not the picture, is the flex item its layout style targets; the
+    // source is not hidden by default, so without display: none it would be a flex item too (and take a gap)
+    return (
+      <picture style={pictureStyle}>
+        <source srcSet={darkSrcSet} media="(prefers-color-scheme: dark)" style={sourceStyle} />
+        {img}
+      </picture>
+    )
+  }
+
+  return img
+}
+
+const ImageIconNative = (props: ImageIconProps) => {
+  const {type, style} = props
+  const isDarkMode = useColorScheme() === 'dark'
+
+  let source = (isDarkMode && iconMeta[type].requireDark) || iconMeta[type].require
+  if (typeof source !== 'number') {
+    source = undefined
+  }
+  if (!source) return null
+
+  return <RNImage source={source} style={style} />
+}
+
+const ImageIcon = isMobile ? ImageIconNative : ImageIconDesktop
+export default ImageIcon

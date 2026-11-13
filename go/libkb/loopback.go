@@ -19,6 +19,7 @@ type LoopbackAddr struct{}
 // LoopbackListener is a listener that creates new loopback connections.
 // It is goroutine safe.
 type LoopbackListener struct {
+	logCtx LogContext
 
 	// Protects closing of ch so that we can close ch
 	// and set isClosed atomically.
@@ -30,7 +31,6 @@ type LoopbackListener struct {
 // LoopbackConn implments the net.Conn interface but is used to loopback
 // from a process to itself. It is goroutine safe.
 type LoopbackConn struct {
-
 	// wMutex protects isClosed and ch to protect against
 	// double-closes, and writes after close. It protects the
 	// writer, hence the 'w'.
@@ -47,8 +47,9 @@ type LoopbackConn struct {
 }
 
 // NewLoopbackListener creates a new Loopback listener
-func NewLoopbackListener() *LoopbackListener {
+func NewLoopbackListener(ctx LogContext) *LoopbackListener {
 	return &LoopbackListener{
+		logCtx:   ctx,
 		ch:       make(chan *LoopbackConn),
 		isClosed: false,
 	}
@@ -68,7 +69,7 @@ func NewLoopbackConnPair() (*LoopbackConn, *LoopbackConn) {
 // LoopbackDial dials the given LoopbackListener and yields an new net.Conn
 // that's a connection to it.
 func (ll *LoopbackListener) Dial() (net.Conn, error) {
-	G.Log.Debug("+ LoopbackListener.Dial")
+	ll.logCtx.GetLog().Debug("+ LoopbackListener.Dial")
 	ll.mutex.Lock()
 	defer ll.mutex.Unlock()
 	if ll.isClosed {
@@ -81,7 +82,7 @@ func (ll *LoopbackListener) Dial() (net.Conn, error) {
 
 // Accept waits for and returns the next connection to the listener.
 func (ll *LoopbackListener) Accept() (ret net.Conn, err error) {
-	G.Log.Debug("+ LoopbackListener.Accept")
+	ll.logCtx.GetLog().Debug("+ LoopbackListener.Accept")
 	var ok bool
 
 	// We can't hold the lock (even if we had to) since that would
@@ -91,7 +92,7 @@ func (ll *LoopbackListener) Accept() (ret net.Conn, err error) {
 		err = syscall.EINVAL
 	}
 
-	G.Log.Debug("- LoopbackListener.Accept -> %v", err)
+	ll.logCtx.GetLog().Debug("- LoopbackListener.Accept -> %v", err)
 	return ret, err
 }
 
@@ -101,8 +102,10 @@ func (ll *LoopbackListener) Close() (err error) {
 	ll.mutex.Lock()
 	defer ll.mutex.Unlock()
 	if ll.isClosed {
+		ll.logCtx.GetLog().Debug("LoopbackListener.Close: already closed")
 		return syscall.EINVAL
 	}
+	ll.logCtx.GetLog().Debug("LoopbackListener.Close: closing")
 	ll.isClosed = true
 	close(ll.ch)
 	return
@@ -125,8 +128,38 @@ func (lc *LoopbackConn) Read(b []byte) (n int, err error) {
 	if !ok {
 		return 0, io.EOF
 	}
-	lc.buf.Write(msg)
-	return lc.buf.Read(b)
+	// Copy directly from message to caller's buffer, only buffering leftovers.
+	// Most messages fit in the read buffer, so this saves one full copy.
+	n = copy(b, msg)
+	if n < len(msg) {
+		lc.buf.Write(msg[n:])
+	}
+	return n, nil
+}
+
+// TryRead is a non-blocking Read: it returns immediately with n == 0 when no
+// data is pending. Used by the mobile bridge to coalesce already-pending
+// writes into one delivery, amortizing the per-call native->JS bridge hop.
+func (lc *LoopbackConn) TryRead(b []byte) (n int, err error) {
+	lc.rMutex.Lock()
+	defer lc.rMutex.Unlock()
+
+	if lc.buf.Len() > 0 {
+		return lc.buf.Read(b)
+	}
+	select {
+	case msg, ok := <-lc.partnerCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		n = copy(b, msg)
+		if n < len(msg) {
+			lc.buf.Write(msg[n:])
+		}
+		return n, nil
+	default:
+		return 0, nil
+	}
 }
 
 // Write writes data to the connection.

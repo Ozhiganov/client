@@ -1,0 +1,187 @@
+import * as C from '@/constants'
+import * as Teams from '@/constants/teams'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {makeNewTeamWizard} from '@/teams/new-team/wizard/state'
+import {useTeamsList} from '@/teams/use-teams-list'
+
+type OwnProps = {isTeam: boolean}
+const NewTeamSentry = '---NewTeam---'
+
+const PickTeamItem = () => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 alignItems="center" direction="horizontal" fullWidth={true} style={styles.avatarBox} justifyContent="flex-start">
+      <Kb.Text type="BodyBig">Pick a team</Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const NewTeamItem = () => {
+  const styles = useStyles()
+  return (
+    <Kb.Text type="Header" style={styles.newTeamItem}>
+      New team...
+    </Kb.Text>
+  )
+}
+
+const TeamItem = (p: {teamname: string}) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 alignSelf="center" direction="horizontal" alignItems="center" gap="tiny" style={styles.avatarBox}>
+      <Kb.Avatar isTeam={true} teamname={p.teamname} size={16} />
+      <Kb.Text type="Header" style={styles.teamName}>
+        {p.teamname}
+      </Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const makeDropdownItem = (item?: string) => {
+  if (!item) {
+    return <PickTeamItem />
+  }
+  if (item === NewTeamSentry) {
+    return <NewTeamItem key={NewTeamSentry} />
+  }
+  return <TeamItem key={item} teamname={item} />
+}
+
+const NewRepo = (ownProps: OwnProps) => {
+  const styles = useStyles()
+  const {isTeam} = ownProps
+  const [error, setError] = React.useState('')
+  const {teams: loadedTeams} = useTeamsList()
+  const teams = React.useMemo(
+    () => loadedTeams.map(team => team.teamname).sort(Teams.sortTeamnames),
+    [loadedTeams]
+  )
+  const navigateUp = C.Router2.navigateUp
+  const createPersonalRepo = C.useRPC(T.RPCGen.gitCreatePersonalRepoRpcPromise)
+  const createTeamRepo = C.useRPC(T.RPCGen.gitCreateTeamRepoRpcPromise)
+  const onCreate = (name: string, teamname: string, notifyTeam: boolean) => {
+    if (isTeam && teamname) {
+      createTeamRepo(
+        [{notifyTeam, repoName: name, teamName: {parts: teamname.split('.')}}, C.waitingKeyGitLoading],
+        navigateUp,
+        err => setError(err.message)
+      )
+    } else {
+      createPersonalRepo(
+        [{repoName: name}, C.waitingKeyGitLoading],
+        navigateUp,
+        err => setError(err.message)
+      )
+    }
+  }
+  const switchTab = C.Router2.switchTab
+  const navigateAppend = C.Router2.navigateAppend
+  const onNewTeam = () => {
+    switchTab(C.Tabs.teamsTab)
+    navigateAppend({name: 'teamWizard1TeamPurpose', params: {wizard: makeNewTeamWizard()}})
+  }
+
+  const [name, setName] = React.useState('')
+  const [notifyTeam, setNotifyTeam] = React.useState(true)
+  const [selectedTeam, setSelectedTeam] = React.useState('')
+
+  const makeDropdownItems = () => teams.concat(NewTeamSentry).map(makeDropdownItem)
+
+  const dropdownChanged = (idx: number) => {
+    const t = teams.at(idx)
+    if (!t) {
+      onNewTeam()
+    } else {
+      setSelectedTeam(t)
+    }
+  }
+
+  const onSubmit = () => {
+    setError('')
+    onCreate(name, selectedTeam, isTeam && notifyTeam)
+  }
+
+  const canSubmit = () => {
+    return name && !(isTeam && !selectedTeam)
+  }
+  return (
+    <Kb.ModalScreen
+      banner={<Kb.ErrorBanner error={error} />}
+      footer={
+        <Kb.ConfirmButtons
+          split={true}
+          waitingKey={C.waitingKeyGitLoading}
+          onCancel={navigateUp}
+          onConfirm={onSubmit}
+          confirmLabel="Create"
+          confirmDisabled={!canSubmit()}
+        />
+      }
+    >
+      <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" gap="medium">
+        <Kb.IconAuto type={isTeam ? 'icon-repo-team-add-48' : 'icon-repo-personal-add-48'} />
+        <Kb.Text type="Body">
+          {isTeam
+            ? 'Your repository will be end-to-end encrypted and accessible by all members in the team.'
+            : 'Your repository will be encrypted and only accessible by you.'}
+        </Kb.Text>
+        {isTeam && (
+          <Kb.Dropdown
+            items={makeDropdownItems()}
+            selected={makeDropdownItem(selectedTeam)}
+            onChangedIdx={dropdownChanged}
+            style={styles.dropdown}
+            testID={TestIDs.GIT_NEW_TEAM_DROPDOWN}
+          />
+        )}
+        <Kb.Input3
+          textType="BodySemibold"
+          value={name}
+          autoFocus={true}
+          onChangeText={setName}
+          placeholder="Name your repository"
+          onEnterKeyDown={onSubmit}
+        />
+        {isTeam && (
+          <Kb.Checkbox
+            label="Notify the team"
+            checked={notifyTeam}
+            onCheck={setNotifyTeam}
+            style={styles.checkbox}
+            testID={TestIDs.settingTestID(TestIDs.GIT_NEW_NOTIFY, notifyTeam)}
+          />
+        )}
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      avatarBox: {
+        paddingLeft: Kb.Styles.globalMargins.xsmall,
+        paddingRight: Kb.Styles.globalMargins.small,
+        width: '100%',
+      },
+      checkbox: {alignSelf: 'flex-start'},
+      dropdown: {width: '100%'},
+      newTeamItem: {paddingLeft: Kb.Styles.globalMargins.small},
+      teamName: Kb.Styles.platformStyles({
+        common: {
+          overflow: 'hidden',
+          width: '100%',
+        },
+        isElectron: {
+          display: 'block',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        },
+      }),
+    }) as const
+)
+
+export default NewRepo

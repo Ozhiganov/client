@@ -1,0 +1,395 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as C from '@/constants'
+import * as T from '@/constants/types'
+import {pathToRPCPath} from '@/constants/fs'
+import {fsCacheDir} from '@/constants/platform'
+import {pickSave} from '@/util/misc'
+import * as FsCommon from '@/fs/common'
+import {settingsArchiveTab} from '@/constants/settings'
+import {useCurrentUserState} from '@/stores/current-user'
+import {getInboxConversationMeta, getInboxConversationParticipants} from '@/chat/inbox/metadata'
+import {makeUUID} from '@/util/uuid'
+
+type ArchiveAllFilesResponseWaiter =
+  | {state: 'idle'}
+  | {state: 'waiting'}
+  | {
+      errors: Map<string, string>
+      skipped: number
+      started: number
+      state: 'finished'
+    }
+
+type ArchiveAllGitResponseWaiter =
+  | {state: 'idle'}
+  | {state: 'waiting'}
+  | {
+      errors: Map<string, string>
+      started: number
+      state: 'finished'
+    }
+
+type Props =
+  | {type: 'chatID'; conversationIDKey: T.Chat.ConversationIDKey}
+  | {type: 'chatTeam'; teamname: string}
+  | {type: 'chatAll'}
+  | {type: 'fsAll'}
+  | {type: 'gitAll'}
+  | {type: 'fsPath'; path: string}
+  | {type: 'git'; gitURL: string}
+
+const chatIDToDisplayname = (conversationIDKey: T.Chat.ConversationIDKey) => {
+  const you = useCurrentUserState.getState().username
+  const m = getInboxConversationMeta(conversationIDKey)
+  if (m?.teamname) {
+    if (m.channelname) {
+      return `${m.teamname}#${m.channelname}`
+    }
+    return m.teamname
+  }
+
+  const participants = getInboxConversationParticipants(conversationIDKey)?.name ?? []
+  if (participants.length === 1) {
+    return participants[0] ?? ''
+  }
+  return participants.filter(username => username !== you).join(',')
+}
+
+const ArchiveModal = (p: Props) => {
+  const styles = useStyles()
+  const {type} = p
+  const displayname = p.type === 'chatID' ? chatIDToDisplayname(p.conversationIDKey) : ''
+
+  let defaultPath = ''
+  if (isElectron) {
+    defaultPath = `${C.downloadFolder}/kb-archive-`
+    switch (type) {
+      case 'chatID':
+        defaultPath += `${displayname.replaceAll(',', '_').replaceAll('#', '_')}`
+        break
+      case 'chatAll':
+        defaultPath += `chat`
+        break
+      case 'gitAll':
+        defaultPath = `${C.downloadFolder}/keybase-git`
+        break
+      case 'chatTeam':
+        defaultPath += p.teamname
+        break
+      case 'fsAll':
+        defaultPath += `fs`
+        break
+      case 'fsPath':
+        defaultPath += `${p.path.replaceAll('/', '_')}`
+        break
+      case 'git':
+        defaultPath = `${C.downloadFolder}/keybase-${p.gitURL.replaceAll('/', '_')}`
+        break
+    }
+  }
+
+  const [outpath, setOutpath] = React.useState(defaultPath)
+  const [started, setStarted] = React.useState(false)
+  // a single folder or repo whose backup did not start (one never written has nothing to back up)
+  const [singleError, setSingleError] = React.useState('')
+  const [archiveAllFilesResponseWaiter, setArchiveAllFilesResponseWaiter] =
+    React.useState<ArchiveAllFilesResponseWaiter>({state: 'idle'})
+  const [archiveAllGitResponseWaiter, setArchiveAllGitResponseWaiter] =
+    React.useState<ArchiveAllGitResponseWaiter>({state: 'idle'})
+  const startChatArchive = C.useRPC(T.RPCChat.localArchiveChatRpcPromise)
+  const startArchiveAllFiles = C.useRPC(T.RPCGen.SimpleFSSimpleFSArchiveAllFilesRpcPromise)
+  const startArchiveAllGitRepos = C.useRPC(T.RPCGen.SimpleFSSimpleFSArchiveAllGitReposRpcPromise)
+  const startArchiveSingle = C.useRPC(T.RPCGen.SimpleFSSimpleFSArchiveStartRpcPromise)
+  const navigateUp = C.Router2.navigateUp
+  const switchTab = C.Router2.switchTab
+
+  const canStart = !!((isMobile || outpath) && !started)
+
+  const onStart = () => {
+    if (!canStart) return
+    setStarted(true)
+
+    const startChat = (query: T.RPCChat.GetInboxLocalQuery | null) => {
+      const jobID = makeUUID()
+      const outputPath = outpath || (isAndroid && fsCacheDir ? `${fsCacheDir}/kbchat-${jobID}` : '')
+      startChatArchive(
+        [
+          {
+            req: {
+              compress: true,
+              identifyBehavior: T.RPCGen.TLFIdentifyBehavior.unset,
+              jobID,
+              outputPath,
+              query,
+            },
+          },
+        ],
+        () => {},
+        () => {}
+      )
+    }
+
+    const startSingle = (type: 'kbfs' | 'git', target: string) => {
+      const prefix = type === 'kbfs' ? 'kbfs-backup' : 'git-backup'
+      const outputPath = outpath || (isAndroid && fsCacheDir ? `${fsCacheDir}/${prefix}-${Date.now()}` : '')
+      startArchiveSingle(
+        [
+          {
+            archiveJobStartPath:
+              type === 'kbfs'
+                ? {
+                    archiveJobStartPathType: T.RPCGen.ArchiveJobStartPathType.kbfs,
+                    kbfs: pathToRPCPath(target).kbfs,
+                  }
+                : {archiveJobStartPathType: T.RPCGen.ArchiveJobStartPathType.git, git: target},
+            outputPath,
+            overwriteZip: true,
+          },
+        ],
+        () => {},
+        error => setSingleError(error.desc)
+      )
+    }
+
+    switch (p.type) {
+      case 'chatID':
+        startChat({
+          computeActiveList: false,
+          convIDs: [T.Chat.keyToConversationID(p.conversationIDKey)],
+          readOnly: false,
+          unreadOnly: false,
+        })
+        break
+      case 'chatAll':
+        startChat(null)
+        break
+      case 'fsAll':
+        setArchiveAllFilesResponseWaiter({state: 'waiting'})
+        startArchiveAllFiles(
+          [
+            {
+              includePublicReadonly: false,
+              outputDir: outpath || (isAndroid && fsCacheDir ? fsCacheDir : ''),
+              overwriteZip: false,
+            },
+          ],
+          response => {
+            setArchiveAllFilesResponseWaiter({
+              errors: new Map(Object.entries(response.tlfPathToError ?? {})),
+              skipped: (response.skippedTLFPaths ?? []).length,
+              started: Object.keys(response.tlfPathToJobDesc ?? {}).length,
+              state: 'finished',
+            })
+          },
+          () => {}
+        )
+        break
+      case 'gitAll':
+        setArchiveAllGitResponseWaiter({state: 'waiting'})
+        startArchiveAllGitRepos(
+          [
+            {
+              outputDir: outpath || (isAndroid && fsCacheDir ? fsCacheDir : ''),
+              overwriteZip: false,
+            },
+          ],
+          response => {
+            setArchiveAllGitResponseWaiter({
+              errors: new Map(Object.entries(response.gitRepoToError ?? {})),
+              started: Object.keys(response.gitRepoToJobDesc ?? {}).length,
+              state: 'finished',
+            })
+          },
+          () => {}
+        )
+        break
+      case 'chatTeam':
+        startChat({
+          computeActiveList: false,
+          name: {membersType: T.RPCChat.ConversationMembersType.team, name: p.teamname},
+          readOnly: false,
+          unreadOnly: false,
+        })
+        break
+      case 'fsPath':
+        startSingle('kbfs', p.path)
+        break
+      case 'git':
+        startSingle('git', p.gitURL)
+        break
+    }
+  }
+  const onClose = () => {
+    navigateUp()
+  }
+  const navigateAppend = C.Router2.navigateAppend
+  const onProgress = () => {
+    navigateUp()
+    setTimeout(() => {
+      switchTab(C.Tabs.settingsTab)
+      setTimeout(() => {
+        navigateAppend({name: settingsArchiveTab, params: {}})
+      }, 200)
+    }, 200)
+  }
+
+  const selectPath = () => {
+    const f = async () => {
+      const path = await pickSave({})
+      if (path) setOutpath(path)
+    }
+    C.ignorePromise(f())
+  }
+
+  let content: React.ReactNode = null
+  switch (type) {
+    case 'chatID':
+      content = <Kb.Text type="Body">Source: Chat conversation: {displayname}</Kb.Text>
+      break
+    case 'chatTeam':
+      content = <Kb.Text type="Body">Source: Chat team: {p.teamname}</Kb.Text>
+      break
+    case 'chatAll':
+      content = <Kb.Text type="Body">Source: All chats</Kb.Text>
+      break
+    case 'fsAll':
+      content =
+        archiveAllFilesResponseWaiter.state === 'idle' ? (
+          <Kb.Box2 direction="vertical" centerChildren={true} style={styles.contentContainer} gap="small">
+            <Kb.Box2 direction="horizontal" centerChildren={true} style={styles.contentContainer} gap="small">
+              <Kb.Icon type="iconfont-nav-2-files" fontSize={72} />
+              <Kb.Text type="BodyBig">All Files</Kb.Text>
+            </Kb.Box2>
+            <Kb.Text type="Body">
+              Note: folders that were never written to, and public folders that you are not a writer
+              of, will be skipped. Use <Kb.Text type="TerminalInline">keybase fs archive</Kb.Text> if
+              you want to backup the public ones.
+            </Kb.Text>
+          </Kb.Box2>
+        ) : archiveAllFilesResponseWaiter.state === 'waiting' ? (
+          <Kb.LoadingLine />
+        ) : (
+          <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} style={styles.contentContainer} gap="small">
+            <Kb.Box2 direction="horizontal" centerChildren={true} style={styles.contentContainer} gap="small">
+              <Kb.Icon type="iconfont-nav-2-files" fontSize={72} />
+              <Kb.Text type="BodyBig">All Files</Kb.Text>
+            </Kb.Box2>
+            <Kb.Box2 direction="vertical" centerChildren={true}>
+              <Kb.Text type="Body">
+                Started {archiveAllFilesResponseWaiter.started} jobs successfully.
+              </Kb.Text>
+              <Kb.Text type="Body">Skipped {archiveAllFilesResponseWaiter.skipped} folders.</Kb.Text>
+              <Kb.Text type="Body">Encountered {archiveAllFilesResponseWaiter.errors.size} errors.</Kb.Text>
+            </Kb.Box2>
+          </Kb.Box2>
+        )
+      break
+    case 'gitAll':
+      content =
+        archiveAllGitResponseWaiter.state === 'idle' ? (
+          <Kb.Box2 alignSelf="center" direction="horizontal" centerChildren={true} style={styles.contentContainer} gap="small">
+            <Kb.Icon type="iconfont-nav-2-git" fontSize={72} />
+            <Kb.Text type="BodyBig">All Git Repos</Kb.Text>
+          </Kb.Box2>
+        ) : archiveAllGitResponseWaiter.state === 'waiting' ? (
+          <Kb.LoadingLine />
+        ) : (
+          <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} style={styles.contentContainer} gap="small">
+            <Kb.Box2 direction="horizontal" centerChildren={true} style={styles.contentContainer} gap="small">
+              <Kb.Icon type="iconfont-nav-2-git" fontSize={72} />
+              <Kb.Text type="BodyBig">All Git Repos</Kb.Text>
+            </Kb.Box2>
+            <Kb.Box2 direction="vertical" centerChildren={true}>
+              <Kb.Text type="Body">Started {archiveAllGitResponseWaiter.started} jobs successfully.</Kb.Text>
+              <Kb.Text type="Body">Encountered {archiveAllGitResponseWaiter.errors.size} errors.</Kb.Text>
+            </Kb.Box2>
+          </Kb.Box2>
+        )
+      break
+    case 'fsPath':
+      content = (
+        <Kb.WithTooltip tooltip={p.path} position="bottom center" toastStyle={styles.contentContainer}>
+          <FsCommon.FsErrorProvider>
+            <FsCommon.FsDataProvider>
+              <FsCommon.PathItemInfo path={p.path} />
+            </FsCommon.FsDataProvider>
+          </FsCommon.FsErrorProvider>
+        </Kb.WithTooltip>
+      )
+      break
+    case 'git':
+      content = (
+        <Kb.Box2 direction="vertical" centerChildren={true} style={styles.contentContainer} gap="small">
+          <Kb.Icon type="iconfont-nav-2-git" fontSize={72} />
+          <Kb.Text type="TerminalInline" lineClamp={2}>
+            {p.gitURL}
+          </Kb.Text>
+        </Kb.Box2>
+      )
+      break
+  }
+
+  const output = isMobile ? null : (
+    <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center">
+      <Kb.Text type="Body">Save To</Kb.Text>
+      <Kb.Box2 direction="horizontal" fullWidth={true}>
+        <Kb.Text type="BodyItalic" lineClamp={1} title={outpath} style={styles.outPath}>
+          {outpath}
+        </Kb.Text>
+        <Kb.BoxGrow />
+        <Kb.Text type="BodyPrimaryLink" onClick={selectPath}>
+          Change
+        </Kb.Text>
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+
+  return (
+    <Kb.ModalScreen
+      footer={
+        started ? (
+          <Kb.ConfirmButtons
+            split={true}
+            cancelLabel="Close"
+            onCancel={onClose}
+            confirmLabel="See progress"
+            onConfirm={onProgress}
+          />
+        ) : (
+          <Kb.Button label="Start" onClick={onStart} disabled={!canStart} fullWidth={true} />
+        )
+      }
+    >
+      <Kb.Box2 direction="vertical" fullWidth={true} gap="medium">
+        {isMobile ? (
+          <Kb.Text type="Body">Share a copy of your content to another app</Kb.Text>
+        ) : (
+          <Kb.Text type="Body">Save a copy of your content to your local drive</Kb.Text>
+        )}
+        {content}
+        {singleError ? <Kb.Text type="BodySmallError">Nothing was backed up: {singleError}</Kb.Text> : null}
+        {archiveAllFilesResponseWaiter.state !== 'idle' || archiveAllGitResponseWaiter.state !== 'idle'
+          ? null
+          : output}
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  contentContainer: {
+    maxWidth: 400,
+  },
+  outPath: Kb.Styles.platformStyles({
+    isElectron: {
+      backgroundColor: theme.blue_30,
+      borderColor: theme.grey,
+      borderRadius: Kb.Styles.borderRadius,
+      padding: 2,
+      wordBreak: 'break-all',
+    },
+  }),
+}))
+
+export default ArchiveModal

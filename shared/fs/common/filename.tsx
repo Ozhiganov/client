@@ -1,0 +1,64 @@
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import type {TextType} from '@/common-adapters/text.shared'
+
+type Props = {
+  path?: T.FS.Path
+  filename?: string
+  selectable?: boolean
+  style?: Kb.Styles.StylesCrossPlatform
+  type: TextType
+}
+
+const splitFileNameAndExtension = (fileName: string) => {
+  const idx = fileName.lastIndexOf('.')
+  if (idx === -1 || fileName.length - idx > 10) {
+    return [fileName, '']
+  } else {
+    return [fileName.slice(0, idx), fileName.slice(idx)]
+  }
+}
+
+const Filename = (props: Props) => {
+  const styles = useStyles()
+  // also does this to subteams...
+  const [fileNameWithoutExtension, fileExtension] = splitFileNameAndExtension(
+    props.path ? T.FS.getPathName(props.path) : props.filename || ''
+  )
+  return (
+    <Kb.Box2 direction="horizontal" style={props.style}>
+      <Kb.Text
+        className="hover-underline-child"
+        type={props.type}
+        style={styles.breakAll}
+        lineClamp={1}
+        selectable={props.selectable}
+      >
+        {fileNameWithoutExtension}
+      </Kb.Text>
+      {fileExtension ? (
+        <Kb.Text
+          className="hover-underline-child"
+          type={props.type}
+          style={styles.noShrink}
+          selectable={props.selectable}
+        >
+          {fileExtension}
+        </Kb.Text>
+      ) : null}
+    </Kb.Box2>
+  )
+}
+
+export default Filename
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      breakAll: Kb.Styles.platformStyles({
+        common: {flexShrink: 1},
+        isElectron: {wordBreak: 'break-all'},
+      }),
+      noShrink: {flexShrink: 0},
+    }) as const
+)

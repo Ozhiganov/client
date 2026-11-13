@@ -1,0 +1,266 @@
+import type {ChainablePromiseElement, ChainablePromiseArray} from 'webdriverio'
+
+// Select by testID. React Native maps testID to different native attributes per
+// platform: iOS → accessibilityIdentifier (Appium "~" accessibility-id), Android
+// → the view's resource-id. So the same testID needs a different selector each
+// platform. (On Android "~" matches content-desc/accessibilityLabel, NOT testID.)
+const byTestIDSelector = (id: string): string =>
+  browser.isAndroid ? `android=new UiSelector().resourceId("${id}")` : `~${id}`
+
+export const el = (id: string): ChainablePromiseElement => browser.$(byTestIDSelector(id))
+export const els = (id: string): ChainablePromiseArray => browser.$$(byTestIDSelector(id))
+
+// Use waitForExist (presence in the XCUI tree), not waitForDisplayed: layout
+// containers that carry screen-marker testIDs (e.g. a flex Box2 wrapping a list)
+// report visible="false" to XCUITest even when on screen, so waitForDisplayed
+// would spuriously fail. iOS prunes truly off-screen views from the tree, so
+// existence is a reliable "this screen is active" signal.
+export const waitForTestID = async (id: string, timeout = 5000) =>
+  // interval 150 (vs the 500 default) so a wait returns promptly once the
+  // element appears, instead of idling up to half a second per wait.
+  el(id).waitForExist({timeout, interval: 150, timeoutMsg: `testID "${id}" never appeared`})
+
+// True for the iOS-16.4 "Old" sims (device name ends in "Old"), set per device
+// by the runner via KB_IOS_DEVICE.
+const isOldDevice = (): boolean => /old$/i.test(process.env['KB_IOS_DEVICE'] ?? '')
+
+// What a field holds, read from its element: an empty one reports its placeholder as its value.
+export const fieldText = async (field: ChainablePromiseElement) => {
+  const value = await field.getAttribute('value')
+  const placeholder = await field.getAttribute('placeholderValue').catch(() => null)
+  return value === null || value === placeholder ? '' : value
+}
+
+// The part of an element's frame that is on screen and above the keyboard, or undefined when too
+// little of it is to tap.
+const tappableFrame = async (field: ChainablePromiseElement) => {
+  const r = await field.getElementRect(await field.elementId)
+  const win = await browser.getWindowRect()
+  const keyboard = browser.$('-ios class chain:**/XCUIElementTypeKeyboard')
+  const keyboardTop = (await keyboard.isExisting()) ? await keyboard.getLocation('y') : win.height
+  const left = Math.max(r.x, 0)
+  const top = Math.max(r.y, 0)
+  const right = Math.min(r.x + r.width, win.width)
+  const bottom = Math.min(r.y + r.height, win.height, keyboardTop)
+  return right - left >= 10 && bottom - top >= 10 ? {bottom, right} : undefined
+}
+
+const CLEAR_ROUNDS = 3
+
+// Deletes what a field holds with backspace keys. A field is never set or cleared with WDA's
+// setValue, clearValue or elementClear: after any of them the app's process stays in
+// hardware-keyboard mode, so a later focus draws no software keyboard until the app relaunches.
+// The caret may sit anywhere (a draft an earlier test left, a scrolled multi-line field), so each
+// round taps the bottom-right corner of the field's part on screen and above the keyboard (the end
+// of the text drawn there), presses backspace once per character the field holds, and reads the
+// field back, until it is empty (at most CLEAR_ROUNDS rounds). addValue taps the field again only
+// when it has no keyboard focus (fb_prepareForTextInputWithSnapshot in WDA's
+// XCUIElement+FBTyping.m), so the corner tap's caret holds. Errors give the count, never the text.
+// Bound: CLEAR_ROUNDS rounds of (the read 1, the frame 1, the tap 1, the keys 2) 15, the last read
+// 1 = 16s.
+export const clearFieldByKeys = async (field: ChainablePromiseElement) => {
+  for (let round = 0; ; round++) {
+    const held = [...(await fieldText(field))].length
+    if (!held) return
+    if (round === CLEAR_ROUNDS) throw new Error(`the field still holds ${held} characters after ${CLEAR_ROUNDS} rounds of backspaces`)
+    const frame = await tappableFrame(field)
+    if (!frame) throw new Error('the field is off screen or under the keyboard: no place to put its caret')
+    await browser.execute('mobile: tap', {x: Math.round(frame.right - 4), y: Math.round(frame.bottom - 4)})
+    await field.addValue('\b'.repeat(held))
+  }
+}
+
+// Enter text into a field. The testID is on the real input element (see Input3),
+// so el(id) is the editable itself. iOS-16.4 sims must paste (per-key injection
+// crashes RN there — see pasteText). On modern iOS what the field holds is
+// deleted by keys (clearFieldByKeys) and the text goes in as key presses
+// (addValue) where the input surfaces as a typeable element (chat, sign,
+// iPhone); the modern-iPad encrypt input surfaces as an XCUIElementTypeOther
+// (addValue → "element wasn't found"), so fall back to pasting, which works
+// regardless of element type.
+export const enterText = async (id: string, text: string): Promise<void> => {
+  if (browser.isAndroid) {
+    await androidEnterText(id, text)
+    return
+  }
+  if (isOldDevice()) {
+    await pasteText(id, text)
+    return
+  }
+  try {
+    const field = el(id)
+    await clearFieldByKeys(field)
+    await field.addValue(text)
+  } catch {
+    await pasteText(id, text)
+  }
+}
+
+// Android: a RN testID lands on the wrapper View, not the EditText itself, so
+// setValue on the testID'd node fails ("Cannot set the element to ..."). The
+// crypto input wrappers carry collapsable={false} so the wrapper keeps its
+// EditText descendants (without it RN view-flattening renders the wrapper as an
+// empty leaf). Resolve the real editable field: (1) the EditText carrying the
+// resource-id; (2) the LAST EditText descendant of the wrapper — the PRIMARY
+// input is last (encrypt renders the "Search people" recipients field before the
+// message input); (3) the last EditText on screen as a final fallback.
+const androidEnterText = async (id: string, text: string): Promise<void> => {
+  const selfEdit = browser.$(
+    `android=new UiSelector().resourceId("${id}").className("android.widget.EditText")`
+  )
+  let field: WebdriverIO.Element | undefined
+  if (await selfEdit.isExisting().catch(() => false)) {
+    field = await selfEdit.getElement()
+  } else {
+    const within = await el(id).$$('.//android.widget.EditText').getElements()
+    const onScreen = within.length > 0 ? within : await browser.$$('//android.widget.EditText').getElements()
+    field = onScreen[onScreen.length - 1]
+  }
+  if (!field) throw new Error(`androidEnterText: no EditText found for "${id}"`)
+  await field.click().catch(() => {})
+  await field.setValue(text)
+}
+
+// The tappable Paste of a field's edit menu. The menu exposes THREE "Paste" nodes: a MenuItem, a
+// non-tappable StaticText, and an "assistantPaste:" Button; only the MenuItem and Button paste.
+export const PASTE_ITEM =
+  '-ios predicate string:(type == "XCUIElementTypeMenuItem" OR type == "XCUIElementTypeButton") AND (name == "Paste" OR label == "Paste")'
+
+// Enter text by pasting from the system pasteboard instead of per-key typing.
+// Appium's keyboard injection (setValue) drives UIKit's per-character a11y
+// insertion path, which desyncs RN's RCTBackedTextInputDelegateAdapter cached
+// range on older iOS (16.4) → NSRangeException → app SIGABRT. Pasting inserts
+// the whole string in one shot via UIPasteboard, avoiding that path. Also the
+// modern-iPad fallback for inputs that don't expose as a settable element.
+// Everything here is element-based (the testID is on the real input) — no
+// coordinates: focus the field, long-press IT to raise the edit menu, tap Paste.
+const pasteText = async (id: string, text: string): Promise<void> => {
+  await browser.execute('mobile: setPasteboard', {
+    content: Buffer.from(text).toString('base64'),
+    encoding: 'base64',
+  })
+  const field = await el(id).getElement()
+  await field.click()
+  await pasteFromMenu({elementId: field.elementId}, `the field "${id}"`)
+}
+
+// Where a long press goes: an element, or a point on screen.
+export type HoldTarget = {elementId: string} | {x: number; y: number}
+
+// Long-presses `at` until its edit menu offers Paste, and taps it: what a person does to paste. The
+// long press that summons the menu is now and then swallowed, so it is tried six times; any other
+// error throws. `what` names the field in the error. Bound: six tries of the hold 1.3 and 1.5 for
+// the menu, the item 1 = 18.
+export const pasteFromMenu = async (at: HoldTarget, what: string) => {
+  const hold = 'elementId' in at ? {elementId: at.elementId} : {x: Math.round(at.x), y: Math.round(at.y)}
+  for (let i = 0; i < 6; i++) {
+    await browser.execute('mobile: touchAndHold', {duration: 1.3, ...hold})
+    if (await browser.$(PASTE_ITEM).waitForExist({interval: 150, timeout: 1_500}).then(() => true, () => false)) {
+      await browser.$(PASTE_ITEM).click()
+      return
+    }
+  }
+  throw new Error(`${what}'s edit menu never offered Paste`)
+}
+
+// Long-presses the field with `testID` until its edit menu offers Paste, and taps it: what a person
+// does to paste. The pasteboard is set before (gate/device.ts setPasteboard, over stdin, so no
+// WebDriver request carries the text). Bound: the field and its tap 3, pasteFromMenu 18 = 21.
+export const pasteInto = async (testID: string) => {
+  const field = await el(testID).getElement()
+  await field.click()
+  await pasteFromMenu({elementId: field.elementId}, 'the field')
+}
+
+// Tap a testID and wait for an expected testID to appear, re-tapping if it does
+// not. On slow/old sims the first tap can be swallowed by an in-flight screen
+// transition (e.g. the More→Crypto push that immediately precedes a sub-nav tab
+// tap), so a single tap+wait is flaky. Re-tapping recovers; merely extending the
+// wait does NOT — the swallowed tap never lands, so the screen never changes.
+// Once a tap takes, the expected id appears and we return before re-tapping; if
+// it already navigated, the re-tap hits a now-absent element and is a harmless
+// no-op (caught).
+export const tapForTestID = async (
+  tapId: string,
+  expectId: string,
+  {taps = 3, timeout = 5000}: {taps?: number; timeout?: number} = {}
+): Promise<void> => {
+  for (let i = 0; i < taps; i++) {
+    await el(tapId).click().catch(() => {})
+    const ok = await el(expectId)
+      .waitForExist({timeout, interval: 150})
+      .then(() => true)
+      .catch(() => false)
+    if (ok) return
+  }
+  throw new Error(`tapForTestID: "${expectId}" never appeared after ${taps} taps on "${tapId}"`)
+}
+
+// Best-effort wait for at least one match. Returns false (rather than throwing)
+// if none appear — for list rows that stream in after the list mounts, where
+// "no rows" is a legitimate outcome and not a test failure.
+export const anyExist = async (id: string, timeout = 3000): Promise<boolean> => {
+  await browser
+    .waitUntil(async () => (await els(id).length) > 0, {timeout, interval: 150})
+    .catch(() => {})
+  return (await els(id).length) > 0
+}
+
+// Backslashes and double quotes would otherwise terminate/alter the quoted
+// predicate literal and make the selector invalid.
+export const escapePredicate = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+
+// Runs `f`, and when it throws, throws a copy of its error with `name` replaced by `label`: for a
+// name that may go into no error (a paper key's is the first two words of its phrase), when `f`'s
+// selectors or messages hold it. Replacing the name as it is works because a paper key's words are
+// plain lowercase letters: no selector or message escapes them into another form.
+export const maskingName = async <T,>(name: string, label: string, f: () => Promise<T>): Promise<T> => {
+  if (label === name) return f()
+  try {
+    return await f()
+  } catch (e) {
+    // a masked copy: the raw error, as a cause too, may carry the name
+    // eslint-disable-next-line preserve-caught-error
+    throw new Error((e instanceof Error ? e.message : String(e)).split(name).join(label))
+  }
+}
+
+// iOS: the element of `type` whose label is exactly `label`.
+export const labeled = (type: 'Button' | 'Other' | 'StaticText', label: string): ChainablePromiseElement =>
+  browser.$(`-ios predicate string:type == "XCUIElementType${type}" AND label == "${escapePredicate(label)}"`)
+
+// CONTAINS, not ==, on purpose: many tappable rows (More menu items, team tabs)
+// are ClickableBoxes whose accessibility label is a merge of child labels, e.g.
+// ", Crypto" rather than "Crypto".
+// Android: a row's text can surface either as the TextView's text OR (when the
+// touchable is accessible) as the parent's content-desc, so match both; the
+// visible-text path uses textContains, the merged-label path content-desc.
+// `within` limits the match to that element's subtree.
+export const byText = (text: string, within?: ChainablePromiseElement): ChainablePromiseElement => {
+  const t = escapePredicate(text)
+  const root = within ?? browser
+  if (browser.isAndroid) {
+    // xpath (not UiSelector) so we can OR the visible-text and merged-label
+    // (content-desc) paths in one selector. A scoped xpath needs the leading
+    // "." or "//" searches the whole document.
+    return root.$(`${within ? '.' : ''}//*[contains(@text, "${t}") or contains(@content-desc, "${t}")]`)
+  }
+  return root.$(`-ios predicate string:label CONTAINS "${t}" OR name CONTAINS "${t}"`)
+}
+
+// Tab-bar buttons. iOS exposes the native UITabBarItem by its title as the
+// accessibility id. Android's tab bar is a native Material BottomNavigationView:
+// target the ITEM view via its content-desc — the label, plus an optional badge
+// suffix ("Chat, 1 new notification"), hence the anchored regex. Not the label
+// TextViews: each item keeps BOTH a small and large label view (selected vs not)
+// and UiSelector also matches the currently-invisible twin, whose bogus bounds
+// make the click silently no-op. The className pins it to the NATIVE item
+// (FrameLayout): RN touchables surface as android.view.ViewGroup, and the
+// settings root's "Files"/"Chat" rows carry the same content-desc — without the
+// class filter the row wins the match and the tap opens the settings subpage.
+export const tab = (label: string): ChainablePromiseElement =>
+  browser.isAndroid
+    ? browser.$(
+        `android=new UiSelector().className("android.widget.FrameLayout").descriptionMatches("^${label}(,.*)?$")`
+      )
+    : browser.$(`~${label}`)

@@ -1,0 +1,91 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {PdfEmbed} from '@/common-adapters/pdf-embed'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {useNavigation} from '@react-navigation/native'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+import {attachmentDownloadMessage, takePDFMessage} from '../conversation/attachment-actions'
+import {useConversationMessage} from '../conversation/data-hooks'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {
+  conversationIDKey?: T.Chat.ConversationIDKey
+  messageID: T.Chat.MessageID
+  url?: string
+}
+
+const ChatPDF = (props: Props) => {
+  const nativeStyles = useNativeStyles()
+  const {messageID} = props
+  const conversationIDKey = props.conversationIDKey ?? T.Chat.noConversationIDKey
+  const [initialMessage] = React.useState(() =>
+    isMobile ? undefined : takePDFMessage(conversationIDKey, messageID)
+  )
+  const [error, setError] = React.useState('')
+  const loadedMessage = useConversationMessage(conversationIDKey, messageID)
+  const message = loadedMessage?.type === 'attachment' ? loadedMessage : initialMessage
+  const title = message?.title || message?.fileName || 'PDF'
+  const url = props.url ?? message?.fileURL
+  const navigation = useNavigation()
+
+  React.useEffect(() => {
+    if (isMobile) return
+    navigation.setOptions({title})
+  }, [navigation, title])
+
+  if (!isMobile) {
+    const canDownload = !!message
+    const onDownload = () => {
+      if (message) {
+        attachmentDownloadMessage(conversationIDKey, message)
+      }
+      openLocalPathInSystemFileManagerDesktop(C.downloadFolder)
+    }
+
+    return (
+      <Kb.ModalScreen
+        scroll={false}
+        padding="none"
+        footer={<Kb.Button type="Default" label="Download" onClick={onDownload} disabled={!canDownload} />}
+      >
+        <PdfEmbed url={url} testID={TestIDs.CHAT_PDF_VIEWER} />
+      </Kb.ModalScreen>
+    )
+  }
+
+  return (
+    <Kb.ModalScreen scroll={false} padding="none">
+      {url && !error ? (
+        <Kb.WebView
+          originWhitelist={['*']}
+          renderLoading={() => (
+            <Kb.Box2
+              direction="vertical"
+              justifyContent="center"
+              style={nativeStyles.progressContainer}
+              fullWidth={true}
+              fullHeight={true}
+            >
+              <Kb.ProgressIndicator white={true} />
+            </Kb.Box2>
+          )}
+          url={url}
+          pinnedURLMode={true}
+          onError={err => setError(err)}
+          style={nativeStyles.webViewContainer}
+          testID={TestIDs.CHAT_PDF_VIEWER}
+        />
+      ) : (
+        <Kb.Text type="BodySmallError">Can&apos;t load this file {error}</Kb.Text>
+      )}
+    </Kb.ModalScreen>
+  )
+}
+
+const useNativeStyles = Kb.Styles.createStyleHook(() => ({
+  progressContainer: {position: 'absolute'},
+  webViewContainer: {margin: Kb.Styles.globalMargins.xtiny},
+}))
+
+export default ChatPDF

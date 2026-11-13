@@ -1,0 +1,411 @@
+// Meta manages the metadata about a conversation. Participants, isMuted, reset people, etc. Things that drive the inbox
+import isEqual from 'lodash/isEqual'
+import * as T from '@/constants/types'
+import * as Teams from '@/constants/teams'
+import * as Message from './message'
+import {base64ToUint8Array, uint8ArrayToHex} from '@/util/uint8array'
+import {useCurrentUserState} from '@/stores/current-user'
+
+const conversationMemberStatusToMembershipType = (
+  m: T.RPCChat.ConversationMemberStatus
+): T.Chat.MembershipType => {
+  switch (m) {
+    case T.RPCChat.ConversationMemberStatus.active:
+      return 'active'
+    case T.RPCChat.ConversationMemberStatus.reset:
+      return 'youAreReset'
+    case T.RPCChat.ConversationMemberStatus.preview:
+      return 'youArePreviewing'
+    case T.RPCChat.ConversationMemberStatus.left:
+    case T.RPCChat.ConversationMemberStatus.removed:
+      return 'youLeft'
+    default:
+      return 'notMember'
+  }
+}
+
+// This one call handles us getting a string or a buffer
+const supersededConversationIDToKey = (id: string | Uint8Array): string => {
+  return typeof id === 'string' ? uint8ArrayToHex(base64ToUint8Array(id)) : uint8ArrayToHex(id)
+}
+
+// We only treat implicit adhoc teams as having resetParticipants
+const isImpteamMembersType = (membersType: T.RPCChat.ConversationMembersType) =>
+  membersType === T.RPCChat.ConversationMembersType.impteamnative ||
+  membersType === T.RPCChat.ConversationMembersType.impteamupgrade
+
+// Shared field mappings between InboxUIItem (trusted) and UnverifiedInboxUIItem.
+// `resetParticipants` is passed in explicitly since its source field differs
+// per type (`i.resetParticipants` vs `i.localMetadata?.resetParticipants`).
+const baseMetaFromUIItem = (
+  i: T.RPCChat.InboxUIItem | T.RPCChat.UnverifiedInboxUIItem,
+  isTeam: boolean,
+  resetParticipantsSource: ReadonlyArray<string> | null | undefined
+) => {
+  const resetParticipants: Set<string> = new Set(
+    isImpteamMembersType(i.membersType) && resetParticipantsSource ? resetParticipantsSource : []
+  )
+
+  const supersededBy = conversationMetadataToMetaSupersedeInfo(i.supersededBy ?? undefined)
+  const supersedes = conversationMetadataToMetaSupersedeInfo(i.supersedes ?? undefined)
+  const {retentionPolicy, teamRetentionPolicy} = UIItemToRetentionPolicies(i, isTeam)
+
+  const {notificationsDesktop, notificationsGlobalIgnoreMentions, notificationsMobile} =
+    parseNotificationSettings(i.notifications ?? undefined)
+
+  return {
+    commands: i.commands,
+    conversationIDKey: T.Chat.stringToConversationIDKey(i.convID),
+    draft: i.draft || '',
+    inboxLocalVersion: i.localVersion,
+    inboxVersion: i.version,
+    isMuted: i.status === T.RPCChat.ConversationStatus.muted,
+    maxMsgID: T.Chat.numberToMessageID(i.maxMsgID),
+    maxVisibleMsgID: T.Chat.numberToMessageID(i.maxVisibleMsgID),
+    membershipType: conversationMemberStatusToMembershipType(i.memberStatus),
+    notificationsDesktop,
+    notificationsGlobalIgnoreMentions,
+    notificationsMobile,
+    readMsgID: T.Chat.numberToMessageID(i.readMsgID),
+    resetParticipants,
+    retentionPolicy,
+    status: i.status,
+    supersededBy: supersededBy ? T.Chat.stringToConversationIDKey(supersededBy) : T.Chat.noConversationIDKey,
+    supersedes: supersedes ? T.Chat.stringToConversationIDKey(supersedes) : T.Chat.noConversationIDKey,
+    teamID: i.tlfID,
+    teamRetentionPolicy,
+    teamType: getTeamType(i),
+    timestamp: i.time,
+    tlfname: i.name,
+    wasFinalizedBy: i.finalizeInfo ? i.finalizeInfo.resetUser : '',
+  }
+}
+
+export const unverifiedInboxUIItemToConversationMeta = (
+  i: T.RPCChat.UnverifiedInboxUIItem
+): T.Chat.ConversationMeta | undefined => {
+  // Private chats only
+  if (i.visibility !== T.RPCGen.TLFVisibility.private) {
+    return undefined
+  }
+
+  // Should be impossible
+  if (!i.convID) {
+    return undefined
+  }
+
+  const isTeam = i.membersType === T.RPCChat.ConversationMembersType.team
+  const channelname = isTeam && i.localMetadata ? i.localMetadata.channelName : ''
+  const teamname = isTeam ? i.name : ''
+
+  return {
+    ...makeConversationMeta(),
+    ...baseMetaFromUIItem(i, isTeam, i.localMetadata?.resetParticipants),
+    channelname,
+    description: i.localMetadata?.headline || '',
+    descriptionDecorated: i.localMetadata?.headlineDecorated || '',
+    isEmpty: false,
+    snippet: i.localMetadata ? i.localMetadata.snippet : undefined,
+    snippetDecorated: undefined,
+    snippetDecoration: i.localMetadata ? i.localMetadata.snippetDecoration : T.RPCChat.SnippetDecoration.none,
+    teamname,
+    trustedState: 'untrusted',
+  }
+}
+
+export const inboxUIItemErrorToConversationMetaAndParticipants = (
+  error: T.RPCChat.InboxUIItemError,
+  username: string,
+  oldMeta?: T.Chat.ConversationMeta
+): {meta?: T.Chat.ConversationMeta; participants?: T.Chat.ParticipantInfo} => {
+  if (error.typ === T.RPCChat.ConversationErrorType.transient) {
+    return {}
+  }
+  const isRekeyError =
+    error.typ === T.RPCChat.ConversationErrorType.otherrekeyneeded ||
+    error.typ === T.RPCChat.ConversationErrorType.selfrekeyneeded
+  const remoteMeta = unverifiedInboxUIItemToConversationMeta(error.remoteConv)
+  const baseMeta = isRekeyError ? remoteMeta : (oldMeta ?? remoteMeta)
+  if (!baseMeta) {
+    return {}
+  }
+  const meta = {
+    ...baseMeta,
+    snippet: error.message,
+    snippetDecoration: T.RPCChat.SnippetDecoration.none,
+    trustedState: 'error' as const,
+  }
+  if (!isRekeyError) {
+    return {meta}
+  }
+
+  const {rekeyInfo} = error
+  const participants = [
+    ...(rekeyInfo
+      ? new Set<string>(
+          ([] as Array<string>)
+            .concat(rekeyInfo.writerNames || [], rekeyInfo.readerNames || [])
+            .filter(Boolean)
+        )
+      : new Set<string>(error.unverifiedTLFName.split(','))),
+  ]
+  return {
+    meta: {
+      ...meta,
+      rekeyers: new Set<string>(
+        error.typ === T.RPCChat.ConversationErrorType.selfrekeyneeded
+          ? [username || '']
+          : rekeyInfo?.rekeyers || []
+      ),
+    },
+    participants: {
+      all: participants,
+      contactName: new Map<string, string>(),
+      name: participants,
+    },
+  }
+}
+
+const conversationMetadataToMetaSupersedeInfo = (metas?: ReadonlyArray<T.RPCChat.ConversationMetadata>) => {
+  const meta = metas?.find(m => m.idTriple.topicType === T.RPCChat.TopicType.chat && !!m.finalizeInfo)
+
+  return meta ? supersededConversationIDToKey(meta.conversationID) : undefined
+}
+
+const getTeamType = (tt: {
+  teamType: T.RPCChat.TeamType
+  membersType: T.RPCChat.ConversationMembersType
+}): T.Chat.TeamType => {
+  if (tt.teamType === T.RPCChat.TeamType.complex) {
+    return 'big'
+  } else if (tt.membersType === T.RPCChat.ConversationMembersType.team) {
+    return 'small'
+  } else {
+    return 'adhoc'
+  }
+}
+
+export const getEffectiveRetentionPolicy = (meta: T.Immutable<T.Chat.ConversationMeta>) => {
+  return meta.retentionPolicy.type === 'inherit' ? meta.teamRetentionPolicy : meta.retentionPolicy
+}
+
+// Incoming metas are freshly unmarshaled from RPC data, so fields with unchanged
+// content still arrive with new identities (botAliases, commands, pinnedMsg, ...).
+// Reuse the old value for any deep-equal field so subscriber selectors can bail on
+// reference checks instead of re-rendering.
+const copyOverOldValuesIfEqual = (
+  oldMeta: T.Immutable<T.Chat.ConversationMeta>,
+  newMeta: T.Immutable<T.Chat.ConversationMeta>
+): T.Immutable<T.Chat.ConversationMeta> => {
+  const merged: Record<string, unknown> = {...newMeta}
+  for (const key of Object.keys(merged)) {
+    const oldValue = (oldMeta as Record<string, unknown>)[key]
+    const newValue = merged[key]
+    if (newValue !== oldValue && isEqual(newValue, oldValue)) {
+      merged[key] = oldValue
+    }
+  }
+  return merged as T.Immutable<T.Chat.ConversationMeta>
+}
+
+// Upgrade a meta, try and keep existing values if possible to reduce render thrashing in components
+// Enforce the verions only increase and we only go from untrusted to trusted, etc
+export const updateMeta = (
+  oldMeta: T.Immutable<T.Chat.ConversationMeta>,
+  newMeta: T.Immutable<T.Chat.ConversationMeta>
+): T.Immutable<T.Chat.ConversationMeta> => {
+  if (newMeta.inboxVersion < oldMeta.inboxVersion) {
+    // new is older, keep old
+    return oldMeta
+  } else if (oldMeta.inboxVersion === newMeta.inboxVersion) {
+    // same version, take data if untrusted -> trusted
+    // or if localVersion increased
+    if (
+      (newMeta.trustedState === 'trusted' && oldMeta.trustedState !== 'trusted') ||
+      newMeta.inboxLocalVersion > oldMeta.inboxLocalVersion
+    ) {
+      return copyOverOldValuesIfEqual(oldMeta, newMeta)
+    }
+    return oldMeta
+  }
+  // higher inbox version, use new
+  return copyOverOldValuesIfEqual(oldMeta, newMeta)
+}
+
+type NotificationSettingsParsed = {
+  notificationsDesktop: T.Chat.NotificationsType
+  notificationsGlobalIgnoreMentions: boolean
+  notificationsMobile: T.Chat.NotificationsType
+}
+export const parseNotificationSettings = (
+  notifications?: T.RPCChat.ConversationNotificationInfo
+): NotificationSettingsParsed => {
+  let notificationsDesktop = 'never' as T.Chat.NotificationsType
+  let notificationsGlobalIgnoreMentions = false
+  let notificationsMobile = 'never' as T.Chat.NotificationsType
+
+  // Map this weird structure from the daemon to something we want
+  if (notifications) {
+    notificationsGlobalIgnoreMentions = notifications.channelWide
+    const s = notifications.settings
+    const desktop = s?.[String(T.RPCGen.DeviceType.desktop)]
+    if (desktop) {
+      if (desktop[String(T.RPCChat.NotificationKind.generic)]) {
+        notificationsDesktop = 'onAnyActivity'
+      } else if (desktop[String(T.RPCChat.NotificationKind.atmention)]) {
+        notificationsDesktop = 'onWhenAtMentioned'
+      }
+    }
+    const mobile = s?.[String(T.RPCGen.DeviceType.mobile)]
+    if (mobile) {
+      if (mobile[String(T.RPCChat.NotificationKind.generic)]) {
+        notificationsMobile = 'onAnyActivity'
+      } else if (mobile[String(T.RPCChat.NotificationKind.atmention)]) {
+        notificationsMobile = 'onWhenAtMentioned'
+      }
+    }
+  }
+
+  return {notificationsDesktop, notificationsGlobalIgnoreMentions, notificationsMobile}
+}
+
+const UIItemToRetentionPolicies = (
+  i: T.RPCChat.InboxUIItem | T.RPCChat.UnverifiedInboxUIItem,
+  isTeam: boolean
+) => {
+  // default inherit for teams, retain for ad-hoc
+  // TODO remove these hard-coded defaults if core starts sending the defaults instead of nil to represent 'unset'
+  let retentionPolicy = isTeam ? Teams.makeRetentionPolicy({type: 'inherit'}) : Teams.makeRetentionPolicy()
+  if (i.convRetention) {
+    // it has been set for this conversation
+    retentionPolicy = Teams.serviceRetentionPolicyToRetentionPolicy(i.convRetention)
+  }
+
+  // default for team-wide policy is 'retain'
+  let teamRetentionPolicy = Teams.makeRetentionPolicy()
+  if (i.teamRetention) {
+    teamRetentionPolicy = Teams.serviceRetentionPolicyToRetentionPolicy(i.teamRetention)
+  }
+  return {retentionPolicy, teamRetentionPolicy}
+}
+
+// A conversation with no minimum writer role (none set, or cleared) lets every member write.
+export const convSettingsToMeta = (
+  settings: T.RPCChat.ConversationSettingsLocal | null | undefined
+): Pick<T.Chat.ConversationMeta, 'cannotWrite' | 'minWriterRole'> => {
+  const info = settings?.minWriterRoleInfo
+  const role = info ? Teams.teamRoleByEnum[info.role] : 'none'
+  return {cannotWrite: info?.cannotWrite ?? false, minWriterRole: role === 'none' ? 'reader' : role}
+}
+
+export const inboxUIItemToConversationMeta = (
+  i: T.RPCChat.InboxUIItem
+): T.Chat.ConversationMeta | undefined => {
+  // Private chats only
+  if (i.visibility !== T.RPCGen.TLFVisibility.private) {
+    return
+  }
+  // We don't support mixed reader/writers
+  if (i.name.includes('#')) {
+    return
+  }
+
+  const isTeam = i.membersType === T.RPCChat.ConversationMembersType.team
+
+  const {cannotWrite, minWriterRole} = convSettingsToMeta(i.convSettings)
+  const conversationIDKey = T.Chat.stringToConversationIDKey(i.convID)
+  let pinnedMsg: T.Chat.PinnedMessageInfo | undefined
+  if (i.pinnedMsg) {
+    const username = useCurrentUserState.getState().username
+    const devicename = useCurrentUserState.getState().deviceName
+    const getLastOrdinal = () => T.Chat.numberToOrdinal(Math.max(0, i.maxVisibleMsgID))
+    const message = Message.uiMessageToMessage(
+      conversationIDKey,
+      i.pinnedMsg.message,
+      username,
+      getLastOrdinal,
+      devicename
+    )
+    if (message) {
+      pinnedMsg = {
+        message,
+        pinnerUsername: i.pinnedMsg.pinnerUsername,
+      }
+    }
+  }
+
+  return {
+    ...makeConversationMeta(),
+    ...baseMetaFromUIItem(i, isTeam, i.resetParticipants),
+    botAliases: i.botAliases ?? {},
+    botCommands: i.botCommands,
+    cannotWrite,
+    channelname: (isTeam && i.channel) || '',
+    description: i.headline,
+    descriptionDecorated: i.headlineDecorated,
+    isEmpty: i.isEmpty,
+    minWriterRole,
+    pinnedMsg,
+    snippet: i.snippet,
+    snippetDecorated: i.snippetDecorated,
+    snippetDecoration: i.snippetDecoration,
+    teamname: (isTeam && i.name) || '',
+    trustedState: 'trusted',
+  }
+}
+
+export const makeConversationMeta = (): T.Chat.ConversationMeta => ({
+  botAliases: {},
+  botCommands: {} as T.RPCChat.ConversationCommandGroups,
+  cannotWrite: false,
+  channelname: '',
+  commands: {} as T.RPCChat.ConversationCommandGroups,
+  conversationIDKey: T.Chat.noConversationIDKey,
+  description: '',
+  descriptionDecorated: '',
+  draft: '',
+  inboxLocalVersion: -1,
+  inboxVersion: -1,
+  isEmpty: false,
+  isMuted: false,
+  maxMsgID: T.Chat.numberToMessageID(-1),
+  maxVisibleMsgID: T.Chat.numberToMessageID(-1),
+  membershipType: 'active' as const,
+  minWriterRole: 'reader' as const,
+  notificationsDesktop: 'never' as const,
+  notificationsGlobalIgnoreMentions: false,
+  notificationsMobile: 'never' as const,
+  offline: false,
+  pinnedMsg: undefined,
+  readMsgID: T.Chat.numberToMessageID(-1),
+  rekeyers: new Set(),
+  resetParticipants: new Set(),
+  retentionPolicy: Teams.makeRetentionPolicy(),
+  snippet: '',
+  snippetDecorated: undefined,
+  snippetDecoration: T.RPCChat.SnippetDecoration.none as T.RPCChat.SnippetDecoration,
+  status: T.RPCChat.ConversationStatus.unfiled as T.RPCChat.ConversationStatus,
+  supersededBy: T.Chat.noConversationIDKey,
+  supersedes: T.Chat.noConversationIDKey,
+  teamID: '',
+  teamRetentionPolicy: Teams.makeRetentionPolicy(),
+  teamType: 'adhoc' as T.Chat.TeamType,
+  teamname: '',
+  timestamp: 0,
+  tlfname: '',
+  trustedState: 'untrusted' as T.Chat.MetaTrustedState,
+  wasFinalizedBy: '',
+})
+
+export const getRowParticipants = (participants: T.Immutable<T.Chat.ParticipantInfo>, username: string) =>
+  participants.name
+    // Filter out ourselves unless it's our 1:1 conversation
+    .filter((participant, _, list) => (list.length === 1 ? true : participant !== username))
+
+export const getTeams = (metaMap: T.Chat.MetaMap) =>
+  [...metaMap.values()].reduce<Array<string>>((l, meta) => {
+    if (meta.teamname && meta.channelname === 'general') {
+      l.push(meta.teamname)
+    }
+    return l
+  }, [])

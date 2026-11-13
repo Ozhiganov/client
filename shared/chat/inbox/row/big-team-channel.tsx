@@ -1,0 +1,252 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import * as RowSizes from './sizes'
+import * as T from '@/constants/types'
+import {useInboxRowBig} from '@/chat/inbox/rows-state'
+import {useOpenedRowState} from './opened-row-state'
+import ChannelMenu from '@/chat/conversation/info-panel/menu'
+type Props = {
+  conversationIDKey: string
+  selected: boolean
+}
+
+const BigTeamChannel = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {selected, conversationIDKey} = props
+
+  const row = useInboxRowBig(conversationIDKey)
+  const {channelname, isMuted, hasBadge, hasDraft, hasUnread, isError, snippetDecoration} = row
+
+  const onSelectConversation = () => C.Router2.navigateToThread(conversationIDKey, 'inboxBig')
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    return (
+      <ChannelMenu
+        attachTo={attachTo}
+        channelOnly={true}
+        conversationIDKey={conversationIDKey}
+        hasHeader={false}
+        isSmallTeam={false}
+        onHidden={hidePopup}
+        visible={true}
+      />
+    )
+  }
+  const {showingPopup, showPopup, popup, popupAnchor} = Kb.usePopup2(makePopup)
+  const setOpenedRow = useOpenedRowState(s => s.dispatch.setOpenRow)
+  const onLongPress = isMobile
+    ? () => {
+        setOpenedRow(Chat.noConversationIDKey)
+        showPopup()
+      }
+    : undefined
+
+  let outboxTooltip: string | undefined
+  let outboxIcon: React.ReactNode = null
+  switch (snippetDecoration) {
+    case T.RPCChat.SnippetDecoration.pendingMessage:
+      outboxTooltip = 'Sending...'
+      outboxIcon = (
+        <Kb.Icon
+          style={styles.icon}
+          sizeType="Small"
+          type={'iconfont-hourglass'}
+          color={selected ? theme.white : theme.black_20}
+        />
+      )
+      break
+    case T.RPCChat.SnippetDecoration.failedPendingMessage:
+      outboxTooltip = 'Message failed to send'
+      outboxIcon = (
+        <Kb.Icon
+          style={styles.icon}
+          type={'iconfont-exclamation'}
+          color={selected ? theme.white : theme.red}
+        />
+      )
+      break
+    default:
+  }
+
+  const nameStyle = Kb.Styles.collapseStyles([
+    styles.channelText,
+    isError
+      ? styles.textError
+      : selected
+        ? hasUnread
+          ? styles.textSelectedBold
+          : styles.textSelected
+        : hasUnread
+          ? styles.textPlainBold
+          : styles.textPlain,
+  ])
+
+  const name = (
+    <Kb.Text
+      lineClamp={1}
+      type="Body"
+      style={Kb.Styles.collapseStyles([styles.channelHash, selected && styles.channelHashSelected])}
+    >
+      #{' '}
+      <Kb.Text type={selected ? 'BodySemibold' : 'Body'} style={nameStyle}>
+        {channelname}
+      </Kb.Text>
+    </Kb.Text>
+  )
+
+  const mutedIcon = isMuted ? (
+    <Kb.Box2 alignSelf="center" direction="vertical" tooltip="Muted conversation">
+      <Kb.IconAuto
+        color={selected ? theme.white : theme.black_20}
+        style={styles.muted}
+        type={Kb.Styles.isPhone ? (selected ? 'icon-shh-active-26-21' : 'icon-shh-26-21') : 'iconfont-shh'}
+      />
+    </Kb.Box2>
+  ) : null
+
+  const draftIcon = hasDraft ? (
+    <Kb.Icon
+      type="iconfont-edit"
+      style={styles.icon}
+      sizeType="Small"
+      color={selected ? theme.white : undefined}
+    />
+  ) : null
+
+  return (
+    <Kb.ClickableBox
+      direction="vertical"
+      fullWidth={true}
+      onClick={onSelectConversation}
+      onLongPress={onLongPress}
+      style={styles.container}
+      testID={TestIDs.CHAT_INBOX_CHANNEL_ROW}
+    >
+      {popup}
+      <Kb.Box2 direction="horizontal" fullHeight={true} style={styles.rowContainer}>
+        <Kb.Box2
+          className="hover_background_color_blueGreyDark hover-container"
+          direction="horizontal"
+          alignSelf={isMobile ? 'center' : undefined}
+          fullWidth={!isMobile}
+          alignItems="center"
+          style={Kb.Styles.collapseStyles([
+            styles.channelBackground,
+            selected && styles.selectedChannelBackground,
+          ])}
+        >
+          {name}
+          {mutedIcon}
+          <Kb.Box2
+            direction="horizontal"
+            alignSelf="center"
+            alignItems="center"
+            justifyContent="flex-end"
+            flex={1}
+            tooltip={outboxTooltip || (hasDraft ? 'Draft message' : undefined)}
+          >
+            {draftIcon}
+            {outboxIcon}
+            {hasBadge && <Kb.Box2 direction="vertical" style={styles.unread} />}
+          </Kb.Box2>
+          {!isMobile && (
+            <Kb.Box2
+              // stays up while its menu is open, so the menu keeps its anchor
+              className={showingPopup ? undefined : 'hover-visible'}
+              direction="vertical"
+              ref={popupAnchor}
+              style={styles.gear}
+            >
+              <Kb.Icon
+                type="iconfont-gear"
+                onClick={showPopup}
+                color={selected ? theme.white : theme.black_35}
+                hoverColor={selected ? theme.white_75 : theme.black}
+              />
+            </Kb.Box2>
+          )}
+        </Kb.Box2>
+      </Kb.Box2>
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      channelBackground: Kb.Styles.platformStyles({
+        common: {
+          marginLeft: Kb.Styles.globalMargins.large,
+          paddingRight: Kb.Styles.globalMargins.xsmall,
+        },
+        isElectron: {
+          borderBottomLeftRadius: 3,
+          borderTopLeftRadius: 3,
+          paddingLeft: Kb.Styles.globalMargins.tiny,
+        },
+        isPhone: {
+          ...Kb.Styles.globalStyles.fillAbsolute,
+          flex: 1,
+          paddingLeft: Kb.Styles.globalMargins.small,
+        },
+        isTablet: {
+          borderBottomLeftRadius: 3,
+          borderTopLeftRadius: 3,
+          flex: 1,
+          height: '80%',
+          marginLeft: 48,
+          paddingLeft: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+      channelHash: {color: theme.black_20},
+      channelHashSelected: {color: theme.white_60},
+      channelText: Kb.Styles.platformStyles({
+        isElectron: {wordBreak: 'break-all'},
+      }),
+      container: {flexShrink: 0, height: RowSizes.bigRowHeight},
+      gear: {marginLeft: Kb.Styles.globalMargins.xtiny},
+      icon: {
+        display: 'flex',
+        margin: 3,
+      },
+      muted: {marginLeft: Kb.Styles.globalMargins.xtiny},
+      rowContainer: Kb.Styles.platformStyles({
+        common: {
+          alignItems: 'stretch',
+          paddingLeft: Kb.Styles.globalMargins.tiny,
+          paddingRight: 0,
+        },
+        isTablet: {alignItems: 'center'},
+      }),
+      selectedChannelBackground: {backgroundColor: theme.blue},
+      textError: {color: theme.redDark},
+      textPlain: {color: theme.black_63},
+      textPlainBold: {
+        color: theme.blackOrWhite,
+        ...Kb.Styles.globalStyles.fontBold,
+      },
+      textSelected: {color: theme.white},
+      textSelectedBold: {
+        color: theme.white,
+        ...Kb.Styles.globalStyles.fontBold,
+      },
+      unread: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.orange,
+          borderRadius: Kb.Styles.borderRadius,
+          flexShrink: 0,
+          ...Kb.Styles.size(8),
+        },
+        isMobile: {
+          marginRight: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+    }) as const
+)
+
+export default BigTeamChannel

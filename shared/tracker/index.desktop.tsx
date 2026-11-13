@@ -1,0 +1,392 @@
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+import {openURL as openUrl} from '@/util/misc'
+import {useColorScheme} from 'react-native'
+import Bio from './bio'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {assertionColorToColor, assertionColorToTextColor, stateToIcon} from './model'
+
+export type Props = {
+  assertions?: ReadonlyArray<T.Tracker.Assertion>
+  bio?: string
+  blocked: boolean
+  darkMode: boolean
+  followThem: boolean
+  followersCount?: number
+  followingCount?: number
+  followsYou: boolean
+  fullname?: string
+  guiID: string
+  hidFromFollowers: boolean
+  httpSrvAddress: string
+  httpSrvToken: string
+  isYou: boolean
+  location?: string
+  onAccept: () => void
+  onChat: () => void
+  onClose: () => void
+  onFollow: () => void
+  onIgnoreFor24Hours: () => void
+  onReload: () => void
+  reason: string
+  state: T.Tracker.DetailsState
+  teamShowcase?: ReadonlyArray<T.Tracker.TeamShowcase>
+  trackerUsername: string
+}
+
+const avatarUrl = (httpSrvAddress: string, httpSrvToken: string, username: string, darkMode: boolean) =>
+  `http://${httpSrvAddress}/av?typ=user&name=${username}&format=square_192&mode=${darkMode ? 'dark' : 'light'}&token=${httpSrvToken}&count=0`
+
+const teamAvatarUrl = (httpSrvAddress: string, httpSrvToken: string, teamname: string, darkMode: boolean) =>
+  `http://${httpSrvAddress}/av?typ=team&name=${teamname}&format=square_192&mode=${darkMode ? 'dark' : 'light'}&token=${httpSrvToken}&count=0`
+
+const getButtons = (props: Props, theme: Kb.Styles.Theme, styles: ReturnType<typeof useStyles>) => {
+  const buttonClose = (
+    <Kb.Button type="Dim" key="Close" label="Close" onClick={props.onClose} />
+  )
+  const buttonAccept = (
+    <Kb.Button type="Success" key="Accept" label="Accept" onClick={props.onAccept} />
+  )
+  const buttonChat = (
+    <Kb.Button key="Chat" label="Chat" onClick={props.onChat}>
+      <Kb.Icon type="iconfont-chat" color={theme.whiteOrWhite} style={styles.chatIcon} />
+    </Kb.Button>
+  )
+
+  if (props.isYou) {
+    return [buttonClose, buttonChat]
+  }
+
+  switch (props.state) {
+    case 'notAUserYet':
+      return [buttonClose]
+    case 'checking':
+      break
+    case 'valid':
+      return props.followThem
+        ? [buttonClose, buttonChat]
+        : [
+            buttonChat,
+            <Kb.Button type="Success" key="Follow" label="Follow" onClick={props.onFollow} />,
+          ]
+    case 'broken':
+      return [
+        <Kb.Button type="Dim" key="Ignore for 24 hours" label="Ignore for 24 hours" onClick={props.onIgnoreFor24Hours} />,
+        buttonAccept,
+      ]
+    case 'needsUpgrade':
+      return [buttonChat, buttonAccept]
+    case 'error':
+      return [<Kb.Button key="Reload" label="Reload" onClick={props.onReload} />]
+    default:
+      break
+  }
+  return []
+}
+
+const _scoreAssertionKey = (a: string) => {
+  switch (a) {
+    case 'pgp': return 110
+    case 'twitter': return 100
+    case 'facebook': return 90
+    case 'github': return 80
+    case 'reddit': return 75
+    case 'hackernews': return 70
+    case 'https': return 60
+    case 'http': return 50
+    case 'dns': return 40
+    case 'stellar': return 30
+    case 'btc': return 20
+    case 'zcash': return 10
+    default: return 1
+  }
+}
+
+const sortAssertions = (a: T.Tracker.Assertion, b: T.Tracker.Assertion) => {
+  if (a.type === b.type) {
+    return a.value.localeCompare(b.value)
+  }
+  return _scoreAssertionKey(b.type) - _scoreAssertionKey(a.type)
+}
+
+const siteIconToSrcSet = (set: T.Tracker.SiteIconSet) =>
+  set.map(i => `url("${i.path}")`).reverse().join(', ')
+
+// Inline assertion rendering (store-free)
+const AssertionRow = (props: {assertion: T.Tracker.Assertion}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {assertion: a} = props
+  const isDarkMode = useColorScheme() === 'dark'
+  const iconSet = isDarkMode ? a.siteIconDarkmode : a.siteIcon
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} noShrink={true} style={styles.assertionRow}>
+      <Kb.Box2 alignItems="flex-start" direction="horizontal" gap="tiny" fullWidth={true} gapStart={true} gapEnd={true}>
+        {iconSet.length > 0 && (
+          <Kb.Box2
+            alignSelf="center"
+            direction="vertical"
+            style={Kb.Styles.collapseStyles([
+              styles.siteIcon,
+              Kb.Styles.platformStyles({isElectron: {backgroundImage: siteIconToSrcSet(iconSet)}}),
+            ])}
+          />
+        )}
+        <Kb.Text type="Body" style={styles.assertionTextContainer}>
+          <Kb.Text
+            type="BodyPrimaryLink"
+            onClick={a.siteURL ? () => { void openUrl(a.siteURL) } : undefined}
+            style={Kb.Styles.collapseStyles([
+              styles.assertionValue,
+              a.state === 'revoked' && styles.strikeThrough,
+              {color: assertionColorToTextColor(a.color, theme)},
+            ])}
+          >
+            {a.value}
+          </Kb.Text>
+          <Kb.Text type="Body" style={styles.assertionSite}>@{a.type}</Kb.Text>
+        </Kb.Text>
+        <Kb.Icon
+          type={stateToIcon(a.state)}
+          fontSize={20}
+          color={assertionColorToColor(a.color, theme)}
+          onClick={a.proofURL ? () => { void openUrl(a.proofURL) } : undefined}
+        />
+      </Kb.Box2>
+      {!!a.metas.length && (
+        <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.metaContainer}>
+          {a.metas.map(m => (
+            <Kb.Meta key={m.label} backgroundColor={assertionColorToColor(m.color, theme)} title={m.label} />
+          ))}
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const TeamShowcase = (props: {name: string; httpSrvAddress: string; httpSrvToken: string}) => {
+  const styles = useStyles()
+  const isDarkMode = useColorScheme() === 'dark'
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} gap="tiny" alignItems="center">
+      <img
+        src={teamAvatarUrl(props.httpSrvAddress, props.httpSrvToken, props.name, isDarkMode)}
+        width={32}
+        height={32}
+        style={styles.teamAvatar}
+        loading="lazy"
+      />
+      <Kb.Text type="BodySemibold">{props.name}</Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const Tracker = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const isDarkMode = useColorScheme() === 'dark'
+
+  const sortedAssertions = props.assertions ? [...props.assertions].sort(sortAssertions) : null
+
+  let backgroundColor: string
+  if (['broken', 'error'].includes(props.state)) {
+    backgroundColor = theme.red
+  } else {
+    backgroundColor = props.followThem ? theme.green : theme.blue
+  }
+
+  const buttons = getButtons(props, theme, styles)
+
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} fullHeight={true} relative={true} style={styles.container}>
+      <Kb.Text type="BodySmallSemibold" style={Kb.Styles.collapseStyles([styles.reason, {backgroundColor}])}>
+        {props.reason}
+      </Kb.Text>
+      {/* Close button must go after reason text for z-ordering on Linux */}
+      <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.header} justifyContent="flex-end">
+        <Kb.Icon type="iconfont-close" color={theme.black_20} onClick={props.onClose} style={styles.close} />
+      </Kb.Box2>
+      <Kb.ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false} showsHorizontalScrollIndicator={false}>
+        <Kb.Box2 direction="vertical">
+          <Kb.Text type="BodySmallSemibold" style={styles.reasonInvisible}>
+            {props.reason}
+          </Kb.Text>
+          <Kb.Box2
+            direction="vertical"
+            fullWidth={true}
+            relative={true}
+            noShrink={true}
+            centerChildren={true}
+            gap="tiny"
+          >
+            <Kb.Box2 alignSelf="center" direction="vertical" style={styles.avatarBackground} />
+            <img
+              src={avatarUrl(props.httpSrvAddress, props.httpSrvToken, props.trackerUsername, isDarkMode)}
+              width={96}
+              height={96}
+              style={styles.avatar}
+              loading="lazy"
+            />
+            {/* follow-state colors match the profile screen's name */}
+            <Kb.Text
+              type="BodyBig"
+              selectable={true}
+              style={{color: props.followThem ? theme.greenDark : theme.orange}}
+            >
+              {props.trackerUsername}
+            </Kb.Text>
+          </Kb.Box2>
+          <Bio
+            bio={props.bio}
+            blocked={props.blocked}
+            followThem={props.followThem}
+            followersCount={props.followersCount}
+            followingCount={props.followingCount}
+            followsYou={props.followsYou}
+            fullname={props.fullname}
+            hidFromFollowers={props.hidFromFollowers}
+            inTracker={true}
+            location={props.location}
+            username={props.trackerUsername}
+          />
+          {props.teamShowcase && (
+            <Kb.Box2 direction="vertical" fullWidth={true} style={styles.teamShowcases} gap="xtiny">
+              {props.teamShowcase.map(t => (
+                <TeamShowcase key={t.name} name={t.name} httpSrvAddress={props.httpSrvAddress} httpSrvToken={props.httpSrvToken} />
+              ))}
+            </Kb.Box2>
+          )}
+          <Kb.Box2 direction="vertical" fullWidth={true} style={styles.assertions}>
+            {sortedAssertions?.map(a => <AssertionRow key={a.assertionKey} assertion={a} />)}
+          </Kb.Box2>
+          {!!buttons.length && (
+            <Kb.Box2 fullWidth={true} direction="vertical" noShrink={true} style={styles.spaceUnderButtons} />
+          )}
+        </Kb.Box2>
+      </Kb.ScrollView>
+      {!!buttons.length && (
+        <Kb.Box2
+          gap="small"
+          centerChildren={true}
+          direction="horizontal"
+          style={styles.buttons}
+          testID={TestIDs.TRACKER_BUTTONS}
+        >
+          {buttons}
+        </Kb.Box2>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const avatarSize = 96
+const barHeight = 62
+// color lives at the use sites below, where the sheet factory has the theme in scope
+const reason = {
+  alignSelf: 'center' as const,
+  flexShrink: 0,
+  ...Kb.Styles.padding(Kb.Styles.globalMargins.small, Kb.Styles.globalMargins.medium),
+  textAlign: 'center' as const,
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      assertionRow: {...Kb.Styles.paddingV(4)},
+      assertionSite: {color: theme.black_20},
+      assertionTextContainer: Kb.Styles.platformStyles({
+        common: {flexGrow: 1, flexShrink: 1, marginTop: -1},
+      }),
+      assertionValue: Kb.Styles.platformStyles({
+        common: {letterSpacing: 0.2},
+        isElectron: {wordBreak: 'break-all'},
+      }),
+      assertions: {
+        backgroundColor: theme.white,
+        flexShrink: 0,
+        ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        paddingTop: Kb.Styles.globalMargins.small,
+      },
+      avatar: {borderRadius: '50%'} as const,
+      avatarBackground: {
+        backgroundColor: theme.white,
+        bottom: 0,
+        left: 0,
+        position: 'absolute',
+        right: 0,
+        top: avatarSize / 2,
+      },
+      buttons: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.globalStyles.fillAbsolute,
+          backgroundColor: theme.white_90,
+          flexShrink: 0,
+          height: barHeight,
+          top: undefined,
+        },
+        isElectron: {boxShadow: 'rgba(0, 0, 0, 0.15) 0px 0px 3px'},
+      }),
+      chatIcon: {marginRight: Kb.Styles.globalMargins.tiny},
+      close: Kb.Styles.platformStyles({
+        common: {padding: Kb.Styles.globalMargins.tiny},
+        isElectron: {
+          ...Kb.Styles.desktopStyles.windowDraggingClickable,
+        },
+      }),
+      container: {
+        backgroundColor: theme.white,
+      },
+      header: {
+        ...Kb.Styles.paddingV(Kb.Styles.globalMargins.tiny),
+        position: 'absolute',
+        zIndex: 9,
+      },
+      metaContainer: {flexShrink: 0, paddingLeft: 20 + Kb.Styles.globalMargins.tiny * 2 - 4},
+      reason: Kb.Styles.platformStyles({
+        common: {
+          ...reason,
+          color: theme.white,
+          ...Kb.Styles.globalStyles.fillAbsolute,
+          bottom: undefined,
+          paddingBottom: reason.paddingBottom + avatarSize / 2,
+        },
+        isElectron: {
+          ...Kb.Styles.desktopStyles.windowDragging,
+        },
+      }),
+      reasonInvisible: {
+        ...reason,
+        color: theme.white,
+        opacity: 0,
+      },
+      scrollView: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.globalStyles.fillAbsolute,
+          overflowX: 'hidden',
+          overflowY: 'auto',
+          paddingBottom: Kb.Styles.globalMargins.small,
+        },
+      }),
+      siteIcon: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundSize: 'contain',
+          flexShrink: 0,
+          ...Kb.Styles.size(16),
+        },
+      }),
+      spaceUnderButtons: {
+        height: barHeight,
+      },
+      strikeThrough: {textDecorationLine: 'line-through'},
+      teamAvatar: {borderRadius: Kb.Styles.borderRadius},
+      teamShowcases: {
+        backgroundColor: theme.white,
+        flexShrink: 0,
+        paddingLeft: Kb.Styles.globalMargins.medium,
+        paddingRight: Kb.Styles.globalMargins.small,
+        paddingTop: Kb.Styles.globalMargins.small,
+      },
+    }) as const
+)
+
+export default Tracker

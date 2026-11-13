@@ -4,9 +4,8 @@
 package client
 
 import (
+	"context"
 	"fmt"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -66,7 +65,7 @@ func (s *CmdPGPList) Run() error {
 			continue
 		}
 		dui.Printf("Keybase Key ID:  %s\n", key.KID)
-		dui.Printf("PGP Fingerprint: %s\n", libkb.PGPFingerprintFromHexNoError(key.PGPFingerprint).ToQuads())
+		dui.Printf("PGP Fingerprint: %s\n", libkb.PGPFingerprintFromHexNoError(key.PGPFingerprint))
 		if len(key.PGPIdentities) > 0 {
 			dui.Printf("PGP Identities:\n")
 			for _, id := range key.PGPIdentities {
@@ -78,7 +77,11 @@ func (s *CmdPGPList) Run() error {
 				if len(id.Email) > 0 {
 					email = fmt.Sprintf(" <%s>", id.Email)
 				}
-				dui.Printf("   %s%s%s\n", id.Username, comment, email)
+				var revoked string
+				if key.IsRevoked {
+					revoked = "[Revoked] "
+				}
+				dui.Printf("   %s%s%s%s\n", revoked, id.Username, comment, email)
 			}
 		}
 		dui.Printf("\n")

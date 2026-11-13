@@ -1,0 +1,165 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type OwnProps = {
+  isSearching: boolean
+  onCancelSearch: () => void
+  onEnsureSelection: () => void
+  onSelectDown: () => void
+  onSelectUp: () => void
+  onQueryChanged: (arg0: string) => void
+  query: string
+  showSearch: boolean
+  startSearch: () => void
+}
+
+function ConversationFilterInput(ownProps: OwnProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {isSearching, onCancelSearch, onEnsureSelection, onSelectDown, onSelectUp, showSearch} = ownProps
+  const {onQueryChanged: onSetFilter, query: filter} = ownProps
+
+  const appendNewChatBuilder = C.Router2.appendNewChatBuilder
+  const {startSearch} = ownProps
+
+  const inputRef = React.useRef<Kb.SearchFilterRef>(null)
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      onCancelSearch()
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      e.stopPropagation()
+      onSelectDown()
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      e.stopPropagation()
+      onSelectUp()
+    }
+  }
+
+  const onEnterKeyDown = (e?: React.BaseSyntheticEvent) => {
+    if (!isMobile) {
+      if (e) {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+      onEnsureSelection()
+      inputRef.current?.blur()
+    }
+  }
+
+  const onChange = (q: string) => {
+    if (q !== filter) {
+      onSetFilter(q)
+    }
+  }
+
+  Kb.useHotKey('mod+n', appendNewChatBuilder)
+  Kb.useHotKey('mod+k', startSearch)
+
+  React.useEffect(() => {
+    if (isSearching) {
+      inputRef.current?.focus()
+    }
+  }, [isSearching])
+
+  const searchInput = isSearching ? (
+    <Kb.SearchFilter
+      ref={inputRef}
+      size="full-width"
+      style={styles.searchBox}
+      icon="iconfont-search"
+      placeholderText="Search"
+      showXOverride={true}
+      value={filter}
+      valueControlled={true}
+      focusOnMount={isMobile}
+      onChange={onChange}
+      onCancel={onCancelSearch}
+      onKeyDown={onKeyDown}
+      onEnterKeyDown={onEnterKeyDown}
+    />
+  ) : (
+    <Kb.Box2 direction="horizontal" style={styles.searchPlaceholderOuter} alignItems="center">
+      <Kb.ClickableBox direction="horizontal" alignItems="center" flex={1} onClick={startSearch} style={styles.searchPlaceholder} testID={TestIDs.CHAT_INBOX_SEARCH}>
+        <Kb.Icon
+          type="iconfont-search"
+          sizeType={isMobile ? 'Small' : 'Default'}
+          color={theme.black_50}
+          style={styles.searchPlaceholderIcon}
+        />
+        <Kb.Text type="BodySemibold" style={styles.searchPlaceholderText}>
+          {isMobile ? 'Search' : 'Search (\u2318K)'}
+        </Kb.Text>
+      </Kb.ClickableBox>
+    </Kb.Box2>
+  )
+  return (
+    <Kb.Box2
+      direction="horizontal"
+      centerChildren={!Kb.Styles.isTablet}
+      gap={isMobile ? 'small' : showSearch ? 'xtiny' : undefined}
+      fullWidth={true}
+      relative={true}
+      style={Kb.Styles.collapseStyles([
+        styles.containerNotFiltering,
+        !Kb.Styles.isPhone && styles.whiteBg,
+      ])}
+      gapStart={showSearch}
+      gapEnd={showSearch}
+    >
+      {showSearch && searchInput}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      containerNotFiltering: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.blueGrey,
+          height: undefined,
+        },
+        isElectron: {
+          alignSelf: 'stretch',
+          flexGrow: 1,
+          ...Kb.Styles.marginH(Kb.Styles.globalMargins.tiny),
+          width: undefined,
+        },
+        isPhone: {backgroundColor: theme.white},
+      }),
+      searchBox: Kb.Styles.platformStyles({
+        common: {flex: 1},
+        isElectron: Kb.Styles.desktopStyles.windowDraggingClickable,
+        // hacky, redo the layout of this component later
+        isTablet: {maxWidth: 270 - 16 * 2},
+      }),
+      searchPlaceholder: {
+        backgroundColor: theme.black_10,
+        borderRadius: Kb.Styles.borderRadius,
+        flexShrink: 1,
+        height: 32,
+        ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xsmall),
+      },
+      searchPlaceholderIcon: Kb.Styles.platformStyles({
+        isElectron: {marginRight: Kb.Styles.globalMargins.tiny, marginTop: 2},
+        isMobile: {marginRight: Kb.Styles.globalMargins.tiny},
+      }),
+      searchPlaceholderOuter: Kb.Styles.platformStyles({
+        common: {flex: 1},
+        isElectron: Kb.Styles.desktopStyles.windowDraggingClickable,
+        isMobile: {
+          ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.small),
+        },
+        isTablet: {...Kb.Styles.paddingH(0)},
+      }),
+      searchPlaceholderText: {color: theme.black_50},
+      whiteBg: {backgroundColor: theme.white},
+    }) as const
+)
+
+export default ConversationFilterInput

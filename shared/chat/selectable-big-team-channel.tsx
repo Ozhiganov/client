@@ -1,0 +1,185 @@
+import * as Kb from '@/common-adapters'
+import {TeamAvatar} from './avatars'
+import {pluralize} from '@/util/string'
+import {BottomLine} from './inbox/row/small-team'
+import {useInboxRowBig} from '@/chat/inbox/rows-state'
+import type * as T from '@/constants/types'
+
+type OwnProps = {
+  conversationIDKey: T.Chat.ConversationIDKey
+  isSelected: boolean
+  maxSearchHits?: number
+  name: string
+  numSearchHits?: number
+  onSelectConversation: () => void
+}
+
+const SelectableBigTeamChannel = (ownProps: OwnProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {conversationIDKey, isSelected, maxSearchHits, numSearchHits, onSelectConversation, name} = ownProps
+  const row = useInboxRowBig(conversationIDKey)
+  const showBadge = row.hasBadge
+  let teamname = row.teamname
+  let channelname = row.channelname
+  if (!teamname) {
+    const parts = name.split('#')
+    if (parts.length >= 2) {
+      teamname = parts[0]!
+      channelname = parts[1]!
+    }
+  }
+  const showBold = row.hasUnread && !isSelected
+  const snippet = row.snippet
+  const snippetDecoration = row.snippetDecoration
+
+  const props = {
+    channelname,
+    conversationIDKey,
+    isSelected,
+    maxSearchHits,
+    numSearchHits,
+    onSelectConversation,
+    showBadge,
+    showBold,
+    snippet,
+    snippetDecoration,
+    teamname,
+  }
+
+  const _getSearchHits = () => {
+    if (!props.numSearchHits) {
+      return ''
+    }
+    if (props.maxSearchHits) {
+      return props.numSearchHits >= props.maxSearchHits ? `${props.numSearchHits}+` : `${props.numSearchHits}`
+    }
+    return `${props.numSearchHits}`
+  }
+
+  const boldOverride = props.showBold ? Kb.Styles.globalStyles.fontBold : null
+  const rowLoadedContent = (
+    <>
+      <TeamAvatar teamname={props.teamname} isMuted={false} isSelected={false} />
+      <Kb.Box2 direction="vertical" fullWidth={true} overflow="hidden" style={styles.textContainer}>
+        <Kb.Box2 direction="horizontal" fullWidth={true}>
+          <Kb.Text
+            type="BodySemibold"
+            style={Kb.Styles.collapseStyles([
+              styles.teamname,
+              {color: props.isSelected ? theme.white : theme.black},
+            ])}
+            title={props.teamname}
+            lineClamp={isMobile ? 1 : undefined}
+            ellipsizeMode="tail"
+          >
+            {props.teamname}
+          </Kb.Text>
+          <Kb.Text
+            type="BodySemibold"
+            style={Kb.Styles.collapseStyles([
+              boldOverride,
+              styles.channelname,
+              {color: props.isSelected ? theme.white : theme.black},
+            ])}
+            title={`#${props.channelname}`}
+            lineClamp={isMobile ? 1 : undefined}
+            ellipsizeMode="tail"
+          >
+            &nbsp;#
+            {props.channelname}
+          </Kb.Text>
+        </Kb.Box2>
+        {!props.numSearchHits && (
+          <BottomLine
+            conversationIDKey={props.conversationIDKey}
+            snippet={props.snippet}
+            snippetDecoration={props.snippetDecoration}
+            isSelected={props.isSelected}
+            allowBold={false}
+          />
+        )}
+        {!!props.numSearchHits && (
+          <Kb.Text
+            type="BodySmall"
+            style={Kb.Styles.collapseStyles([props.isSelected && styles.selectedText])}
+          >
+            {_getSearchHits()} {pluralize('result', props.numSearchHits)}
+          </Kb.Text>
+        )}
+      </Kb.Box2>
+      {props.showBadge && <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.badge} />}
+    </>
+  )
+  return (
+    <Kb.ClickableBox
+      direction="horizontal"
+      fullWidth={true}
+      centerChildren={true}
+      className="hover_background_color_blueGreyDark"
+      onClick={props.onSelectConversation}
+      style={Kb.Styles.collapseStyles([
+        styles.filteredRow,
+        {
+          backgroundColor: props.isSelected ? theme.blue : theme.white,
+        },
+      ])}
+    >
+      {props.teamname ? rowLoadedContent : <Kb.ProgressIndicator type="Small" />}
+    </Kb.ClickableBox>
+  )
+}
+
+const rowHeight = isMobile ? 64 : 56
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      badge: {
+        backgroundColor: theme.orange,
+        borderRadius: 6,
+        flexShrink: 0,
+        height: Kb.Styles.globalMargins.tiny,
+        width: Kb.Styles.globalMargins.tiny,
+      },
+      channelname: Kb.Styles.platformStyles({
+        // TODO: tweak this so that they take up full space in popup
+        common: {
+          flexShrink: 0,
+          maxWidth: '70%',
+        },
+        isElectron: {
+          ...Kb.Styles.textEllipsis,
+        },
+      }),
+      filteredRow: Kb.Styles.platformStyles({
+        common: {
+          height: rowHeight,
+        },
+        isElectron: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xsmall),
+        },
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        },
+      }),
+      selectedText: {
+        color: theme.white,
+      },
+      teamname: Kb.Styles.platformStyles({
+        common: {
+          color: theme.black,
+          flexShrink: 1,
+        },
+        isElectron: {
+          ...Kb.Styles.textEllipsis,
+        },
+      }),
+      textContainer: {
+        flexShrink: 1,
+        paddingRight: Kb.Styles.globalMargins.tiny,
+      },
+    }) as const
+)
+
+export default SelectableBigTeamChannel

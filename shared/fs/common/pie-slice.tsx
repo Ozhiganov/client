@@ -1,0 +1,106 @@
+import * as Kb from '@/common-adapters'
+
+type Props = {
+  degrees: number
+  animated?: boolean
+  negative?: boolean
+  style?: Kb.Styles.StylesCrossPlatform
+}
+
+const Slice = (props: Props) => {
+  const styles = useStyles()
+  const styleFilled = props.negative ? styles.filledNegative : styles.filledPositive
+  const styleUnfilled = props.negative ? styles.unfilledNegative : styles.unfilledPositive
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.collapseStyles([styles.container, ...(props.style ? [props.style] : [])])}>
+      <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.collapseStyles([styles.wholeUnfilled, styleUnfilled])} />
+      <Kb.Box2 alignSelf="center"
+        direction="vertical"
+        style={Kb.Styles.collapseStyles([
+          styles.rotateContainer,
+          Kb.Styles.platformStyles({
+            isElectron: {transform: `rotate(${props.degrees}deg)`},
+            isMobile: {transform: [{rotate: `${props.degrees}deg`}]},
+          }),
+        ])}
+      >
+        <Kb.Box2 alignSelf="center" direction="vertical" style={Kb.Styles.collapseStyles([styles.leftFilled, styleFilled])} />
+      </Kb.Box2>
+      <Kb.Box2 alignSelf="center"
+        direction="vertical"
+        style={Kb.Styles.collapseStyles(
+          props.degrees <= 180 ? [styles.leftUnfilled, styleUnfilled] : [styles.rightFilled, styleFilled]
+        )}
+      />
+    </Kb.Box2>
+  )
+}
+
+const PieSlice = (props: Props) => (
+  <Slice degrees={props.degrees} style={props.style} negative={props.negative} />
+)
+const pieSize = isMobile ? 16 : 12
+const pieHalfSize = isMobile ? 8 : 6
+const stylePieHalf = {
+  height: pieSize,
+  position: 'absolute' as const,
+  width: pieHalfSize,
+}
+const stylePieWhole = {
+  height: pieSize,
+  position: 'absolute' as const,
+  width: pieSize,
+}
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: {
+        ...Kb.Styles.size(pieSize),
+        position: 'relative' as const,
+      },
+      filledNegative: {
+        backgroundColor: theme.greyLight,
+      },
+      filledPositive: {
+        backgroundColor: theme.blue,
+      },
+      leftFilled: {
+        ...stylePieHalf,
+        borderBottomLeftRadius: pieHalfSize,
+        borderTopLeftRadius: pieHalfSize,
+        left: 0,
+        overflow: 'hidden', // need to set this so it's fully round on mobile
+      },
+      leftUnfilled: {
+        ...stylePieHalf,
+        borderBottomLeftRadius: pieHalfSize,
+        borderTopLeftRadius: pieHalfSize,
+        left: 0,
+        overflow: 'hidden',
+      },
+      rightFilled: {
+        ...stylePieHalf,
+        borderBottomRightRadius: pieHalfSize,
+        borderTopRightRadius: pieHalfSize,
+        left: pieHalfSize,
+        overflow: 'hidden',
+      },
+      rotateContainer: {
+        ...stylePieWhole,
+        left: 0,
+      },
+      unfilledNegative: {
+        backgroundColor: theme.blueDark,
+      },
+      unfilledPositive: {
+        backgroundColor: theme.greyLight,
+      },
+      wholeUnfilled: {
+        ...stylePieWhole,
+        borderRadius: pieHalfSize,
+        overflow: 'hidden',
+      },
+    }) as const
+)
+
+export default PieSlice

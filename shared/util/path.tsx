@@ -1,0 +1,42 @@
+import {pathSep} from '@/constants/platform'
+// simple versions we use in the renderer, definitely doesn't handle edge cases but likely ok as-is
+
+// pathSep is a backslash on windows, which is a regex escape, so it can't go in a pattern raw
+const sepRun = new RegExp(`${pathSep.replaceAll(/[\\^$*+?.()|[\]{}]/g, '\\$&')}+`, 'g')
+
+export const join = (...args: Array<string>) => {
+  return [...args].join(pathSep).replace(sepRun, pathSep)
+}
+
+export const extname = (path: string) => {
+  const parts = path.split(pathSep)
+  const last = parts.at(-1)
+  const idx = last?.lastIndexOf('.') ?? -1
+  if (idx === -1) {
+    return ''
+  }
+
+  return last?.substring(idx) ?? ''
+}
+
+export const basename = (path: string, extname: string) => {
+  const parts = path.split(pathSep)
+  const last = parts.at(-1)
+  if (last?.endsWith(extname)) {
+    return last.substring(0, last.length - extname.length)
+  } else {
+    return last
+  }
+}
+
+export const dirname = (path: string) => {
+  const parts = path.split(pathSep)
+  parts.pop()
+  const dir = parts.join(pathSep)
+  // the parent of a root level file is the root, not a relative path
+  return !dir && parts.length ? pathSep : dir
+}
+
+export const isPathSaltpackEncrypted = (path: string) => path.endsWith('.encrypted.saltpack')
+export const isPathSaltpackSigned = (path: string) => path.endsWith('.signed.saltpack')
+export const isPathSaltpack = (path: string) => isPathSaltpackEncrypted(path) || isPathSaltpackSigned(path)

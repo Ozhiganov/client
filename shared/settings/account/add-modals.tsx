@@ -1,0 +1,219 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {EnterEmailBody} from '@/signup/email'
+import {EnterPhoneNumberBody} from '@/signup/phone-number'
+import VerifyBody from '@/signup/phone-number/verify-body'
+import {useAddPhoneNumber, usePhoneVerification} from '@/signup/phone-number/use-verification'
+import {useAddEmail} from './use-add-email'
+import {useDefaultPhoneCountry} from '@/util/phone-numbers'
+import {settingsAccountTab} from '@/constants/settings'
+
+export const Email = () => {
+  const nav = useSafeNavigation()
+
+  const [email, onChangeEmail] = React.useState('')
+  const [searchable, onChangeSearchable] = React.useState(true)
+  const [submittedEmail, setSubmittedEmail] = React.useState('')
+  const emailTrimmed = email.trim()
+  const disabled = !emailTrimmed
+
+  const {clearError, error: emailError, submitEmail, waiting} = useAddEmail()
+
+  const clearModals = C.Router2.clearModals
+  const navigateAppend = C.Router2.navigateAppend
+
+  // clean on edit
+  React.useEffect(() => {
+    if (emailTrimmed !== submittedEmail && emailError) {
+      clearError()
+    }
+  }, [clearError, emailError, emailTrimmed, submittedEmail])
+
+  const onClose = () => nav.safeNavigateUp()
+  const onContinue = () => {
+    if (disabled || waiting) {
+      return
+    }
+    setSubmittedEmail(emailTrimmed)
+    submitEmail(emailTrimmed, searchable, addedEmail => {
+      clearModals()
+      // Wait for the modal reset so replace=true updates the account route instead of duplicating it.
+      setTimeout(() => {
+        navigateAppend({name: settingsAccountTab, params: {addedEmailBannerEmail: addedEmail}}, true)
+      }, 0)
+    })
+  }
+  return (
+    <Kb.ModalScreen
+      banner={
+        emailError ? (
+          <Kb.Banner color="red">
+            <Kb.BannerParagraph bannerColor="red" content={emailError} />
+          </Kb.Banner>
+        ) : null
+      }
+      footer={
+        <Kb.ConfirmButtons
+          split={true}
+          waiting={waiting}
+          onCancel={onClose}
+          onConfirm={onContinue}
+          confirmLabel="Continue"
+          confirmDisabled={disabled}
+        />
+      }
+    >
+      <EnterEmailBody
+        email={email}
+        onChangeEmail={onChangeEmail}
+        showSearchable={true}
+        searchable={searchable}
+        onChangeSearchable={onChangeSearchable}
+        onContinue={onContinue}
+        iconType={
+          isMobile
+            ? C.isLargeScreen
+              ? 'icon-email-add-96'
+              : 'icon-email-add-64'
+            : 'icon-email-add-64'
+        }
+      />
+    </Kb.ModalScreen>
+  )
+}
+export const Phone = () => {
+  const nav = useSafeNavigation()
+
+  const [phoneNumber, onChangeNumber] = React.useState('')
+  const [valid, onChangeValidity] = React.useState(false)
+  const [searchable, onChangeSearchable] = React.useState(true)
+  const disabled = !valid
+
+  const defaultCountry = useDefaultPhoneCountry()
+  const {clearError, error, submitPhoneNumber, waiting} = useAddPhoneNumber()
+
+  const onClose = () => {
+    nav.safeNavigateUp()
+  }
+
+  const onContinue = () => {
+    if (disabled || waiting) {
+      return
+    }
+    submitPhoneNumber(phoneNumber, searchable, submittedPhoneNumber => {
+      nav.safeNavigateAppend({
+        name: 'settingsVerifyPhone',
+        params: {initialResend: false, phoneNumber: submittedPhoneNumber},
+      })
+    })
+  }
+
+  const onChangeNumberCb = (phoneNumber: string, validity: boolean) => {
+    if (error) {
+      clearError()
+    }
+    onChangeNumber(phoneNumber)
+    onChangeValidity(validity)
+  }
+
+  return (
+    <Kb.ModalScreen
+      banner={
+        error ? (
+          <Kb.Banner color="red">
+            <Kb.BannerParagraph bannerColor="red" content={error} />
+          </Kb.Banner>
+        ) : null
+      }
+      footer={
+        <Kb.ConfirmButtons
+          split={true}
+          waiting={waiting}
+          onCancel={onClose}
+          onConfirm={onContinue}
+          confirmLabel="Continue"
+          confirmDisabled={disabled}
+        />
+      }
+    >
+      <EnterPhoneNumberBody
+        defaultCountry={defaultCountry}
+        onChangeNumber={onChangeNumberCb}
+        onContinue={onContinue}
+        searchable={searchable}
+        onChangeSearchable={onChangeSearchable}
+        iconType={
+          isMobile
+            ? C.isLargeScreen
+              ? 'icon-phone-number-add-96'
+              : 'icon-phone-number-add-64'
+            : 'icon-phone-number-add-64'
+        }
+      />
+    </Kb.ModalScreen>
+  )
+}
+type VerifyPhoneProps = {
+  initialResend?: boolean
+  phoneNumber: string
+}
+
+export const VerifyPhone = ({initialResend, phoneNumber}: VerifyPhoneProps) => {
+  const styles = useStyles()
+  const [code, onChangeCode] = React.useState('')
+
+  const clearModals = C.Router2.clearModals
+  const navigateAppend = C.Router2.navigateAppend
+  const {error, resendVerificationForPhone, verifyPhoneNumber} = usePhoneVerification({
+    initialResend,
+    onSuccess: () => {
+      clearModals()
+      // Wait for the modal reset so replace=true updates the account route instead of duplicating it.
+      setTimeout(() => {
+        navigateAppend({name: settingsAccountTab, params: {addedPhoneBanner: true}}, true)
+      }, 0)
+    },
+    phoneNumber,
+  })
+  const resendWaiting = C.Waiting.useAnyWaiting(C.waitingKeySettingsPhoneResendVerification)
+  const verifyWaiting = C.Waiting.useAnyWaiting(C.waitingKeySettingsPhoneVerifyPhoneNumber)
+
+  const onResend = () => {
+    resendVerificationForPhone(phoneNumber)
+  }
+  const onContinue = () => verifyPhoneNumber(phoneNumber, code)
+  const disabled = !code
+
+  return (
+    <Kb.ModalScreen
+      centered={true}
+      style={styles.blueBackground}
+      footerDivider={false}
+      banner={
+        error ? (
+          <Kb.Banner color="red">
+            <Kb.BannerParagraph bannerColor="red" content={error} />
+          </Kb.Banner>
+        ) : null
+      }
+      footer={
+        <Kb.Button
+          disabled={disabled}
+          type="Success"
+          label="Continue"
+          onClick={onContinue}
+          waiting={verifyWaiting}
+          fullWidth={true}
+        />
+      }
+    >
+      <VerifyBody onResend={onResend} resendWaiting={resendWaiting} code={code} onChangeCode={onChangeCode} />
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  blueBackground: {backgroundColor: theme.blue},
+}))

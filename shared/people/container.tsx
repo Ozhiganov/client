@@ -1,0 +1,499 @@
+import * as C from '@/constants'
+import {ignorePromise, RPCError, isNetworkErr} from '@/constants/utils'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import type {IconType} from '@/common-adapters/icon.constants-gen' // do NOT pull in all of common-adapters
+import {useNavigation} from '@react-navigation/native'
+import type {DebouncedFunc} from 'lodash'
+import debounce from 'lodash/debounce'
+import invert from 'lodash/invert'
+import isEqual from 'lodash/isEqual'
+import logger from '@/logger'
+import People from '.'
+import * as T from '@/constants/types'
+import {useEngineActionListener} from '@/engine/action-listener'
+import {useFollowerState} from '@/stores/followers'
+import {useCurrentUserState} from '@/stores/current-user'
+import {e164ToDisplay} from '@/util/phone-numbers'
+import {navToProfile} from '@/constants/router'
+import {clearSignupEmail, useSignupEmail} from './signup-email'
+
+const waitToRefresh = 1000 * 60 * 5
+const defaultNumFollowSuggestions = 10
+
+const maxDate = (times: Array<number>) => new Date(Math.max(...times))
+const todoTypeEnumToType = invert(T.RPCGen.HomeScreenTodoType) as {
+  [K in T.People.TodoTypeEnum]: T.People.TodoType
+}
+
+const markViewed = () => {
+  const f = async () => {
+    try {
+      await T.RPCGen.homeHomeMarkViewedRpcPromise()
+    } catch (error) {
+      if (!(error instanceof RPCError)) {
+        throw error
+      }
+      if (isNetworkErr(error.code)) {
+        logger.warn('Network error calling homeMarkViewed')
+      } else {
+        throw error
+      }
+    }
+  }
+  ignorePromise(f())
+}
+
+const todoTypeToInstructions: {[K in T.People.TodoType]: string} = {
+  addEmail: 'Add an email address for security purposes, and to get important notifications.',
+  addPhoneNumber: 'Add your phone number so your friends can find you.',
+  annoncementPlaceholder: '',
+  avatarTeam: 'Change your team’s avatar from within the Keybase app.',
+  avatarUser: 'Upload your profile picture, or an avatar.',
+  bio: 'Add your name, bio, and location to complete your profile.',
+  chat: 'Start a chat! All conversations on Keybase are end-to-end encrypted.',
+  device: `Install Keybase on your ${
+    isMobile ? 'computer' : 'phone'
+  }. Until you have at least 2 devices, you risk losing data.`,
+  folder:
+    'Open an encrypted private folder with someone! They’ll only get notified once you drop files in it.',
+  follow:
+    'Follow at least one person on Keybase. A "follow" is a signed snapshot of someone. It strengthens Keybase and your own security.',
+  gitRepo:
+    'Create an encrypted Git repository! Only you (and teammates) will be able to decrypt any of it. And it’s so easy!',
+  legacyEmailVisibility: '',
+  none: '',
+  paperkey:
+    'Please make a paper key. Unlike your account password, paper keys can provision new devices and recover data, for ultimate safety.',
+  proof: 'Add some proofs to your profile. The more you have, the stronger your cryptographic identity.',
+  team: 'Create a team! Keybase team chats are end-to-end encrypted - unlike Slack - and work for any kind of group, from casual friends to large communities.',
+  teamShowcase: `Tip: Keybase team chats are private, but you can choose to publish that you're an admin. Check out the team settings on any team you manage.`,
+  verifyAllEmail: '',
+  verifyAllPhoneNumber: '',
+}
+
+const todoTypeToIcon: {[K in T.People.TodoType]: IconType} = {
+  addEmail: 'icon-onboarding-email-add-48',
+  addPhoneNumber: 'icon-onboarding-number-new-48',
+  annoncementPlaceholder: 'iconfont-close',
+  avatarTeam: 'icon-onboarding-team-avatar-48',
+  avatarUser: 'icon-onboarding-user-avatar-48',
+  bio: 'icon-onboarding-user-info-48',
+  chat: 'icon-onboarding-chat-48',
+  device: isMobile ? 'icon-onboarding-computer-48' : 'icon-onboarding-phone-48',
+  folder: 'icon-onboarding-folder-48',
+  follow: 'icon-onboarding-follow-48',
+  gitRepo: 'icon-onboarding-git-48',
+  legacyEmailVisibility: 'icon-onboarding-email-searchable-48',
+  none: 'iconfont-close',
+  paperkey: 'icon-onboarding-paper-key-48',
+  proof: 'icon-onboarding-proofs-48',
+  team: 'icon-onboarding-team-48',
+  teamShowcase: 'icon-onboarding-team-publicity-48',
+  verifyAllEmail: 'icon-onboarding-email-verify-48',
+  verifyAllPhoneNumber: 'icon-onboarding-number-verify-48',
+} as const
+
+const todoTypeToConfirmLabel: {[K in T.People.TodoType]: string} = {
+  addEmail: 'Add email',
+  addPhoneNumber: 'Add number',
+  annoncementPlaceholder: '',
+  avatarTeam: 'Edit team avatar',
+  avatarUser: 'Upload avatar',
+  bio: 'Edit Profile',
+  chat: 'Start a chat',
+  device: isMobile ? 'Get the download link' : 'Get the app',
+  folder: 'Open a private folder',
+  follow: 'Search people',
+  gitRepo: isMobile ? 'Create a repo' : 'Create a personal git repo',
+  legacyEmailVisibility: '',
+  none: '',
+  paperkey: 'Create a paper key',
+  proof: 'Prove your identities',
+  team: 'Create a team!',
+  teamShowcase: 'Set publicity settings',
+  verifyAllEmail: 'Verify',
+  verifyAllPhoneNumber: 'Verify',
+}
+
+const descriptionForTodoItem = (todo: T.RPCGen.HomeScreenTodo) => {
+  const t = T.RPCGen.HomeScreenTodoType
+  switch (todo.t) {
+    // the * * is bold markup, so an absent value would render as an empty bold run
+    case t.legacyEmailVisibility: {
+      const e = todo.legacyEmailVisibility
+      return e
+        ? `Allow friends to find you using *${e}*?`
+        : 'Allow friends to find you using your email address?'
+    }
+    case t.verifyAllEmail: {
+      const e = todo.verifyAllEmail
+      return e ? `Your email address *${e}* is unverified.` : 'Your email address is unverified.'
+    }
+    case t.verifyAllPhoneNumber: {
+      const p = todo.verifyAllPhoneNumber
+      return p ? `Your number *${e164ToDisplay(p)}* is unverified.` : 'Your number is unverified.'
+    }
+    default: {
+      const type = todoTypeEnumToType[todo.t]
+      return todoTypeToInstructions[type]
+    }
+  }
+}
+
+const extractMetaFromTodoItem = (todo: T.RPCGen.HomeScreenTodo, todoExt?: T.RPCGen.HomeScreenTodoExt) => {
+  const t = T.RPCGen.HomeScreenTodoType
+  switch (todo.t) {
+    case t.legacyEmailVisibility:
+      return {email: todo.legacyEmailVisibility, lastVerifyEmailDate: 0, type: 'email' as const}
+    case t.verifyAllEmail:
+      return {
+        email: todo.verifyAllEmail || '',
+        lastVerifyEmailDate: todoExt?.t === t.verifyAllEmail ? todoExt.verifyAllEmail.lastVerifyEmailDate : 0,
+        type: 'email' as const,
+      }
+    case t.verifyAllPhoneNumber:
+      return {phone: todo.verifyAllPhoneNumber, type: 'phone' as const}
+    default:
+      return
+  }
+}
+
+export const reduceRPCItemToPeopleItem = (
+  list: Array<T.People.PeopleScreenItem>,
+  item: T.RPCGen.HomeScreenItem
+): Array<T.People.PeopleScreenItem> => {
+  const badged = item.badged
+  switch (item.data.t) {
+    case T.RPCGen.HomeScreenItemType.todo: {
+      const todo = item.data.todo
+      const todoExt: T.RPCGen.HomeScreenTodoExt | undefined =
+        item.dataExt.t === T.RPCGen.HomeScreenItemType.todo ? item.dataExt.todo : undefined
+      const todoType = todoTypeEnumToType[todo.t || 0]
+      const metadata: T.People.TodoMeta = extractMetaFromTodoItem(todo, todoExt)
+      list.push(
+        {
+          badged,
+          confirmLabel: todoTypeToConfirmLabel[todoType],
+          dismissable: false,
+          icon: todoTypeToIcon[todoType],
+          instructions: descriptionForTodoItem(todo),
+          metadata,
+          todoType,
+          type: 'todo',
+        }
+      )
+      return list
+    }
+    case T.RPCGen.HomeScreenItemType.people: {
+      const notification = item.data.people
+      switch (notification.t) {
+        case T.RPCGen.HomeScreenPeopleNotificationType.followed: {
+          const follow = notification.followed
+          list.push(
+            {
+              badged,
+              newFollows: [{contactDescription: '', username: follow.user.username}],
+              notificationTime: new Date(follow.followTime),
+              type: 'follow',
+            }
+          )
+          return list
+        }
+        case T.RPCGen.HomeScreenPeopleNotificationType.followedMulti: {
+          const multiFollow = notification.followedMulti
+          const followers = multiFollow.followers
+          // empty is as useless as missing: maxDate([]) is Date{NaN}
+          if (!followers?.length) {
+            return list
+          }
+          list.push(
+            {
+              badged,
+              newFollows: followers.map(follow => ({
+                contactDescription: '',
+                username: follow.user.username,
+              })),
+              notificationTime: maxDate(followers.map(f => f.followTime)),
+              numAdditional: multiFollow.numOthers,
+              type: 'follow',
+            }
+          )
+          return list
+        }
+        case T.RPCGen.HomeScreenPeopleNotificationType.contact: {
+          const follow = notification.contact
+          list.push(
+            {
+              badged,
+              newFollows: [
+                {
+                  contactDescription: follow.description,
+                  username: follow.username,
+                },
+              ],
+              notificationTime: new Date(follow.resolveTime),
+              type: 'contact',
+            }
+          )
+          return list
+        }
+        case T.RPCGen.HomeScreenPeopleNotificationType.contactMulti: {
+          const multiContact = notification.contactMulti
+          const contacts = multiContact.contacts
+          // empty is as useless as missing: maxDate([]) is Date{NaN}
+          if (!contacts?.length) {
+            return list
+          }
+          list.push(
+            {
+              badged,
+              newFollows: contacts.map(c => ({contactDescription: c.description, username: c.username})),
+              notificationTime: maxDate(contacts.map(c => c.resolveTime)),
+              numAdditional: multiContact.numOthers,
+              type: 'contact',
+            }
+          )
+          return list
+        }
+        default:
+          return list
+      }
+    }
+    case T.RPCGen.HomeScreenItemType.announcement: {
+      const a = item.data.announcement
+      list.push(
+        {
+          appLink: a.appLink,
+          badged,
+          confirmLabel: a.confirmLabel,
+          dismissable: a.dismissable,
+          iconUrl: a.iconUrl,
+          id: a.id,
+          text: a.text,
+          type: 'announcement',
+          url: a.url,
+        }
+      )
+      return list
+    }
+  }
+}
+
+export const reducePeopleScreenData = (
+  data: Pick<T.RPCGen.HomeScreen, 'followSuggestions' | 'items'>,
+  followers: ReadonlySet<string>,
+  following: ReadonlySet<string>
+) => {
+  const oldItems: Array<T.People.PeopleScreenItem> = []
+  const newItems: Array<T.People.PeopleScreenItem> = []
+  for (const item of data.items ?? []) {
+    const isNew = item.badged || item.data.t === T.RPCGen.HomeScreenItemType.todo
+    reduceRPCItemToPeopleItem(isNew ? newItems : oldItems, item)
+  }
+
+  const followSuggestions = (data.followSuggestions ?? []).reduce<Array<T.People.FollowSuggestion>>(
+    (list, suggestion) => {
+      const followsMe = followers.has(suggestion.username)
+      const iFollow = following.has(suggestion.username)
+      list.push(
+        {
+          followsMe,
+          fullName: suggestion.fullName,
+          iFollow,
+          username: suggestion.username,
+        }
+      )
+      return list
+    },
+    []
+  )
+
+  return {followSuggestions, newItems, oldItems}
+}
+
+const usePeoplePageState = () => {
+  const [followSuggestions, setFollowSuggestions] = React.useState<Array<T.People.FollowSuggestion>>([])
+  const [newItems, setNewItems] = React.useState<Array<T.People.PeopleScreenItem>>([])
+  const [oldItems, setOldItems] = React.useState<Array<T.People.PeopleScreenItem>>([])
+  const [resentEmail, setResentEmail] = React.useState('')
+  const dismissAnnouncementRPC = C.useRPC(T.RPCGen.homeHomeDismissAnnouncementRpcPromise)
+  const skipTodoRPC = C.useRPC(T.RPCGen.homeHomeSkipTodoTypeRpcPromise)
+  const mountedRef = React.useRef(true)
+  // Loads can overlap (a pull while a focus load is out); only the latest one may write
+  const loadSeqRef = React.useRef(0)
+  const debouncedLoadPeopleRef = React.useRef<DebouncedFunc<
+    (markViewed: boolean, numFollowSuggestionsWanted?: number) => void
+  > | null>(null)
+
+  const loadPeople = React.useEffectEvent(
+    async (markViewed: boolean, numFollowSuggestionsWanted: number = defaultNumFollowSuggestions) => {
+      const seq = ++loadSeqRef.current
+      const superseded = () => !mountedRef.current || seq !== loadSeqRef.current
+      try {
+        const data = await T.RPCGen.homeHomeGetScreenRpcPromise(
+          {markViewed, numFollowSuggestionsWanted},
+          C.waitingKeyPeopleGetData
+        )
+        if (superseded()) {
+          return
+        }
+
+        const {followers, following} = useFollowerState.getState()
+        const nextState = reducePeopleScreenData(data, followers, following)
+        setFollowSuggestions(s =>
+          isEqual(s, nextState.followSuggestions) ? s : nextState.followSuggestions
+        )
+        setNewItems(s => (isEqual(s, nextState.newItems) ? s : nextState.newItems))
+        setOldItems(s => (isEqual(s, nextState.oldItems) ? s : nextState.oldItems))
+      } catch {
+        // Keep People resilient to transient RPC failures.
+      }
+    }
+  )
+
+  if (debouncedLoadPeopleRef.current == null) {
+    debouncedLoadPeopleRef.current = debounce(
+      (markViewed: boolean, numFollowSuggestionsWanted: number = defaultNumFollowSuggestions) => {
+        ignorePromise(loadPeople(markViewed, numFollowSuggestionsWanted))
+      },
+      1000,
+      {leading: true, trailing: false}
+    )
+  }
+
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      debouncedLoadPeopleRef.current?.cancel()
+    }
+  }, [])
+
+  const dismissAnnouncement = (id: T.RPCGen.HomeScreenAnnouncementID) => {
+    dismissAnnouncementRPC(
+      [{i: id}],
+      () => {},
+      _ => {}
+    )
+  }
+
+  const queueLoadPeople = (
+    markViewed: boolean,
+    numFollowSuggestionsWanted: number = defaultNumFollowSuggestions
+  ) => {
+    debouncedLoadPeopleRef.current?.(markViewed, numFollowSuggestionsWanted)
+  }
+
+  const skipTodo = (type: T.People.TodoType) => {
+    skipTodoRPC(
+      [{t: T.RPCGen.HomeScreenTodoType[type]}],
+      () => {
+        if (mountedRef.current) {
+          queueLoadPeople(false)
+        }
+      },
+      _ => {}
+    )
+  }
+
+  return {
+    dismissAnnouncement,
+    followSuggestions,
+    loadPeople: queueLoadPeople,
+    loadPeopleNow: loadPeople,
+    newItems,
+    oldItems,
+    resentEmail,
+    setResentEmail,
+    skipTodo,
+  }
+}
+
+const PeopleReloadable = () => {
+  const {
+    dismissAnnouncement,
+    followSuggestions,
+    loadPeople,
+    loadPeopleNow,
+    newItems,
+    oldItems,
+    resentEmail,
+    setResentEmail,
+    skipTodo,
+  } = usePeoplePageState()
+  const navigation = useNavigation()
+  const username = useCurrentUserState(s => s.username)
+  const signupEmail = useSignupEmail()
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyPeopleGetData)
+  const lastRefreshRef = React.useRef(0)
+  const didInitialLoadRef = React.useRef(false)
+
+  const getData = React.useEffectEvent((markViewed = true, force = false) => {
+    const now = Date.now()
+    if (force || !lastRefreshRef.current || lastRefreshRef.current + waitToRefresh < now) {
+      lastRefreshRef.current = now
+      loadPeople(markViewed, 10)
+    }
+  })
+  // A pull to refresh: settles when the load does, so the spinner shows for exactly that load
+  const refreshNow = React.useEffectEvent(async () => {
+    lastRefreshRef.current = Date.now()
+    await loadPeopleNow(false, 10)
+  })
+  // frozen wrapper, like onReload below: effect-event identities change every render
+  const [refresh] = React.useState(() => async () => {
+    await refreshNow()
+  })
+
+  React.useEffect(() => {
+    if (!didInitialLoadRef.current) {
+      didInitialLoadRef.current = true
+      getData(false, true)
+    }
+  }, [])
+
+  const onClickUser = (username: string) => navToProfile(username)
+
+  const reload = React.useEffectEvent((isRetry?: boolean) => {
+    getData(false, isRetry === true || !followSuggestions.length)
+  })
+  // frozen wrapper: effect-event identities change every render, and an unstable
+  // fn makes useSafeFocusEffect re-run (so re-reload) on every render while focused
+  const [onReload] = React.useState(() => (isRetry?: boolean) => {
+    reload(isRetry)
+  })
+
+  C.Router2.useSafeFocusEffect(onReload)
+  useEngineActionListener('keybase.1.homeUI.homeUIRefresh', () => {
+    getData(false, true)
+  })
+
+  React.useEffect(() => {
+    return navigation.addListener('blur', () => {
+      clearSignupEmail()
+      markViewed()
+    })
+  }, [navigation])
+
+  return (
+    <Kb.Reloadable onReload={onReload} reloadOnMount={false} waitingKeys={C.waitingKeyPeopleGetData}>
+      <People
+        followSuggestions={followSuggestions}
+        getData={getData}
+        refresh={refresh}
+        myUsername={username}
+        newItems={newItems}
+        oldItems={oldItems}
+        onClickUser={onClickUser}
+        dismissAnnouncement={dismissAnnouncement}
+        resentEmail={resentEmail}
+        setResentEmail={setResentEmail}
+        signupEmail={signupEmail}
+        skipTodo={skipTodo}
+        waiting={waiting}
+      />
+    </Kb.Reloadable>
+  )
+}
+export default PeopleReloadable

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/install"
@@ -34,17 +35,18 @@ func newCmdUpdateCheck(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.C
 		Name:  "check",
 		Usage: "Check for update",
 		Action: func(c *cli.Context) {
-			if libkb.IsBrewBuild {
-				g.Log.Errorf("\nTo update, run:\n\n\tbrew upgrade keybase")
-				return
-			}
-
 			updaterPath, err := install.UpdaterBinPath()
 			if err != nil {
 				g.Log.Errorf("Error finding updater path: %s", err)
 				return
 			}
-			g.Log.Errorf("\nTo update, you can run:\n\n\t%s check", updaterPath)
+
+			cmd := exec.Command(updaterPath, "check")
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				g.Log.Errorf("Error running %q: %s", updaterPath, err)
+			}
 		},
 	}
 }
@@ -93,7 +95,7 @@ func (v *cmdUpdateCheckInUse) Run() error {
 	if err != nil {
 		return err
 	}
-	inUse := install.IsInUse(mountDir, G.Log)
+	inUse := install.IsInUse(mountDir, v.G().Log)
 	result := checkInUseResult{InUse: inUse}
 	out, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
@@ -154,7 +156,8 @@ func (v *cmdUpdateNotify) Run() error {
 	v.G().Log.Debug("Received event: %s", v.event)
 	switch v.event {
 	case "after-apply":
-		return install.AfterUpdateApply(v.G(), true, v.force, v.G().Log)
+		// Deprecated (no longer called by go-updater)
+		return nil
 	default:
 		return fmt.Errorf("Unrecognized event: %s", v.event)
 	}

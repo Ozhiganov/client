@@ -1,0 +1,286 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import ReactButton from './react-button'
+import * as T from '@/constants/types'
+import {MessageContext} from './ids-context'
+import {useUsersState} from '@/stores/users'
+import {toggleReaction, useThreadMessageTarget} from '../message-commands'
+import {useConversationThreadMessage} from '../thread-context'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const positionFallbacks = ['bottom center', 'left center'] as const
+
+type OwnProps = {
+  attachmentRef: React.RefObject<Kb.MeasureRef | null>
+  emoji?: string
+  onHidden: () => void
+  onMouseLeave?: (syntheticEvent: React.SyntheticEvent) => void
+  onMouseOver?: (syntheticEvent: React.SyntheticEvent) => void
+  ordinal: T.Chat.Ordinal
+  visible: boolean
+}
+
+const emptyReactions = new Map<string, T.Chat.ReactionDesc>()
+const emptyUsersInfo = new Map<string, T.Users.UserInfo>()
+
+type Section = {
+  data: Array<ListItem>
+  ordinal: T.Chat.Ordinal
+  reaction: T.Chat.ReactionDesc
+  title: string
+}
+
+const ReactionTooltip = (p: OwnProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {ordinal, onHidden, attachmentRef, onMouseLeave, onMouseOver, visible, emoji} = p
+
+  const message = useConversationThreadMessage(ordinal)
+  const reactions = message && Chat.isMessageWithReactions(message) ? message.reactions : undefined
+  const usersInfo = useUsersState(s => (reactions ? s.infoMap : emptyUsersInfo))
+  const target = useThreadMessageTarget(ordinal)
+  const {conversationIDKey} = target
+  const hasMessageID = !!message && !!T.Chat.messageIDToNumber(message.id)
+
+  const onAddReaction = () => {
+    if (!message || !T.Chat.messageIDToNumber(message.id)) {
+      return
+    }
+    onHidden()
+    C.Router2.navigateAppend({
+      name: 'chatChooseEmoji',
+      params: {conversationIDKey, onPickAddToMessageID: message.id, pickKey: 'reaction'},
+    })
+  }
+
+  let reactionsToShow = [...(reactions?.keys() ?? emptyReactions.keys())]
+    .map(emoji => {
+      const reaction = reactions?.get(emoji)
+      const reactionUsers = reactions?.get(emoji)?.users ?? []
+      const sortedUsers = [...reactionUsers].sort((a, b) => a.timestamp - b.timestamp)
+      return {
+        earliestTimestamp: sortedUsers[0]?.timestamp ?? 0,
+        emoji,
+        reaction,
+        users: sortedUsers.map(r => ({
+          fullName: (usersInfo.get(r.username) || {fullname: ''}).fullname || '',
+          username: r.username,
+        })),
+      }
+    })
+    .filter((r): r is {earliestTimestamp: number; emoji: string; reaction: T.Chat.ReactionDesc; users: Array<ListItem>} => !!r.reaction)
+    .sort((a, b) => a.earliestTimestamp - b.earliestTimestamp)
+    .map(({emoji, reaction, users}) => ({emoji, reaction, users}))
+  if (!isMobile && emoji) {
+    reactionsToShow = reactionsToShow.filter(r => r.emoji === emoji)
+  }
+  const insets = Kb.useSafeAreaInsets()
+  const messageContext = {isHighlighted: false, ordinal}
+  const onClickUser = React.useCallback(
+    (username: string) => {
+      onHidden()
+      C.Router2.navToProfile(username)
+    },
+    [onHidden]
+  )
+  const renderItem = React.useCallback(
+    ({item}: {item: ListItem}) => (
+      <Kb.NameWithIcon
+        avatarSize={isMobile ? 32 : undefined}
+        colorFollowing={true}
+        containerStyle={styles.userContainer}
+        horizontal={true}
+        metaOne={isMobile ? undefined : item.fullName}
+        onClick={onClickUser}
+        clickType="onClick"
+        withProfileCardPopup={false}
+        username={item.username}
+      />
+    ),
+    [onClickUser, styles]
+  )
+  if (!visible) {
+    return null
+  }
+
+  const sections = reactionsToShow.map(r => ({
+    data: r.users.map(u => ({...u, key: `${u.username}:${r.emoji}`})),
+    key: r.emoji,
+    ordinal: ordinal,
+    reaction: r.reaction,
+    title: r.emoji,
+  }))
+  const renderSectionHeader = ({section}: {section: Section}) => (
+    <Kb.Box2
+      key={section.title}
+      direction="horizontal"
+      gap="tiny"
+      gapStart={true}
+      gapEnd={true}
+      fullWidth={true}
+      alignItems="center"
+      noShrink={true}
+      style={styles.buttonContainer}
+    >
+      <ReactButton
+        emoji={section.title}
+        reaction={section.reaction}
+        toggleReaction={emoji => toggleReaction({...target, ordinal: section.ordinal}, emoji)}
+      />
+      <Kb.Text type="Terminal" lineClamp={1} style={styles.emojiText}>
+        {section.title}
+      </Kb.Text>
+    </Kb.Box2>
+  )
+
+  if (isMobile) {
+    return (
+      <Kb.Sheet
+        onHidden={onHidden}
+        style={styles.sheet}
+        footer={
+          <Kb.ButtonBar
+            style={Kb.Styles.collapseStyles([
+              styles.addReactionButtonBar,
+              {paddingBottom: Kb.Styles.globalMargins.medium + insets.bottom},
+            ])}
+          >
+            <Kb.Button
+              disabled={!hasMessageID}
+              mode="Secondary"
+              fullWidth={true}
+              onClick={hasMessageID ? onAddReaction : undefined}
+              label="Add a reaction"
+            >
+              <Kb.Icon
+                type="iconfont-reacji"
+                color={theme.blue}
+                style={styles.addReactionButtonIcon}
+              />
+            </Kb.Button>
+          </Kb.ButtonBar>
+        }
+      >
+        <MessageContext value={messageContext}>
+          <Kb.Box2 direction="vertical" fullWidth={true} style={styles.sheetContainer} testID={TestIDs.CHAT_REACTION_TOOLTIP}>
+            {sections.map(section => (
+              <React.Fragment key={section.key}>
+                {renderSectionHeader({section})}
+                {section.data.map(item => (
+                  <React.Fragment key={item.key}>{renderItem({item})}</React.Fragment>
+                ))}
+              </React.Fragment>
+            ))}
+          </Kb.Box2>
+        </MessageContext>
+      </Kb.Sheet>
+    )
+  }
+
+  return (
+    <Kb.AnchoredPopup
+      attachTo={attachmentRef}
+      onHidden={onHidden}
+      position="top center"
+      positionFallbacks={positionFallbacks}
+      propagateOutsideClicks={true}
+      style={styles.overlay}
+    >
+      <MessageContext value={messageContext}>
+        <Kb.Box2
+          onMouseLeave={onMouseLeave}
+          onMouseOver={onMouseOver}
+          direction="vertical"
+          gap="tiny"
+          style={styles.listContainer}
+          testID={TestIDs.CHAT_REACTION_TOOLTIP}
+        >
+          <Kb.SectionList
+            alwaysBounceVertical={false}
+            initialNumToRender={19}
+            sections={sections}
+            stickySectionHeadersEnabled={true}
+            contentContainerStyle={styles.list}
+            renderItem={renderItem}
+            renderSectionHeader={renderSectionHeader}
+          />
+        </Kb.Box2>
+      </MessageContext>
+    </Kb.AnchoredPopup>
+  )
+}
+
+type ListItem = {
+  fullName: string
+  key: string
+  username: string
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      addReactionButtonBar: {
+        backgroundColor: theme.white,
+        ...Kb.Styles.padding(
+          Kb.Styles.globalMargins.small,
+          Kb.Styles.globalMargins.small,
+          Kb.Styles.globalMargins.medium
+        ),
+      },
+      addReactionButtonIcon: {marginRight: Kb.Styles.globalMargins.tiny},
+      buttonContainer: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.tiny),
+        },
+        isElectron: {
+          backgroundColor: theme.white,
+          borderTopLeftRadius: 3,
+          borderTopRightRadius: 3,
+        },
+        isMobile: {backgroundColor: theme.blueGrey},
+      }),
+      emojiText: {
+        color: theme.black_50,
+        flex: -1,
+      },
+      list: Kb.Styles.platformStyles({
+        isElectron: {
+          flex: 1,
+          paddingBottom: Kb.Styles.globalMargins.small,
+        },
+      }),
+      listContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.white,
+          maxHeight: 320,
+          width: 240,
+        },
+      }),
+      overlay: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.white,
+          margin: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+      // fills the sheet's empty area below the reactions so it matches the rows
+      sheet: {backgroundColor: theme.white},
+      sheetContainer: {
+        backgroundColor: theme.white,
+        borderRadius: Kb.Styles.borderRadius,
+      },
+      userContainer: Kb.Styles.platformStyles({
+        common: {
+          alignSelf: 'stretch',
+          backgroundColor: theme.white,
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.xtiny),
+          width: '100%',
+        },
+        isMobile: {paddingLeft: Kb.Styles.globalMargins.small + 8},
+      }),
+    }) as const
+)
+
+export default ReactionTooltip

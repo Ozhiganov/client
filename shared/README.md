@@ -1,85 +1,94 @@
-
 **Attention, please.**
 
 This code is a work in progress, and we publish it for full transparency. You can review the source code, but:
 
- - you shouldn't just run this code without reading it, as it may have bugs or stubbed out crypto
- - it might not do exactly what it says it is doing
+- you shouldn't just run this code without reading it, as it may have bugs or stubbed out crypto
+- it might not do exactly what it says it is doing
 
 If you really want to install Keybase, please return to the [top level Readme.md](https://github.com/keybase/client/blob/master/README.md) for official release instructions.
 
-----------
+---
 
 ## Keybase
 
-### Project Status
-
-Hi everyone! This folder's code is *not* ready for prime time. Use at your own risk (and never against production!)
-We are iterating quickly and a lot of the code is changing every day.
-
 ### Install
 
+Run within the `shared/` directory to setup our dependencies:
+
 ```sh
-yarn install
+yarn modules
 ```
 
 ### Desktop
 
 The following `yarn run` commands, to build, run or package the app:
 
-| Command | Description |
-|---------|-------------|
-| start | Build a development bundle and start app |
-| hot-server | Start the hot-reloading server |
-| start-hot | Connect to a hot-reloading server (If you're developing and want to see changes as you make them) |
-| build-dev | Build development bundle |
-| build-prod | Build prod bundle |
-| package | Package app |
-
+| Command              | Description                              |
+| -------------------- | ---------------------------------------- |
+| desktop:start        | Build a development bundle and start app |
+| desktop:start:hot    | Electron with hot reloading              |
+| desktop:build:dev    | Build development bundle                 |
+| desktop:build:prod   | Build prod bundle                        |
+| desktop:package      | Package app                              |
 
 You can set environment variables for debugging:
 
-| Env     | Description |
-|---------|-------------|
-| KEYBASE_RUN_MODE | Run mode: production, staging, devel |
-| KEYBASE_LOCAL_DEBUG | For debugging |
-| KEYBASE_SHOW_DEVTOOLS | Show devtools |
-| KEYBASE_FEATURES | Feature flags |
-| KEYBASE_RPC_DELAY | Number of ms to delay all RPC calls (requires debug mode) |
-| KEYBASE_RPC_DELAY_RESULT | Number of ms to delay all RPC call callbacks (requires debug mode) |
-| NO_DASHBOARD | Don't show dashboard |
+| Env                   | Description                                                                     |
+| --------------------- | ------------------------------------------------------------------------------- |
+| KEYBASE_RUN_MODE      | Run mode: prod, staging, devel                                                  |
+| KEYBASE_DEVEL_USE_XDG | Force Keybase to use XDG paths, can fix service socket location issues on Linux |
 
-### iOS
+You can also edit `~/Library/Logs/Keybase.app.debug` on macOS,
+`$HOME/.cache/keybase/keybase.app.debug` on Linux, or
+`%localappdata%\Keybase\keybase.app.debug` on Windows (see
+`platform.desktop.js`) to add debug flags. In particular, you probably want
 
-```sh
-# Build the go keybase.framework
-yarn run rn-gobuild-ios
-
-# Open workspace (not xcodeproj)
-open react-native/ios/Keybase.xcworkspace
+```json
+{
+  "showDevTools": true
+}
 ```
 
-Then select the target `Keybase` and run.
+### Debugging with React Developer Tools
 
-### Android
+1. Install react-dev-tools using npm or yarn globally
+1. Run it while running a dev build
 
-Follow instructions at https://facebook.github.io/react-native/docs/getting-started.html
-to install and configure Android.
+### Desktop Performance Testing
+
+Requires `playwright-core` installed globally:
 
 ```sh
-# Build the go keybaselib
-yarn run rn-gobuild-android
-
-# Install the app on your device
-react-native run-android
+yarn global add playwright-core
 ```
 
+Start the app with `yarn desktop:start:hot:debug`, then see `perf/PERF-TESTING.md` for usage.
 
+## Other docs
 
-### Troubleshooting
+see [Docs](docs)
 
-If you run into weird issues with your packager this may be due to a stale cache, run this command to wipe your local cache:
+## Misc
 
-```sh
-yarn run rn-packager-wipe-cache
+### Updating the list of countries with SMS support
+
+In order to update the list of countries supported by Amazon SNS, run
+the [update-data.sh](https://github.com/keybase/client/blob/master/shared/util/phone-numbers/sms-support/update-data.sh)
+script. It will first fetch the JSON from Amazon's public S3 bucket and
+transform it for use in our internal country filtering code.
+
+### ESLint in VSCode
+
+VSCode's ESLint extension needs to know where to look for .eslintrc. Add this to `REPO/.vscode/settings.json`.
+
+```
+{ "eslint.workingDirectories": ["shared"] }
+```
+
+### Watchman
+
+You'll need to have watchman installed if you're running out of file descriptors:
+
+```
+brew install watchman
 ```

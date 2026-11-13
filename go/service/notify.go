@@ -4,10 +4,11 @@
 package service
 
 import (
+	"context"
+
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	context "golang.org/x/net/context"
 )
 
 // NotifyCtlHandler is the RPC handler for notify control messages
@@ -22,7 +23,7 @@ type NotifyCtlHandler struct {
 func NewNotifyCtlHandler(xp rpc.Transporter, id libkb.ConnectionID, g *libkb.GlobalContext) *NotifyCtlHandler {
 	return &NotifyCtlHandler{
 		Contextified: libkb.NewContextified(g),
-		BaseHandler:  NewBaseHandler(xp),
+		BaseHandler:  NewBaseHandler(g, xp),
 		id:           id,
 	}
 }

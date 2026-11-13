@@ -7,14 +7,14 @@ import (
 	"testing"
 
 	"github.com/keybase/client/go/libkb"
+	"github.com/stretchr/testify/require"
 )
 
 func assertStreamCache(tc libkb.TestContext, valid bool) bool {
 	var ppsValid bool
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		ppsValid = a.PassphraseStreamCache().Valid()
-	}, "clear stream cache")
-
+	if ps := tc.G.ActiveDevice.PassphraseStreamCache(); ps != nil {
+		ppsValid = ps.Valid()
+	}
 	return valid == ppsValid
 }
 
@@ -24,32 +24,28 @@ func TestUnlock(t *testing.T) {
 
 	fu := CreateAndSignupFakeUser(tc, "login")
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after sign up")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after sign up")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: fu.NewSecretUI(),
 	}
 
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	tc.G.ActiveDevice.ClearPassphraseStreamCache()
 
-	if !assertStreamCache(tc, false) {
-		t.Fatal("expected invalid stream cache after clear")
-	}
+	require.True(t, assertStreamCache(tc, false),
+		"expected invalid stream cache after clear")
 
 	eng := NewUnlock(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after unlock")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after unlock")
 }
 
 func TestUnlockNoop(t *testing.T) {
@@ -58,24 +54,23 @@ func TestUnlockNoop(t *testing.T) {
 
 	fu := CreateAndSignupFakeUser(tc, "login")
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after sign up")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after sign up")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		LoginUI:  &libkb.TestLoginUI{},
 		SecretUI: fu.NewSecretUI(),
 	}
 
 	eng := NewUnlock(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after unlock")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after unlock")
 }
 
 func TestUnlockWithPassphrase(t *testing.T) {
@@ -84,30 +79,26 @@ func TestUnlockWithPassphrase(t *testing.T) {
 
 	fu := CreateAndSignupFakeUser(tc, "login")
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after sign up")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after sign up")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:   tc.G.UI.GetLogUI(),
 		LoginUI: &libkb.TestLoginUI{},
 		// No SecretUI here!
 	}
 
-	tc.G.LoginState().Account(func(a *libkb.Account) {
-		a.ClearStreamCache()
-	}, "clear stream cache")
+	tc.G.ActiveDevice.ClearPassphraseStreamCache()
 
-	if !assertStreamCache(tc, false) {
-		t.Fatal("expected invalid stream cache after clear")
-	}
+	require.True(t, assertStreamCache(tc, false),
+		"expected invalid stream cache after clear")
 
 	eng := NewUnlockWithPassphrase(tc.G, fu.Passphrase)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
-	if !assertStreamCache(tc, true) {
-		t.Fatal("expected valid stream cache after unlock")
-	}
+	require.True(t, assertStreamCache(tc, true),
+		"expected valid stream cache after unlock")
 }

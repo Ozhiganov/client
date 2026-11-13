@@ -1,0 +1,243 @@
+// Entrypoint for the menubar node part
+import * as RemoteGen from '@/constants/remote-actions'
+import * as R from '@/constants/remote'
+import * as Electron from 'electron'
+import logger from '@/logger'
+import {isDarwin, isWindows, isLinux} from '@/constants/platform'
+import {menubar} from 'menubar'
+import {showDevTools, skipSecondaryDevtools} from '@/local-debug'
+import {getMainWindow} from './main-window-ref.desktop'
+import {appRoot, htmlURL, preloadPath} from './html-root.desktop'
+import {registerRemoteWindow} from './remote-windows.desktop'
+import {handleFromApp} from './ipc-sender.desktop'
+import type {BadgeType} from '@/stores/notifications'
+
+// nativeImage reads these as filesystem paths (inside app.asar when packaged)
+const fsAssetRoot = appRoot.replaceAll('\\', '/') + '/'
+
+const getIcons = (iconType: BadgeType, badges: number) => {
+  const size = isWindows ? 16 : 22
+  const x = isLinux ? '' : '@2x'
+
+  if (badges > 0) {
+    if (badges < 5) {
+      return `icon-menubar-${badges}@2x.png`
+    } else {
+      return `icon-menubar-many@2x.png`
+    }
+  } else {
+    const devMode = __DEV__ ? '-dev' : ''
+    let color = 'white'
+    const badged = badges ? 'badged-' : ''
+    let platform = ''
+
+    if (isDarwin) {
+      color = 'white'
+    } else if (isWindows) {
+      color = 'black'
+      platform = 'windows-'
+    }
+    const file = `icon-${platform}keybase-menubar-${badged}${iconType}-${color}-${size}${devMode}${x}.png`
+    return file
+  }
+}
+
+const htmlFile = htmlURL('remote', 'component=menubar&param=menubar')
+
+// A fixed id lets macOS keep the menu bar icon where the person put it across launches
+const darwinTrayGUID = '1f6ff0e1-805f-43a6-bf95-2e62ac4839d8'
+
+let badgeType: BadgeType = 'regular'
+let badges = 0
+
+const getIcon = () => {
+  const path = getIcons(badgeType, badges)
+  const icon = Electron.nativeImage.createFromPath(fsAssetRoot + 'images/menubarIcon/' + path)
+  // template it always, else the color is just wrong, lose the orange sadly
+  icon.setTemplateImage(true)
+  return icon
+}
+
+type Bounds = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+const MenuBar = () => {
+  const icon = getIcon()
+  const mb = menubar({
+    ...(isDarwin ? {tray: new Electron.Tray(icon, darwinTrayGUID)} : {}),
+    browserWindow: {
+      ...(isDarwin ? {type: 'panel'} : {}),
+      hasShadow: true,
+      height: 640,
+      resizable: false,
+      transparent: true,
+      webPreferences: {
+        contextIsolation: true,
+        devTools: showDevTools,
+        nodeIntegration: false,
+        nodeIntegrationInWorker: false,
+        preload: preloadPath,
+        sandbox: true,
+      },
+      width: 360,
+    },
+    icon,
+    index: false,
+    preloadWindow: true,
+    // Without this flag set, menubar will hide the dock icon when the app
+    // ready event fires. We manage the dock icon ourselves, so this flag
+    // prevents menubar from changing the state.
+    showDockIcon: true,
+    showOnAllWorkspaces: false,
+  })
+
+  const updateIcon = () => {
+    try {
+      mb.tray.setImage(getIcon())
+    } catch (err) {
+      console.error('menu icon err: ' + String(err))
+    }
+  }
+
+  type Action = {
+    type: 'showTray'
+    payload: {
+      badgeType: BadgeType
+      desktopAppBadgeCount: number
+    }
+  }
+
+  handleFromApp('KBmenu', (_event, action: Action) => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (action.type !== 'showTray') return
+
+    badgeType = action.payload.badgeType
+    badges = action.payload.desktopAppBadgeCount
+    updateIcon()
+    const dock = Electron.app.dock
+    if (dock?.isVisible()) {
+      Electron.app.badgeCount = action.payload.desktopAppBadgeCount
+    } else if (isLinux) {
+      // shown by docks and taskbars that support the LauncherEntry API, on the launcher for
+      // keybase.desktop (the desktopName package.desktop.mts writes into the app's package.json)
+      Electron.app.setBadgeCount(action.payload.desktopAppBadgeCount)
+    }
+
+    // Windows just lets us set (or unset, with null) a single 16x16 icon
+    // to be used as an overlay in the bottom right of the taskbar icon.
+    if (isWindows) {
+      const mw = getMainWindow()
+      const overlay =
+        action.payload.desktopAppBadgeCount > 0
+          ? fsAssetRoot + 'images/icons/icon-windows-badge.png'
+          : null
+      if (overlay) {
+        mw?.setOverlayIcon(Electron.nativeImage.createFromPath(overlay), 'new activity')
+      }
+    }
+  })
+
+  mb.on('ready', () => {
+    if (mb.window) {
+      registerRemoteWindow('menubar', 'menubar', mb.window)
+    }
+    mb.window?.setVisibleOnAllWorkspaces(true, {visibleOnFullScreen: true, skipTransformProcessType: true})
+    mb.window
+      ?.loadURL(htmlFile)
+      .then(() => {})
+      .catch(() => {})
+
+    mb.tray.setIgnoreDoubleClickEvents(true)
+
+    if (showDevTools && !skipSecondaryDevtools) {
+      mb.window?.webContents.openDevTools({
+        mode: 'detach',
+        title: `${__DEV__ ? 'DEV' : 'Prod'} Menu Devtools`,
+      })
+    }
+
+    // Hack: open widget when left/right/double clicked
+    mb.tray.on('right-click', (e, bounds: Bounds) => {
+      setTimeout(() => mb.tray.emit('click', {...e}, {...bounds}), 0)
+    })
+    mb.tray.on('double-click', () => {})
+
+    // prevent the menubar's window from dying when we quit
+    // We remove any existing listeners to close because menubar has one that deletes the reference to mb.window
+
+    mb.window?.removeAllListeners('close')
+    mb.window?.on('close', event => {
+      event.preventDefault()
+      mb.hideWindow()
+    })
+
+    mb.window?.on('show', () => {
+      R.remoteDispatch(RemoteGen.createUpdateWindowShown({component: 'menu'}))
+    })
+
+    if (isLinux) {
+      mb.tray.setToolTip('Show Keybase')
+    }
+
+    const adjustForWindows = () => {
+      // Account for different taskbar positions on Windows
+      if (!isWindows || !mb.window) {
+        return
+      }
+      const cursorPoint = Electron.screen.getCursorScreenPoint()
+      const screenSize = Electron.screen.getDisplayNearestPoint(cursorPoint).workArea
+      const menuBounds = mb.window.getBounds()
+      logger.info('Showing menu:', cursorPoint, screenSize)
+      const iconBounds = mb.tray.getBounds()
+      let x = iconBounds.x
+      let y = iconBounds.y - iconBounds.height - menuBounds.height
+
+      // rough guess where the menu bar is, since it's not
+      // available on electron
+      if (cursorPoint.x < screenSize.width / 2) {
+        if (cursorPoint.y > screenSize.height / 2) {
+          logger.info('- start menu on left -')
+          // start menu on left
+          x += iconBounds.width
+        }
+      } else {
+        // start menu on top or bottom
+        x -= menuBounds.width
+        if (cursorPoint.y < screenSize.height / 2) {
+          logger.info('- start menu on top -')
+          // start menu on top
+          y = iconBounds.y + iconBounds.height
+        } else {
+          // start menu on right/bottom
+          logger.info('- start menu on bottom -')
+        }
+      }
+      mb.window.setPosition(x, y)
+    }
+
+    mb.on('show', () => {
+      R.remoteDispatch(RemoteGen.createInboxRefresh())
+      adjustForWindows()
+    })
+    mb.on('hide', () => {})
+    mb.on('after-show', () => {
+      logger.info('Showing menubar at', mb.window?.getBounds())
+    })
+    mb.tray.on('click', (_: unknown, bounds: Bounds) => {
+      logger.info('Clicked tray icon:', bounds)
+    })
+  })
+
+  // Work around an OS X bug that leaves a gap in the status bar if you exit
+  // without removing your status bar icon.
+  if (isDarwin) {
+    mb.app.on('before-quit', () => {
+      mb.tray.destroy()
+    })
+  }
+}
+export default MenuBar

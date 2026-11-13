@@ -1,0 +1,172 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import * as Kbfs from '../common'
+import type * as React from 'react'
+import * as T from '@/constants/types'
+import ConflictBanner from '../banner/conflict-banner'
+import Footer from '../footer/footer'
+import OfflineFolder from './offline'
+import PublicReminder from '../banner/public-reminder'
+import {FsBrowserEditProvider} from './edit-state'
+import {FsBrowserSortProvider} from './sort-state'
+import Root from './root'
+import Rows from './rows/rows-container'
+import {useFsErrorActionOrThrow, useFsPathItem, useFsTlf, useFsUpload} from '../common'
+import {asRows as resetBannerAsRows} from '../banner/reset-banner'
+import {useFolderViewFilterState} from '@/fs/common/folder-view-filter-state'
+import * as FS from '@/constants/fs'
+import {uploadFromDragAndDropDesktop as uploadFromDragAndDropInPlatform} from '@/util/fs-platform'
+
+type OwnProps = {
+  lastClosedPublicBannerTlf?: string
+  path: T.FS.Path
+}
+
+const Container = (ownProps: OwnProps) => {
+  const {path} = ownProps
+  const filter = useFolderViewFilterState(s => s.folderViewFilter)
+  const _pathItem = useFsPathItem(path)
+  const tlf = useFsTlf(path)
+  const _kbfsDaemonStatus = Kbfs.useKbfsDaemonStatus()
+  const resetBannerType = Kbfs.resetBannerTypeFromTlf(tlf)
+  const offlineUnsynced = FS.isOfflineUnsynced(_kbfsDaemonStatus, _pathItem, path)
+  const writable = _pathItem.writable
+  return (
+    // collapsable={false}: keeps this wrapper from being view-flattened, which would hoist the
+    // list's scroll view into a sibling and break iOS 26 tabBarMinimizeBehavior detection.
+    <Kb.Box2
+      direction="vertical"
+      fullWidth={true}
+      collapsable={false}
+      style={Kb.Styles.globalStyles.flexGrow}
+      testID={TestIDs.FILES_BROWSER}
+    >
+      <Kb.KeyboardAvoidingView2>
+        <Kbfs.Errs />
+        <BrowserContent
+          filter={filter}
+          lastClosedPublicBannerTlf={ownProps.lastClosedPublicBannerTlf}
+          offlineUnsynced={offlineUnsynced}
+          path={path}
+          resetBannerType={resetBannerType}
+          writable={writable}
+        />
+        <Footer path={path} />
+      </Kb.KeyboardAvoidingView2>
+    </Kb.Box2>
+  )
+}
+
+type Props = {
+  filter?: string
+  lastClosedPublicBannerTlf?: string
+  offlineUnsynced: boolean
+  path: T.FS.Path
+  resetBannerType: T.FS.ResetBannerType
+  writable: boolean
+}
+
+const SelfReset = (_: Props) => (
+  <Kb.Box2 direction="vertical" fullWidth={true} style={Kb.Styles.globalStyles.flexGrow}>
+    <Kb.Banner color="red">
+      <Kb.BannerParagraph
+        bannerColor="red"
+        content="Since you reset your account, participants have to accept to let you back in."
+      />
+    </Kb.Banner>
+    <Kb.EmptyState illustration={isMobile ? 'icon-skull-64' : 'icon-skull-48'} />
+  </Kb.Box2>
+)
+
+function DragAndDrop(p: {
+  children: React.ReactNode
+  path: T.FS.Path
+  rejectReason?: string
+}) {
+  const {children, path, rejectReason} = p
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  const upload = useFsUpload()
+  const onAttach = (localPaths: Array<string>) => {
+    const f = async () => {
+      try {
+        const nextLocalPaths = await uploadFromDragAndDropInPlatform(localPaths)
+        nextLocalPaths.forEach(localPath => upload(path, localPath))
+      } catch (e) {
+        errorToActionOrThrow(e)
+      }
+    }
+    C.ignorePromise(f())
+  }
+  return (
+    <Kb.DragAndDrop
+      allowFolders={true}
+      fullWidth={true}
+      containerStyle={Kb.Styles.globalStyles.flexOne}
+      onAttach={!rejectReason ? onAttach : undefined}
+      rejectReason={rejectReason}
+    >
+      {children}
+    </Kb.DragAndDrop>
+  )
+}
+
+function BrowserContent(props: Props) {
+  const parsedPath = FS.parsePath(props.path)
+  if (parsedPath.kind === T.FS.PathKind.Root) {
+    return (
+      <DragAndDrop path={props.path} rejectReason="You can only drop files inside a folder.">
+        <Root />
+      </DragAndDrop>
+    )
+  }
+  if (parsedPath.kind === T.FS.PathKind.TlfList) {
+    return (
+      <DragAndDrop path={props.path} rejectReason="You can only drop files inside a folder.">
+        <Rows filter={props.filter} path={props.path} />
+      </DragAndDrop>
+    )
+  }
+  if (props.resetBannerType === T.FS.ResetBannerNoOthersType.Self) {
+    return (
+      <DragAndDrop path={props.path} rejectReason="You can only drop files after participants let you in.">
+        <SelfReset {...props} />
+      </DragAndDrop>
+    )
+  }
+  const addCommonStuff = (children: React.ReactNode) => (
+    <>
+      <PublicReminder path={props.path} lastClosedTlf={props.lastClosedPublicBannerTlf} />
+      <ConflictBanner path={props.path} />
+      {children}
+    </>
+  )
+  if (props.offlineUnsynced) {
+    return addCommonStuff(
+      <DragAndDrop
+        path={props.path}
+        rejectReason="Drop files in unsynced folder is only supported when you are online."
+      >
+        <OfflineFolder path={props.path} />
+      </DragAndDrop>
+    )
+  }
+  return addCommonStuff(
+    <DragAndDrop
+      path={props.path}
+      rejectReason={props.writable ? undefined : "You don't have write permission in this folder."}
+    >
+      <Rows filter={props.filter} path={props.path} headerRows={resetBannerAsRows(props.path, props.resetBannerType)} />
+    </DragAndDrop>
+  )
+}
+
+const Screen = (props: OwnProps) => (
+  <FsBrowserEditProvider path={props.path}>
+    <FsBrowserSortProvider>
+      <Container {...props} />
+    </FsBrowserSortProvider>
+  </FsBrowserEditProvider>
+)
+
+export default Screen

@@ -1,0 +1,91 @@
+import * as Kb from '@/common-adapters'
+import {useReply} from './reply'
+import {useBottom} from './bottom'
+import {useOrdinal} from '../ids-context'
+import {WrapperMessage, useWrapperMessage, type Props} from '../wrapper/wrapper'
+import type {StyleOverride} from '@/common-adapters/markdown'
+import {useSharedStyles} from '../shared-styles'
+import {useConversationCenterActions} from '../../center-context'
+
+const getStyle = (
+  sharedStyles: ReturnType<typeof useSharedStyles>,
+  type: 'error' | 'sent' | 'pending',
+  isEditing: boolean,
+  isHighlighted?: boolean
+): Kb.Styles.StylesCrossPlatform => {
+  if (isHighlighted) {
+    return Kb.Styles.collapseStyles([sharedStyles.sent, sharedStyles.highlighted])
+  } else if (type === 'sent') {
+    return isEditing ? sharedStyles.sentEditing : sharedStyles.sent
+  } else {
+    return isEditing ? sharedStyles.pendingFailEditing : sharedStyles.pendingFail
+  }
+}
+
+function MessageMarkdown({style, text}: {style: Kb.Styles.StylesCrossPlatform; text: string}) {
+  const ordinal = useOrdinal()
+  const styleOverride = isMobile ? {paragraph: style} : undefined
+
+  return (
+    <Kb.Markdown
+      messageType="text"
+      style={style}
+      styleOverride={styleOverride as StyleOverride}
+      allowFontScaling={true}
+      context={String(ordinal)}
+    >
+      {text}
+    </Kb.Markdown>
+  )
+}
+
+function WrapperText(p: Props) {
+  const sharedStyles = useSharedStyles()
+  const {ordinal, isCenteredHighlight = false} = p
+  const wrapper = useWrapperMessage(ordinal, isCenteredHighlight)
+  const {messageData} = wrapper
+  const {centerOnMessage} = useConversationCenterActions()
+  const {isEditing, message, replyTo} = messageData
+
+  const {hasCoinFlip, hasUnfurlList, hasUnfurlPrompts, showCenteredHighlight, text, textType, type} =
+    messageData
+  const bottomChildren = useBottom({
+    author: message.author,
+    conversationIDKey: message.conversationIDKey,
+    hasCoinFlip,
+    hasUnfurlList,
+    hasUnfurlPrompts,
+    messageID: message.id,
+    unfurls: message.type === 'text' ? message.unfurls : undefined,
+  })
+  const onReplyClick = () => {
+    const id = replyTo?.id ?? 0
+    if (id) {
+      centerOnMessage(id, 'flash')
+    }
+  }
+  const reply = useReply(replyTo, onReplyClick)
+
+  const style = getStyle(sharedStyles, textType, isEditing, showCenteredHighlight)
+
+  const children = (
+    <>
+      {reply}
+      <MessageMarkdown style={style} text={text} />
+    </>
+  )
+
+  // due to recycling, we can have items that aren't connected to the list that might have live connectors
+  // so when we load more etc the entire messagMap could no longer have your item
+  if (type !== 'text') {
+    return null
+  }
+
+  return (
+    <WrapperMessage {...p} {...wrapper} bottomChildren={bottomChildren}>
+      {children}
+    </WrapperMessage>
+  )
+}
+
+export default WrapperText

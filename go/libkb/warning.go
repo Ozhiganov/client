@@ -18,7 +18,7 @@ func (s StringWarning) Warning() string {
 	return string(s)
 }
 
-func Warningf(format string, a ...interface{}) Warning {
+func Warningf(format string, a ...any) Warning {
 	return StringWarning(fmt.Sprintf(format, a...))
 }
 
@@ -42,7 +42,7 @@ func (w Warnings) Warnings() []Warning {
 }
 
 func (w Warnings) IsEmpty() bool {
-	return w.w == nil || len(w.w) == 0
+	return len(w.w) == 0
 }
 
 func (w *Warnings) Push(e Warning) {

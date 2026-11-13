@@ -1,0 +1,109 @@
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {useRowStyles} from './common'
+import * as T from '@/constants/types'
+import type {BrowserEditSession} from '../edit-state'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {
+  editSession: BrowserEditSession
+}
+
+function Editing({editSession}: Props) {
+  const styles = useStyles()
+  const rowStyles = useRowStyles()
+  const theme = Kb.Styles.useTheme()
+  const {commitEdit, discardEdit, edit} = editSession
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === 'Escape') discardEdit()
+  }
+  return (
+    <Kb.ListItem
+      type="Small"
+      firstItem={true /* we add divider in Rows */}
+      testID={TestIDs.FILES_EDITING_ROW}
+      statusIcon={
+        <Kb.Icon
+          type={edit.type === T.FS.EditType.NewFolder ? 'iconfont-add' : 'iconfont-edit'}
+          sizeType="Small"
+          padding="xtiny"
+        />
+      }
+      icon={
+        <Kb.Box2 direction="vertical" style={rowStyles.pathItemIcon}>
+          <Kb.ImageIcon type="icon-folder-32" />
+        </Kb.Box2>
+      }
+      body={
+        <Kb.Box2 direction="vertical" key="main" flex={1} justifyContent="center" style={rowStyles.itemBox}>
+          <Kb.Input3
+            value={edit.name}
+            placeholder={edit.originalName}
+            selectTextOnFocus={true}
+            inputStyle={styles.text}
+            onEnterKeyDown={commitEdit}
+            onChangeText={editSession.setEditName}
+            autoFocus={true}
+            onKeyDown={onKeyDown}
+            hideBorder={true}
+            testID={TestIDs.FILES_EDITING_INPUT}
+          />
+        </Kb.Box2>
+      }
+      action={
+        <Kb.Box2 direction="horizontal" alignItems="center" key="right" style={styles.rightBox} justifyContent="flex-end">
+          {!!edit.error && (
+            <Kb.WithTooltip tooltip={edit.error} showOnPressMobile={true}>
+              <Kb.Icon type="iconfont-exclamation" color={theme.red} />
+            </Kb.WithTooltip>
+          )}
+          <Kb.Button
+            key="create"
+            style={styles.button}
+            small={true}
+            label={edit.error ? 'Retry' : edit.type === T.FS.EditType.NewFolder ? 'Create' : 'Save'}
+            waiting={editSession.isSubmitting}
+            onClick={commitEdit}
+            testID={TestIDs.FILES_EDITING_SAVE}
+          />
+          <Kb.Icon
+            onClick={discardEdit}
+            type={edit.type === T.FS.EditType.NewFolder ? 'iconfont-trash' : 'iconfont-close'}
+            color={theme.black_50}
+            hoverColor={theme.black}
+            style={styles.iconCancel}
+          />
+        </Kb.Box2>
+      }
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      button: {
+        marginLeft: Kb.Styles.globalMargins.tiny,
+      },
+      iconCancel: Kb.Styles.platformStyles({
+        common: {
+          padding: Kb.Styles.globalMargins.tiny,
+          paddingRight: 0,
+        },
+        isMobile: {
+          fontSize: 22,
+        },
+      }),
+      rightBox: {
+        flexShrink: 1,
+      },
+      text: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.globalStyles.fontSemibold,
+          maxWidth: '100%',
+        },
+      }),
+    }) as const
+)
+
+export default Editing

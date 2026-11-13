@@ -1,0 +1,275 @@
+import * as Electron from 'electron'
+import * as RemoteGen from '@/constants/remote-actions'
+import * as R from '@/constants/remote'
+import fs from 'fs'
+import path from 'path'
+import exec from './exec.desktop'
+import {type ExecException} from 'child_process'
+import {keybaseBinPath} from './paths.desktop'
+import {ctlQuit} from './ctl.desktop'
+import {isDarwin, runMode} from '@/constants/platform'
+import logger from '@/logger'
+import zlib from 'zlib'
+import {
+  ExitCodeAuthCanceledError,
+  ExitCodeFuseKextError,
+  ExitCodeFuseKextPermissionError,
+  ExitFuseCriticalUpdate,
+  ExitFuseCriticalUpdateFailed,
+} from '@/constants/values'
+
+const file = path.join(Electron.app.getPath('userData'), 'installer.json')
+
+const loadHasPrompted = () => {
+  try {
+    const data = fs.readFileSync(file, 'utf8')
+    const p = JSON.parse(data) as undefined | {promptedForCLI: unknown}
+    return !!p?.promptedForCLI
+  } catch (error_) {
+    const error = error_ as {code?: string} | undefined
+    if (error?.code === 'ENOENT') {
+      console.log('[Installer] loadHasPrompted: No installer.json file')
+    } else {
+      console.warn('[Installer] loadHasPrompted: Error loading state:', error)
+    }
+    return false
+  }
+}
+
+const saveHasPrompted = () => {
+  try {
+    fs.writeFileSync(file, JSON.stringify({promptedForCLI: true}))
+  } catch (err) {
+    console.warn('[Installer] saveHasPrompted: Error saving state:', err)
+  }
+}
+
+type ErrorTypes = {
+  cli: boolean
+  fuse: boolean
+}
+
+type ResultType =
+  | {
+      componentResults?: Array<{
+        status?: {
+          code?: number
+          desc?: string
+        }
+        name?: string
+        exitCode?: number
+      }>
+    }
+  | undefined
+
+const checkErrors = (result: ResultType, errors: Array<string>, errorTypes: ErrorTypes) => {
+  const results = result?.componentResults || []
+  results.forEach(cr => {
+    if (cr.status?.code === 0) {
+      return
+    }
+    if (cr.name === 'fuse') {
+      errorTypes.fuse = true
+      if (cr.exitCode === ExitCodeFuseKextError) {
+        errors.push(
+          `We were unable to load KBFS (Fuse kext). This may be due to a limitation in MacOS where there aren't any device slots available. Device slots can be taken up by apps such as VMWare, VirtualBox, anti-virus programs, VPN programs and Intel HAXM.`
+        )
+      } else if (cr.exitCode === ExitCodeFuseKextPermissionError) {
+        // This will occur if they started install and didn't allow the extension in >= 10.13, and then restarted the app.
+        // The app will deal with this scenario in the folders tab, so we can ignore this specific error here.
+      }
+    } else if (cr.name === 'helper' && cr.exitCode === ExitCodeAuthCanceledError) {
+      // Consider this a FUSE error for the purpose of showing it to the user.
+      errorTypes.fuse = true
+      errors.push(
+        `Installation was canceled. The file system will not be available until authorization is granted.`
+      )
+    } else if (cr.name === 'helper' && cr.exitCode === ExitFuseCriticalUpdate) {
+      logger.info('[Installer] fuse critical update, setting badge')
+      // ignore critical update error, it's just to coerce specific behavior in the Go installer
+      R.remoteDispatch(RemoteGen.createSetCriticalUpdate({critical: true}))
+      return
+    } else if (cr.name === 'helper' && cr.exitCode === ExitFuseCriticalUpdateFailed) {
+      errorTypes.fuse = true
+      errors.push(
+        `We were unable to perform required KBFS maintenance. This is likely because you are using KBFS mounts on more than one macOS system account on this computer. In order to fix this situation, please quit all running copies of Keybase on all accounts, and try starting Keybase again.`
+      )
+    } else if (cr.name === 'cli') {
+      errorTypes.cli = true
+    } else if (cr.name === 'redirector') {
+      errorTypes.fuse = true
+      errors.push(
+        `We were unable to load the part of Keybase that lets you access your files in your file system. You should be able to do so if you wait a few minutes and restart Keybase.`
+      )
+    } else {
+      errors.push(`There was an error trying to install the ${cr.name ?? ''}.`)
+      errors.push(`\n${cr.status?.desc ?? ''}`)
+    }
+  })
+}
+
+// Warn (not Info): prod Info is a 1000-line ring and gets wiped by chat traffic before log send.
+const logComponentResults = (result: ResultType) => {
+  const results = result?.componentResults || []
+  if (results.length === 0) {
+    logger.warn('[Installer]: install-auto returned no componentResults')
+    return
+  }
+  for (const cr of results) {
+    logger.warn(
+      `[Installer]: component=${cr.name ?? '?'} statusCode=${cr.status?.code ?? 'unknown'} exitCode=${cr.exitCode ?? 0} desc=${cr.status?.desc ?? ''}`
+    )
+  }
+}
+
+type CB = (err: Error | null) => void
+const darwinInstall = (callback: CB) => {
+  const keybaseBin = keybaseBinPath()
+  const openedAtLogin = Electron.app.getLoginItemSettings().wasOpenedAtLogin
+  let timeout = 30
+  // If the app was opened at login, there might be contention for lots
+  // of resources, so let's bump the install timeout to something large.
+  if (openedAtLogin) {
+    timeout = 90
+  }
+
+  logger.warn('[Installer]: starting install-auto', {
+    keybaseBin: keybaseBin || '(missing)',
+    keybaseOpenFrom: process.env['KEYBASE_OPEN_FROM'] || '',
+    keybaseStartUI: process.env['KEYBASE_START_UI'] || '',
+    openedAtLogin,
+    runMode,
+    timeoutSec: timeout,
+  })
+
+  if (!keybaseBin) {
+    callback(new Error('No keybase bin path'))
+    return
+  }
+
+  const logOutput = async (stdout: string, stderr: string) =>
+    Promise.all([
+      new Promise<Buffer>((resolve, reject) => {
+        zlib.gzip(stdout, (error, res) => (error ? reject(error) : resolve(res)))
+      }),
+      new Promise<Buffer>((resolve, reject) => {
+        zlib.gzip(stderr, (error, res) => (error ? reject(error) : resolve(res)))
+      }),
+    ])
+      .then(([zStdout, zStderr]) =>
+        logger.info(
+          '[Installer]: got result from install-auto. To read, pipe the base64 strings to "| base64 -d | gzip -d".',
+          `stdout=${zStdout.toString('base64')}`,
+          `stderr=${zStderr.toString('base64')}`
+        )
+      )
+      .catch((err: unknown) => logger.error('[Installer]: Error zipping up logs: ', err))
+
+  const handleResults = (
+    err: ExecException | null,
+    attempted: boolean,
+    stdout: string,
+    stderr: string
+  ) => {
+    // exec() no-ops (attempted=false) when platform/runMode/bin checks fail — previously ignored.
+    if (!attempted) {
+      logger.warn('[Installer]: install-auto was not executed', {
+        err: err?.message,
+        keybaseBin,
+        runMode,
+        stderrLen: stderr.length,
+        stdoutLen: stdout.length,
+      })
+      callback(null)
+      return
+    }
+
+    logger.warn('[Installer]: install-auto finished', {
+      errCode: err?.code,
+      errMessage: err?.message,
+      stderrLen: stderr.length,
+      stdoutLen: stdout.length,
+    })
+
+    const loggingPromise = logOutput(stdout, stderr)
+    const errors: Array<string> = []
+    const errorTypes: ErrorTypes = {
+      cli: false,
+      fuse: false,
+    }
+    if (err) {
+      errors.push(`There was an error trying to run the install (${err.code}).`)
+    } else if (stdout !== '') {
+      try {
+        const result = JSON.parse(stdout) as ResultType
+        if (result) {
+          logComponentResults(result)
+          checkErrors(result, errors, errorTypes)
+        } else {
+          errors.push(`There was an error trying to run the install. No output.`)
+        }
+      } catch (parseErr) {
+        logger.warn('[Installer]: failed to parse install-auto stdout', {
+          parseErr: parseErr instanceof Error ? parseErr.message : String(parseErr),
+          stdoutPrefix: stdout.slice(0, 500),
+        })
+        errors.push(
+          `There was an error trying to run the install. We were unable to parse the output of keybase install-auto.`
+        )
+      }
+    } else {
+      logger.warn('[Installer]: install-auto produced empty stdout')
+    }
+
+    if (errors.length > 0) {
+      logger.warn('[Installer]: Install errored', {errors})
+      const buttons = errorTypes.fuse ? ['Okay'] : ['Ignore', 'Quit']
+      const detail = errors.join('\n') + `\n\nPlease run \`keybase log send\` to report the error.`
+      const message = 'Keybase Install Error'
+      loggingPromise
+        .then(async () => Electron.dialog.showMessageBox({buttons, detail, message}))
+        .then(({response}) => {
+          if (response === 1) {
+            ctlQuit()
+          } else {
+            callback(null)
+          }
+        })
+        .catch(() => {})
+      return
+    }
+
+    // If we had an error install CLI, let's prompt and try to do it via privileged install.
+    if (errorTypes.cli) {
+      logger.warn('[Installer]: Has cli errors and not installed yet, trying CLI install')
+      if (loadHasPrompted()) {
+        logger.warn('[Installer]: Bailing on already tried to install cli previously')
+      } else {
+        saveHasPrompted()
+        exec(
+          keybaseBin,
+          ['--debug', 'install', '--components=clipaths', '--format=json', '--timeout=120s'],
+          'darwin',
+          'prod',
+          true,
+          callback
+        )
+        return
+      }
+    }
+
+    logger.warn('[Installer]: install-auto completed without reported errors')
+    callback(null)
+  }
+  exec(
+    keybaseBin,
+    ['--debug', 'install-auto', '--format=json', `--timeout=${timeout}s`],
+    'darwin',
+    'prod',
+    true,
+    handleResults
+  )
+}
+
+const install = isDarwin ? darwinInstall : (callback: CB) => callback(null) // nothing on other platforms
+export default install

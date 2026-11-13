@@ -1,0 +1,106 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {openURL} from '@/util/misc'
+
+type Props = {
+  height: number
+  mapSrc: string
+  onLoad?: () => void
+  width: number
+}
+
+const LocationMap = (props: Props) => {
+  const styles = useStyles()
+  const {height, mapSrc, width, onLoad: _onLoad} = props
+  const [mapLoaded, setMapLoaded] = React.useState(false)
+  const [mapFailed, setMapFailed] = React.useState(false)
+  // mapSrc updates as the live location moves; reset load/error state so a new
+  // coordinate can recover from a transient failure.
+  const [prevMapSrc, setPrevMapSrc] = React.useState(mapSrc)
+  if (mapSrc !== prevMapSrc) {
+    setPrevMapSrc(mapSrc)
+    setMapLoaded(false)
+    setMapFailed(false)
+  }
+  const onLoad = () => {
+    setMapLoaded(true)
+    _onLoad?.()
+  }
+  const onError = () => {
+    setMapFailed(true)
+  }
+
+  const inner = (
+    <Kb.Box2
+      direction="vertical"
+      fullHeight={true}
+      fullWidth={true}
+      gap="small"
+      justifyContent="center"
+      style={styles.container}
+    >
+      {!!mapSrc && <Kb.Image src={mapSrc} style={{height, width}} onLoad={onLoad} onError={onError} />}
+      {!mapLoaded && !mapFailed && <Kb.ProgressIndicator style={styles.loading} />}
+      {mapFailed && (
+        <Kb.Text center={true} type="BodySmall" style={styles.error}>
+          Unable to load map.
+        </Kb.Text>
+      )}
+      <Kb.Banner color="white" style={styles.banner}>
+        <Kb.BannerParagraph
+          bannerColor="white"
+          content={[
+            'Your location is protected. ',
+            {onClick: () => { void openURL('https://book.keybase.io/docs/chat/location') }, text: 'Learn more'},
+          ]}
+        />
+      </Kb.Banner>
+    </Kb.Box2>
+  )
+
+  if (!isMobile) {
+    return <Kb.Box2 alignSelf="center" direction="vertical" style={styles.outer}>{inner}</Kb.Box2>
+  }
+  return inner
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      banner: {
+        backgroundColor: theme.white,
+        borderBottomWidth: 1,
+        borderColor: theme.black_10,
+        left: 0,
+        position: 'absolute',
+        top: 0,
+      },
+      error: {
+        color: theme.redDark,
+      },
+      container: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.globalStyles.fillAbsolute,
+        },
+        isElectron: {
+          alignItems: 'center',
+        },
+      }),
+      loading: {
+        bottom: '50%',
+        left: '50%',
+        ...Kb.Styles.marginH(-12),
+        ...Kb.Styles.marginV(-12),
+        position: 'absolute',
+        right: '50%',
+        top: '50%',
+        width: 24,
+      },
+      outer: {
+        height: 300,
+        width: 300,
+      },
+    }) as const
+)
+
+export default LocationMap

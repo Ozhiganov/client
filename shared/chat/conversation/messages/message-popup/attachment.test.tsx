@@ -1,0 +1,128 @@
+/** @jest-environment jsdom */
+/// <reference types="jest" />
+import * as T from '@/constants/types'
+import {cleanup, render} from '@testing-library/react'
+import {makeMessageAttachment} from '@/constants/chat/message'
+import {resetAllStores} from '@/util/zustand'
+import {useCurrentUserState} from '@/stores/current-user'
+import {makeConversationMeta} from '@/constants/chat/meta'
+import {metasReceived, participantInfoReceived} from '@/chat/inbox/metadata'
+import type {Props as FloatingMenuProps} from '@/common-adapters/floating-menu'
+
+// the menu's popup chrome is a placeholder; what the popup offers is the items it hands the menu
+let menuItems: FloatingMenuProps['items'] = []
+jest.mock('@/common-adapters/floating-menu', () => ({
+  __esModule: true,
+  default: (p: FloatingMenuProps) => {
+    menuItems = p.items
+    return null
+  },
+}))
+
+import PopAttach from './attachment'
+
+const conversationIDKey = T.Chat.stringToConversationIDKey('conv1')
+const g = globalThis as unknown as {isMobile: boolean; isAndroid: boolean; isIOS: boolean}
+
+const titlesFor = (over?: Partial<T.Chat.MessageAttachment>) => {
+  const message = makeMessageAttachment({
+    author: 'testuser-mac',
+    conversationIDKey,
+    fileName: 'doc.pdf',
+    fileType: 'application/pdf',
+    id: T.Chat.numberToMessageID(42),
+    ordinal: T.Chat.numberToOrdinal(42),
+    ...over,
+  })
+  render(
+    <PopAttach
+      conversationIDKey={conversationIDKey}
+      message={message}
+      onHidden={() => {}}
+      ordinal={message.ordinal}
+      position="top left"
+      visible={true}
+    />
+  )
+  return menuItems.map(i => (!i || i === 'Divider' ? 'Divider' : i.title))
+}
+
+beforeEach(() => {
+  menuItems = []
+  useCurrentUserState.getState().dispatch.setBootstrap({
+    deviceID: 'device-id',
+    deviceName: 'device-name',
+    uid: 'uid',
+    username: 'testuser',
+  })
+  // a one-on-one conversation, as the inbox delivered it
+  metasReceived([{...makeConversationMeta(), conversationIDKey, teamType: 'adhoc'}], undefined, {force: true})
+  participantInfoReceived(conversationIDKey, {
+    all: ['testuser', 'testuser-mac'],
+    contactName: new Map(),
+    name: ['testuser', 'testuser-mac'],
+  })
+})
+
+afterEach(() => {
+  cleanup()
+  resetAllStores()
+  g.isMobile = false
+  g.isAndroid = false
+  g.isIOS = false
+})
+
+test('Android offers Download for a non-media file, in the top section', () => {
+  g.isMobile = true
+  g.isAndroid = true
+  const titles = titlesFor()
+  expect(titles).toContain('Download')
+  const topSectionEnd = titles.indexOf('Divider', titles.indexOf('Divider') + 1)
+  expect(titles.indexOf('Download')).toBeLessThan(topSectionEnd)
+  expect(titles.filter(t => t === 'Download')).toHaveLength(1)
+  expect(titles.indexOf('Download')).toBe(titles.indexOf('Share') - 1)
+})
+
+test('Android offers only Save for an image', () => {
+  g.isMobile = true
+  g.isAndroid = true
+  const titles = titlesFor({attachmentType: 'image', fileName: 'pic.png', fileType: 'image/png'})
+  expect(titles).toContain('Save')
+  expect(titles).not.toContain('Download')
+})
+
+test('Android offers only Save for a video', () => {
+  g.isMobile = true
+  g.isAndroid = true
+  const titles = titlesFor({
+    attachmentType: 'image',
+    fileName: 'clip.mp4',
+    fileType: 'video/mp4',
+    showPlayButton: true,
+  })
+  expect(titles).toContain('Save')
+  expect(titles).not.toContain('Download')
+})
+
+test('Android still offers Download for a file whose downloadPath is set', () => {
+  g.isMobile = true
+  g.isAndroid = true
+  expect(titlesFor({downloadPath: '/cache/doc.pdf'})).toContain('Download')
+})
+
+test('Android hides Download for a message with no id', () => {
+  g.isMobile = true
+  g.isAndroid = true
+  expect(titlesFor({id: T.Chat.numberToMessageID(0)})).not.toContain('Download')
+})
+
+test('iOS offers no Download', () => {
+  g.isMobile = true
+  g.isIOS = true
+  expect(titlesFor()).not.toContain('Download')
+})
+
+test('desktop Download still hidden once downloaded', () => {
+  expect(titlesFor()).toContain('Download')
+  expect(titlesFor({downloadPath: '/dl/doc.pdf'})).not.toContain('Download')
+})

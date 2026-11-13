@@ -1,0 +1,77 @@
+// What one RPC shows on its waiting key. The service owes the GUI an answer (waiting) until it hands
+// the GUI a prompt; while any prompt is held the GUI owes the service, so the key stops waiting unless
+// the flow says the service is still working. Settled once, by whatever ends the RPC.
+import {errorKind, isCancelled, type RPCError} from '@/util/errors'
+import once from 'lodash/once'
+import type {WaitingChange, WaitingKeys} from './types'
+
+export type WaitingTracker = {
+  // A prompt is held for the GUI; the release (answer, refusal, service cancel) runs once
+  holdPrompt: () => () => void
+  // The service works while a prompt is held; the release runs once, and settling ends it too
+  holdServerWork: () => () => void
+  // Ends the RPC. Only the first call does anything; it returns whether it was that one. A service error
+  // or a lost link is recorded on the key even if it was not waiting; a cancel, by either side, is not.
+  settle: (error?: RPCError) => boolean
+}
+
+export const makeWaitingTracker = (
+  key: WaitingKeys | undefined,
+  emit: (change: WaitingChange) => void,
+  log?: (waiting: boolean) => void
+): WaitingTracker => {
+  let settled = false
+  let prompts = 0
+  let serverWork = 0
+  let waiting = false
+
+  const show = (next: boolean, error?: RPCError) => {
+    if (next === waiting) {
+      return
+    }
+    waiting = next
+    log?.(next)
+    if (key) {
+      emit(next ? {increment: true, key} : {error, increment: false, key})
+    }
+  }
+  const update = () => show(!settled && (prompts === 0 || serverWork > 0))
+
+  const hold = (change: (by: 1 | -1) => void) => {
+    change(1)
+    update()
+    return once(() => {
+      change(-1)
+      update()
+    })
+  }
+
+  update()
+
+  return {
+    holdPrompt: () =>
+      hold(by => {
+        prompts += by
+      }),
+    holdServerWork: () =>
+      hold(by => {
+        serverWork += by
+      }),
+    settle: error => {
+      if (settled) {
+        return false
+      }
+      settled = true
+      // Only a service error (login-required is one) or a lost link: a quiet cancel is no failure, and
+      // a local failure is the caller's to report
+      const type = errorKind(error)?.type
+      const recorded = type === 'service' || type === 'loginRequired' || isCancelled(error, 'disconnect') ? error : undefined
+      if (waiting) {
+        show(false, recorded)
+      } else if (recorded && key) {
+        emit({error: recorded, key})
+      }
+      return true
+    },
+  }
+}

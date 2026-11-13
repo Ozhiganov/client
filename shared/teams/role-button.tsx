@@ -1,0 +1,60 @@
+import * as Kb from '@/common-adapters'
+import {InlineDropdown} from '@/common-adapters/dropdown'
+import type * as T from '@/constants/types'
+import capitalize from 'lodash/capitalize'
+import RoleCrown from './common/role-crown'
+
+export type Props = {
+  containerStyle?: Kb.Styles.StylesCrossPlatform
+  selectedRole: T.Teams.TeamRoleType
+  onClick: () => void
+  style?: Kb.Styles.StylesCrossPlatform
+  loading?: boolean
+  testID?: string
+}
+
+const RoleButton = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <InlineDropdown
+      containerStyle={props.containerStyle}
+      textWrapperType={null}
+      label={
+        <Kb.Box2 direction="horizontal" alignItems="center" style={styles.label}>
+          <RoleCrown role={props.selectedRole} sizeType="Small" style={styles.icon} />
+          <Kb.Text type="BodySmallSemibold">{capitalize(props.selectedRole)}</Kb.Text>
+        </Kb.Box2>
+      }
+      onPress={props.onClick}
+      style={Kb.Styles.collapseStyles([styles.button, props.style])}
+      loading={props.loading}
+      testID={props.testID}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  button: Kb.Styles.platformStyles({
+    common: {
+      marginRight: 0,
+    },
+    isElectron: {
+      minHeight: 26,
+      minWidth: 82,
+    },
+    isMobile: {
+      minHeight: 30,
+      minWidth: 100,
+    },
+  }),
+  icon: {
+    alignSelf: 'center',
+    marginLeft: 0,
+    marginRight: Kb.Styles.globalMargins.xtiny,
+  },
+  label: {
+    marginLeft: Kb.Styles.globalMargins.xtiny,
+  },
+}))
+
+export default RoleButton

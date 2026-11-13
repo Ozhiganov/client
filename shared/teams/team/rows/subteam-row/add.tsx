@@ -1,0 +1,54 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {makeNewTeamWizard} from '@/teams/new-team/wizard/state'
+
+type Props = {
+  setSubteamFilter: React.Dispatch<React.SetStateAction<string>>
+  subteamFilter: string
+  teamID: T.Teams.TeamID
+}
+
+const AddSubteam = ({setSubteamFilter, subteamFilter, teamID}: Props) => {
+  const styles = useStyles()
+  const nav = useSafeNavigation()
+  const onCreateSubteam = () =>
+    nav.safeNavigateAppend({
+      name: 'teamWizard2TeamInfo',
+      params: {wizard: makeNewTeamWizard({parentTeamID: teamID, teamType: 'subteam'})},
+    })
+  // clear filter on unmount
+  React.useEffect(
+    () => () => {
+      setSubteamFilter('')
+    },
+    [setSubteamFilter]
+  )
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="center" style={styles.containerNew} justifyContent="space-between">
+      <Kb.Button mode="Secondary" label="Create subteam" onClick={onCreateSubteam} small={true} />
+      {!isMobile && (
+        <Kb.SearchFilter
+          size="small"
+          placeholderText="Filter"
+          onChange={setSubteamFilter}
+          hotkey="k"
+          value={subteamFilter}
+          valueControlled={true}
+          style={styles.filterInput}
+        />
+      )}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  containerNew: {
+    ...Kb.Styles.padding(6, Kb.Styles.globalMargins.small),
+    backgroundColor: theme.blueGrey,
+  },
+  filterInput: {maxWidth: 148},
+}))
+
+export default AddSubteam

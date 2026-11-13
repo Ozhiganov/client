@@ -1,0 +1,39 @@
+import * as React from 'react'
+import * as C from '@/constants'
+import type * as T from '@/constants/types'
+import TeamRow from '@/teams/main/team-row'
+import {useActivityLevels} from '@/teams/common'
+import {useNotifState} from '@/stores/notifications'
+import * as Teams from '@/constants/teams'
+import {useTeamsListMap} from '@/teams/use-teams-list'
+
+type Props = {
+  teamID: T.Teams.TeamID
+  teamMeta?: T.Teams.TeamMeta
+}
+
+const SubteamTeamRow = ({teamID, teamMeta: providedTeamMeta}: Props) => {
+  const teamMetaByID = useTeamsListMap()
+  const teamMeta = providedTeamMeta ?? teamMetaByID.get(teamID) ?? Teams.makeTeamMeta({id: teamID})
+  const {teams: activityByTeam} = useActivityLevels()
+  const {badgeCount, isNew} = useNotifState(
+    C.useShallow(s => ({
+      badgeCount: Teams.getTeamRowBadgeCount(s.newTeamRequests, s.teamIDToResetUsers, teamID),
+      isNew: s.newTeams.has(teamID),
+    }))
+  )
+
+  return (
+    <TeamRow
+      activityLevel={activityByTeam.get(teamID) || 'none'}
+      badgeCount={badgeCount}
+      id={teamID}
+      isNew={isNew}
+      teamMeta={teamMeta}
+    />
+  )
+}
+
+// memo: the team screen's section hooks rebuild data arrays per render
+// (e.g. while typing filters); rows have stable/primitive props so they bail
+export default React.memo(SubteamTeamRow)

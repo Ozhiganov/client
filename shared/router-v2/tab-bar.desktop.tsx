@@ -1,0 +1,373 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {useConfigState} from '@/stores/config'
+import * as Kbfs from '@/fs/common'
+import * as Platforms from '@/constants/platform'
+import * as T from '@/constants/types'
+import * as React from 'react'
+import * as Tabs from '@/constants/tabs'
+import * as Common from './common'
+import {CommonActions} from '@react-navigation/core'
+import AccountSwitcher from './account-switcher'
+import RuntimeStats from '../app/runtime-stats'
+import {openURL} from '@/util/misc'
+import {isLinux} from '@/constants/platform'
+import KB2 from '@/util/electron'
+import './tab-bar.css'
+import {settingsLogOutTab} from '@/constants/settings'
+import {useNotifState} from '@/stores/notifications'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useShellState} from '@/stores/shell'
+import {useUsersState} from '@/stores/users'
+import {navToProfile} from '@/constants/router'
+import {fitFontSize, measureTextWidth} from '@/util/measure-text.desktop'
+import {dumpLogs} from '@/util/storeless-actions'
+
+const {hideWindow, ctlQuit} = KB2.functions
+
+export type Props = {
+  navigation: C.Router2.NavigationRef
+  state: C.Router2.NavState
+}
+
+const FilesTabBadge = () => {
+  const styles = useStyles()
+  const uploadIcon = Kbfs.useFilesTabUploadIcon()
+  return uploadIcon ? <Kbfs.UploadIcon uploadIcon={uploadIcon} style={styles.badgeIconUpload} /> : null
+}
+
+const stop = () => {
+  const f = async () => {
+    await T.RPCGen.ctlStopRpcPromise({exitCode: T.RPCGen.ExitCode.ok})
+  }
+  C.ignorePromise(f())
+}
+
+// ~82px of text space in the 160px nav: avatar (14 margin + 24) + gaps + caret + margins
+const maxNameWidth = 82
+const nameFont = (size: number) => `600 ${size}px Keybase` // BodyTinySemibold
+
+const Header = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const username = useCurrentUserState(s => s.username)
+  const fullname = useUsersState(s => s.infoMap.get(username)?.fullname ?? '')
+
+  const {logoutToLoggedOutFlow, userSwitching} = useConfigState(
+    C.useShallow(s => ({
+      logoutToLoggedOutFlow: s.dispatch.logoutToLoggedOutFlow,
+      userSwitching: s.userSwitching,
+    }))
+  )
+  const onHelp = () => { void openURL('https://book.keybase.io') }
+  const onQuit = () => {
+    if (!__DEV__) {
+      if (isLinux) {
+        stop()
+      } else {
+        C.ignorePromise(dumpLogs('quitting through menu'))
+      }
+    }
+    // In case dump log doesn't exit for us
+    hideWindow?.()
+    setTimeout(() => {
+      ctlQuit?.()
+    }, 2000)
+  }
+
+  const {navigateAppend, switchTab} = C.Router2
+  const onSettings = () => switchTab(Tabs.settingsTab)
+  const onSignOut = () => navigateAppend({name: settingsLogOutTab, params: {}})
+  const onAddAccount = () => {
+    logoutToLoggedOutFlow()
+  }
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    const menuItems: Kb.MenuItems = [
+      // the desktop menu only styles disabled items, so drop the handler too
+      {disabled: userSwitching, onClick: userSwitching ? undefined : onAddAccount, title: 'Log in as another user'},
+      {onClick: onSettings, title: 'Settings'},
+      {onClick: onHelp, title: 'Help'},
+      {danger: true, onClick: onSignOut, title: 'Sign out'},
+      {danger: true, onClick: onQuit, title: 'Quit Keybase'},
+    ]
+
+    const onClickWrapper = () => {
+      hidePopup()
+      navToProfile(username)
+    }
+
+    const menuHeader = (
+      <Kb.Box2 direction="vertical" fullWidth={true}>
+        <Kb.ClickableBox alignSelf="center" onClick={onClickWrapper} style={styles.headerBox} direction="vertical">
+          <Kb.NameWithIcon
+            username={username}
+            onClick={onClickWrapper}
+            metaTwo={
+              <Kb.Text type="BodySmall" lineClamp={1} style={styles.fullname}>
+                {fullname}
+              </Kb.Text>
+            }
+          />
+        </Kb.ClickableBox>
+        <Kb.Button
+          label="View/Edit profile"
+          mode="Secondary"
+          onClick={onClickWrapper}
+          small={true}
+          style={styles.button}
+        />
+        <AccountSwitcher onSelected={hidePopup} />
+      </Kb.Box2>
+    )
+
+    return (
+      <Kb.FloatingMenu
+        position="bottom left"
+        containerStyle={styles.menu}
+        header={menuHeader}
+        closeOnSelect={true}
+        visible={true}
+        attachTo={attachTo}
+        items={menuItems}
+        onHidden={hidePopup}
+      />
+    )
+  }
+  const {togglePopup, popup, popupAnchor} = Kb.usePopup2(makePopup)
+
+  // show the greeting only when it truly fits, and step the font down for long names
+  const greeting = `Hi ${username}!`
+  let nameText = greeting
+  let nameFontSize = 12
+  if (measureTextWidth(greeting, nameFont(nameFontSize)) > maxNameWidth) {
+    nameText = username
+    nameFontSize = fitFontSize(username, {
+      fontForSize: nameFont,
+      maxSize: 12,
+      minSize: 10,
+      maxWidth: maxNameWidth,
+    })
+  }
+
+  // mid account-switch we have no user info yet; keep the bar but suppress the dropdown
+  return (
+    <>
+      <Kb.ClickableBox
+        onClick={username ? togglePopup : undefined}
+        direction="horizontal"
+        gap="tiny"
+        fullWidth={true}
+        style={styles.nameContainer}
+        alignItems="center"
+        ref={popupAnchor}
+      >
+        <Kb.Avatar
+          size={24}
+          username={username}
+          style={Kb.Styles.collapseStyles([styles.avatar, styles.avatarBorder])}
+        />
+        {!!username && (
+          <>
+            <Kb.Text
+              className="username"
+              lineClamp={1}
+              type="BodyTinySemibold"
+              style={Kb.Styles.collapseStyles([styles.username, nameFontSize !== 12 && {fontSize: nameFontSize}])}
+            >
+              {nameText}
+            </Kb.Text>
+            <Kb.Icon
+              type="iconfont-arrow-down"
+              color={theme.blueLighter}
+              fontSize={12}
+              style={styles.caret}
+            />
+          </>
+        )}
+      </Kb.ClickableBox>
+      {popup}
+    </>
+  )
+}
+
+const keysMap = Tabs.desktopTabs.reduce<{[key: string]: (typeof Tabs.desktopTabs)[number]}>(
+  (map, tab, index) => {
+    map[`mod+${index + 1}`] = tab
+    return map
+  },
+  {}
+)
+const hotKeys = Object.keys(keysMap)
+
+function TabBar(props: Props) {
+  const styles = useStyles()
+  const {navigation, state} = props
+  const onHotKey = (cmd: string) => {
+    navigation.dispatch(CommonActions.navigate(keysMap[cmd] as Tabs.Tab))
+  }
+  Kb.useHotKey(hotKeys, onHotKey)
+
+  const onSelectTab = Common.useSubnavTabAction(navigation, state)
+  const forceSmallNav = useShellState(s => s.forceSmallNav)
+
+  // always render the bar; mid account-switch username is briefly empty and the
+  // header degrades to a placeholder instead of dropping the whole nav
+  return (
+    <Kb.Box2
+      className={Kb.Styles.classNames('tab-container', {forceSmallNav})}
+      direction="vertical"
+      fullHeight={true}
+    >
+      <Kb.Box2 direction="vertical" noShrink={true} style={styles.header} fullWidth={true}>
+        <Kb.Box2 direction="horizontal" style={styles.osButtons} fullWidth={true} />
+        <Header />
+        <Kb.Divider style={styles.divider} />
+      </Kb.Box2>
+      {state?.routes?.map((route: {key?: string; name?: string}, index: number) => (
+        <Tab
+          key={route.key}
+          tab={route.name as Tabs.AppTab}
+          index={index}
+          isSelected={index === state.index}
+          onSelectTab={onSelectTab}
+        />
+      ))}
+      <RuntimeStats />
+    </Kb.Box2>
+  )
+}
+
+type TabProps = {
+  tab: Tabs.AppTab
+  index: number
+  isSelected: boolean
+  onSelectTab: (t: Tabs.AppTab) => void
+}
+
+const TabBadge = (p: {name: Tabs.Tab}) => {
+  const {name} = p
+  const badgeNumber = useNotifState(s => s.navBadges.get(name) ?? 0)
+  const fsCriticalUpdate = useShellState(s => s.fsCriticalUpdate)
+  const badge = badgeNumber + (name === Tabs.fsTab && fsCriticalUpdate ? 1 : 0)
+  return badge ? <Kb.Badge className="tab-badge" badgeNumber={badge} /> : null
+}
+
+function Tab(props: TabProps) {
+  const styles = useStyles()
+  const {tab, index, isSelected, onSelectTab} = props
+  const isPeopleTab = index === 0
+  const {label} = Tabs.desktopTabMeta[tab]
+  const current = useCurrentUserState(s => s.username)
+  const switchToAccount = useConfigState(s => s.dispatch.switchToAccount)
+  const onQuickSwitch = isPeopleTab
+    ? () => {
+        const {configuredAccounts: accountRows, userSwitching} = useConfigState.getState()
+        if (userSwitching) return
+        const row = accountRows.find(a => a.username !== current && a.hasStoredSecret)
+        if (row) {
+          switchToAccount(row.username)
+        } else {
+          onSelectTab(tab)
+        }
+      }
+    : undefined
+
+  // no long press on desktop so a quick version
+  const [mouseTime, setMouseTime] = React.useState(0)
+  const onMouseUp = isPeopleTab
+    ? () => {
+        if (mouseTime && Date.now() - mouseTime > 1000) {
+          onQuickSwitch?.()
+        }
+        setMouseTime(0)
+      }
+    : undefined
+  const onMouseDown = isPeopleTab
+    ? () => {
+        setMouseTime(Date.now())
+      }
+    : undefined
+  const onMouseLeave = isPeopleTab
+    ? () => {
+        setMouseTime(0)
+      }
+    : undefined
+
+  const onClick = () => {
+    onSelectTab(tab)
+  }
+
+  return (
+    <Kb.ClickableBox
+      key={tab}
+      onClick={onClick}
+      onMouseDown={onMouseDown}
+      onMouseUp={onMouseUp}
+      onMouseLeave={onMouseLeave}
+      direction="horizontal"
+      fullWidth={true}
+      testID={Common.tabToTestID.get(tab)}
+      className={Kb.Styles.classNames(
+        isSelected ? 'tab-selected' : 'tab',
+        'tab-tooltip',
+        'tooltip-top-right'
+      )}
+      relative={true}
+      style={styles.tab}
+      tooltip={`${label} (${Platforms.shortcutSymbol}${index + 1})`}
+    >
+      <Kb.Box2 className="tab-highlight" direction="vertical" fullHeight={true} />
+      <Kb.Box2 direction="horizontal" justifyContent="flex-end" relative={true}>
+        <Kb.Icon className="tab-icon" type={Tabs.desktopTabMeta[tab].icon} sizeType="Big" />
+        {tab === Tabs.fsTab && <FilesTabBadge />}
+      </Kb.Box2>
+      <Kb.Text className="tab-label" type="BodySmallSemibold">
+        {label}
+      </Kb.Text>
+      <TabBadge name={tab} />
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      avatar: {marginLeft: 14},
+      avatarBorder: {borderRadius: '50%', boxShadow: `0px 0px 0px 2px ${theme.blue}`},
+      badgeIconUpload: {
+        bottom: -Kb.Styles.globalMargins.xxtiny,
+        ...Kb.Styles.size(Kb.Styles.globalMargins.xsmall),
+        position: 'absolute',
+        right: Kb.Styles.globalMargins.xsmall,
+      },
+      button: {
+        margin: Kb.Styles.globalMargins.xsmall,
+      },
+      caret: {marginRight: 12},
+      divider: {marginTop: Kb.Styles.globalMargins.tiny},
+      fullname: {maxWidth: 180},
+      header: {height: 80, marginBottom: 20},
+      headerBox: {
+        paddingTop: Kb.Styles.globalMargins.small,
+      },
+      menu: {marginLeft: Kb.Styles.globalMargins.tiny},
+      nameContainer: {height: 24},
+      osButtons: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.desktopStyles.windowDragging,
+          flexGrow: 1,
+        },
+      }),
+      tab: {
+        alignItems: 'center',
+        paddingRight: 12,
+      },
+      username: Kb.Styles.platformStyles({
+        isElectron: {color: theme.blueLighter, flexGrow: 1, wordBreak: 'break-all'},
+      }),
+    }) as const
+)
+
+export default TabBar

@@ -1,0 +1,524 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import useEditAvatar, {type Props} from './hooks'
+import {useNavigation, type ParamListBase} from '@react-navigation/native'
+import type {NativeStackNavigationProp} from '@react-navigation/native-stack'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {ModalTitle} from '@/teams/common'
+import './edit-avatar.css'
+import KB2 from '@/util/electron'
+import {launchImageLibraryAsync} from '@/util/expo-image-picker'
+import {CropZoom, type CropZoomRefType} from '@/util/zoom-toolkit'
+import {cropViewToRect, type CropView} from '@/util/crop'
+
+const desktopFns = isMobile ? ({} as typeof KB2.functions) : KB2.functions
+
+const AVATAR_CONTAINER_SIZE = 300
+
+// Local type stubs for DOM APIs (native tsconfig lacks dom lib)
+type FileLike = {name?: string; size?: number; type?: string}
+type FileListLike = {length?: number; [key: number]: FileLike; [Symbol.iterator]?: () => Iterator<FileLike>}
+type FileInputRef = {click?: () => void; files?: FileListLike | null; value?: string}
+
+// Desktop helpers
+const validDrag = (e: React.DragEvent) => Array.from(e.dataTransfer.types).includes('Files')
+
+const getFile = async (fileList: FileListLike | undefined): Promise<string> => {
+  const {isDirectory, getPathForFile} = desktopFns
+  const paths = fileList?.length ? Array.from(fileList as unknown as Iterable<FileLike>) : undefined
+  const file = paths?.[0]
+  if (!file) {
+    return ''
+  }
+  const path = getPathForFile?.(file as unknown as File) ?? ''
+  if (!path) {
+    return ''
+  }
+  try {
+    const isDir = await (isDirectory?.(path) ?? Promise.resolve(false))
+    if (isDir) {
+      return ''
+    }
+  } catch {}
+  return path
+}
+
+// Desktop implementation
+type Loading = undefined | 'loading' | 'loaded'
+const DesktopEditAvatar = (_p: Props) => {
+  const styles = useStyles()
+  const hoverStyles = useHoverStyles()
+  const theme = Kb.Styles.useTheme()
+  const p = useEditAvatar(_p)
+  const {wizard, type, error, createdTeam, teamname} = p
+  const [serror, setSerror] = React.useState(false)
+  const [dropping, setDropping] = React.useState(false)
+  const [loading, setLoading] = React.useState<Loading>()
+  const [imageSource, setImageSource] = React.useState('')
+
+  const fileRef = React.useRef<FileInputRef>(null)
+
+  const onSave = () => {
+    const crop = cropViewToRect(cropRef.current, AVATAR_CONTAINER_SIZE)
+    p.onSave(imageSource, crop)
+  }
+  const cropRef = React.useRef({height: 0, scale: 0, width: 0, x: 0, y: 0})
+  const onChanged = (e: CropView) => {
+    cropRef.current = e
+  }
+
+  const onImageLoad = () => {
+    setLoading('loaded')
+  }
+  const onDrop = (e: React.DragEvent) => {
+    const f = async () => {
+      if (!validDrag(e)) {
+        return
+      }
+      setDropping(false)
+      setSerror(false)
+      setLoading('loading')
+      const img = await getFile(e.dataTransfer.files as unknown as FileListLike)
+      if (img) {
+        setImageSource(img)
+      }
+    }
+    void f()
+  }
+  const filePickerOpen = () => {
+    fileRef.current?.click?.()
+  }
+  const pickFile = () => {
+    const f = async () => {
+      setSerror(false)
+      setLoading('loading')
+      const img = await getFile(fileRef.current?.files ?? undefined)
+      if (img) {
+        setImageSource(img)
+      }
+      if (fileRef.current) {
+        fileRef.current.value = ''
+      }
+    }
+    void f()
+  }
+
+  return (
+    <Kb.ModalScreen
+      // no scroller: dragging the crop must not scroll the body
+      scroll={false}
+      banner={
+        <>
+          <Kb.ErrorBanner error={error} />
+          {serror ? (
+            <Kb.Banner color="red">
+              The image you uploaded could not be read. Try again with a valid PNG, JPG or GIF.
+            </Kb.Banner>
+          ) : null}
+        </>
+      }
+      footer={
+        <Kb.WaitingButton
+          fullWidth={true}
+          label={wizard ? 'Continue' : 'Save'}
+          onClick={onSave}
+          disabled={loading !== 'loaded'}
+          waitingKey={p.waitingKey}
+        />
+      }
+    >
+      <div
+        className={Kb.Styles.classNames({dropping: dropping})}
+        onDrop={onDrop}
+        style={Kb.Styles.castStyleDesktop(Kb.Styles.collapseStyles([
+          styles.container,
+          createdTeam && styles.paddingTopForCreatedTeam,
+        ]))}
+      >
+        {type === 'team' && createdTeam && !wizard && (
+          <Kb.Box2 direction="vertical" fullWidth={true} style={styles.createdBanner}>
+            <Kb.Text type="BodySmallSemibold" negative={true}>
+              Hoorah! Your team {teamname} was created.
+            </Kb.Text>
+          </Kb.Box2>
+        )}
+        <Kb.Text center={true} type="Body" style={styles.instructions}>
+          Drag and drop a {type} avatar or{' '}
+          <Kb.Text type="BodyPrimaryLink" className="hover-underline" onClick={filePickerOpen}>
+            browse your computer
+          </Kb.Text>{' '}
+          for one.
+        </Kb.Text>
+        <Kb.ClickableBox
+          direction="vertical"
+          className={Kb.Styles.classNames('hoverbox', {filled: loading !== 'loaded'})}
+          onClick={!loading ? filePickerOpen : undefined}
+          style={{
+            borderRadius: type === 'team' ? 32 : AVATAR_CONTAINER_SIZE,
+            ...hoverStyles.hoverContainer,
+          }}
+        >
+          <input
+            accept="image/gif,image/jpeg,image/png"
+            multiple={false}
+            onChange={pickFile}
+            ref={fileRef as React.RefObject<HTMLInputElement>}
+            style={styles.hidden}
+            type="file"
+          />
+          <Kb.ZoomableImage
+            dragPan={true}
+            src={imageSource}
+            onChanged={onChanged}
+            onLoaded={onImageLoad}
+            boxCacheKey="avatar"
+          />
+          {!loading && (
+            <Kb.Icon
+              className="icon"
+              color={theme.greyDark}
+              fontSize={48}
+              style={styles.icon}
+              type="iconfont-camera"
+            />
+          )}
+        </Kb.ClickableBox>
+        {loading === 'loaded' ? <Kb.Text type="Body">Click to select. Scroll to zoom.</Kb.Text> : null}
+      </div>
+    </Kb.ModalScreen>
+  )
+}
+
+// Native implementation
+type ImageInfo = {uri: string; width: number; height: number; type?: 'image' | 'video'}
+type AvatarZoomRef = {
+  getRect: () => {width: number; height: number; x: number; y: number} | undefined
+}
+
+const chooseAvatar = async (
+  onSelected: (image: ImageInfo) => void,
+  onCancel: () => void,
+  onError: (error: string) => void
+) => {
+  try {
+    const result = await launchImageLibraryAsync('photo')
+    const first = result.assets?.reduce<ImageInfo | undefined>((acc, a) => {
+      if (!acc && (a.type === 'image' || a.type === 'video')) {
+        return a as ImageInfo
+      }
+      return acc
+    }, undefined)
+    if (!result.canceled && first) {
+      onSelected(first)
+    } else {
+      onCancel()
+    }
+  } catch (error) {
+    onError(String(error))
+  }
+}
+
+const NativeAvatarUploadWrapper = (p: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {newTeamWizard} = p
+  const props = useEditAvatar(p)
+  const {image, error: _error, onSave: _onSave, teamID, type, wizard, waitingKey} = props
+  const [selectedImage, setSelectedImage] = React.useState(image)
+  const [imageError, setImageError] = React.useState('')
+  const nav = useSafeNavigation()
+  const navigation = useNavigation() as unknown as NativeStackNavigationProp<ParamListBase>
+  const navUp = () => nav.safeNavigateUp()
+
+  const onChooseNewAvatar = () => {
+    C.ignorePromise(
+      chooseAvatar(
+        setSelectedImage,
+        () => {
+          if (!props.wizard) {
+            navUp()
+          }
+        },
+        setImageError
+      )
+    )
+  }
+
+  const noImage = !image
+  const autoPickedRef = React.useRef(false)
+  // iOS drops a picker presented while this modal is still presenting, so it opens at the end of
+  // the modal's animated presentation. Only the first transition counts: a later one (the modal
+  // coming back into view) never opens the picker unasked.
+  React.useEffect(() => {
+    if (wizard || !noImage) return
+    return navigation.addListener('transitionEnd', e => {
+      if (autoPickedRef.current) return
+      autoPickedRef.current = true
+      if (e.data.closing) return
+      C.ignorePromise(chooseAvatar(setSelectedImage, () => nav.safeNavigateUp(), setImageError))
+    })
+  }, [navigation, noImage, wizard, nav])
+
+  const error = _error || imageError
+
+  const _zoomRef = React.useRef<AvatarZoomRef>(null)
+
+  const avatar_size = () => {
+    const margin = type === 'team' ? Kb.Styles.globalMargins.large : Kb.Styles.globalMargins.medium
+    const big = Kb.Styles.dimensionWidth - margin * 2
+    if (C.isTablet) {
+      return Math.min(500, big)
+    } else {
+      return big
+    }
+  }
+
+  const onSave = () => {
+    if (!selectedImage) {
+      throw new Error('Missing image when saving avatar')
+    }
+    const rect = _zoomRef.current?.getRect()
+    if (rect) {
+      const xy = {
+        x0: Math.floor(rect.x),
+        x1: Math.floor(rect.x + rect.width),
+        y0: Math.floor(rect.y),
+        y1: Math.floor(rect.y + rect.height),
+      }
+      _onSave(selectedImage.uri, xy)
+    } else {
+      _onSave(selectedImage.uri)
+    }
+  }
+
+  const getImageStyle = (): Kb.Styles.StylesCrossPlatform => ({
+    borderRadius: type === 'team' ? 32 : avatar_size(),
+    height: avatar_size(),
+    width: avatar_size(),
+  })
+
+  const renderImageZoomer = () => {
+    if (type === 'team' && !selectedImage) {
+      return (
+        <Kb.ClickableBox alignSelf="center"
+          direction="vertical"
+          centerChildren={true}
+          style={Kb.Styles.collapseStyles([styles.placeholder, getImageStyle()])}
+          onClick={onChooseNewAvatar}
+        >
+          <Kb.Icon type="iconfont-camera" sizeType="Huge" color={theme.black_10} />
+        </Kb.ClickableBox>
+      )
+    }
+    return selectedImage ? (
+      <NativeAvatarZoom
+        src={selectedImage.uri}
+        width={selectedImage.width}
+        height={selectedImage.height}
+        ref={_zoomRef}
+      />
+    ) : null
+  }
+
+  // a team's title follows the image picked here, which the route's options can't see
+  const hasImage = !!selectedImage
+  React.useEffect(() => {
+    if (!teamID) return
+    const title = hasImage && isIOS ? 'Zoom and pan' : wizard ? 'Upload avatar' : 'Change avatar'
+    navigation.setOptions({
+      headerTitle: () => <ModalTitle teamID={teamID} title={title} newTeamWizard={newTeamWizard} />,
+    })
+  }, [navigation, newTeamWizard, hasImage, teamID, wizard])
+
+  if (type === 'team') {
+    return (
+      <Kb.ModalScreen
+        scroll={false}
+        padding="none"
+        banner={
+          error ? (
+            <Kb.Banner color="red">
+              <Kb.Text type="Body">{error}</Kb.Text>
+            </Kb.Banner>
+          ) : undefined
+        }
+        footer={
+          <Kb.WaitingButton
+            fullWidth={true}
+            label={wizard ? 'Continue' : 'Save'}
+            onClick={onSave}
+            disabled={!selectedImage}
+            waitingKey={waitingKey}
+          />
+        }
+      >
+        <Kb.Box2 alignSelf="center" direction="vertical" flex={1} style={styles.wizardContainer} gap="small">
+          {renderImageZoomer()}
+          <Kb.Box2 alignSelf="center" direction="vertical" style={styles.flexReallyGrow} />
+          <Kb.Button
+            label={selectedImage ? 'Pick a new avatar' : 'Pick an avatar'}
+            mode="Secondary"
+            onClick={onChooseNewAvatar}
+          />
+        </Kb.Box2>
+      </Kb.ModalScreen>
+    )
+  }
+  return (
+    <Kb.ModalScreen
+      scroll={false}
+      padding="none"
+      banner={
+        error ? (
+          <Kb.Banner color="red">
+            <Kb.Text type="Body">{error}</Kb.Text>
+          </Kb.Banner>
+        ) : undefined
+      }
+      footer={<Kb.WaitingButton fullWidth={true} label="Save" onClick={onSave} waitingKey={waitingKey} />}
+    >
+      <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" style={styles.container}>
+        {renderImageZoomer()}
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const avatarSize = 256
+const cropSize = {height: avatarSize, width: avatarSize}
+
+function NativeAvatarZoom(p: {src?: string; width: number; height: number; ref?: React.Ref<AvatarZoomRef>}) {
+  const {src, width, height, ref} = p
+  const resolution = {height, width}
+
+
+  React.useImperativeHandle(ref, () => {
+    return {
+      getRect: () => {
+        const c = czref.current?.crop(avatarSize)
+        if (c) {
+          const rescale = width / (c.resize?.width ?? 1)
+          const {originX: x, originY: y, width: cw, height: ch} = c.crop
+          return {
+            height: ch * rescale,
+            width: cw * rescale,
+            x: x * rescale,
+            y: y * rescale,
+          }
+        }
+        return
+      },
+    }
+  }, [width])
+  const czref = React.useRef<CropZoomRefType>(null)
+
+  const imageAspectRatio = resolution.width / resolution.height
+  const isWider = imageAspectRatio > 1
+
+  const imageStyle = isWider
+    ? {
+        height: avatarSize,
+        width: avatarSize * imageAspectRatio,
+      }
+    : {
+        height: avatarSize / imageAspectRatio,
+        width: avatarSize,
+      }
+
+  return (
+    <Kb.Box2 alignSelf="center"
+      direction="vertical"
+      overflow="hidden"
+      style={{
+        borderRadius: avatarSize / 2,
+        ...Kb.Styles.size(avatarSize),
+      }}
+    >
+      {src ? (
+        <CropZoom cropSize={cropSize} resolution={resolution} ref={czref} panMode="clamp" minScale={1}>
+          <Kb.Image src={src} style={imageStyle} />
+        </CropZoom>
+      ) : null}
+    </Kb.Box2>
+  )
+}
+
+const AvatarUploadWrapper = (p: Props) => {
+  if (!isMobile) return <DesktopEditAvatar {...p} />
+  return <NativeAvatarUploadWrapper {...p} />
+}
+
+const useHoverStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      hoverContainer: Kb.Styles.platformStyles({
+        common: {
+          alignItems: 'flex-start',
+          ...Kb.Styles.size(AVATAR_CONTAINER_SIZE),
+          marginBottom: Kb.Styles.globalMargins.small,
+          marginTop: Kb.Styles.globalMargins.medium,
+          outlineStyle: 'dotted',
+          outlineWidth: 4,
+          overflow: 'hidden',
+          position: 'relative',
+        },
+        isElectron: {
+          cursor: 'pointer',
+        },
+      }),
+    }) as const
+)
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  container: Kb.Styles.platformStyles({
+    common: {
+      ...Kb.Styles.globalStyles.flexBoxColumn,
+      flexGrow: 1,
+    },
+    isMobile: {
+      ...Kb.Styles.padding(0, Kb.Styles.globalMargins.medium),
+      ...Kb.Styles.marginV(Kb.Styles.globalMargins.small),
+    },
+    isElectron: {
+      alignItems: 'center',
+      paddingTop: Kb.Styles.globalMargins.small,
+    },
+  }),
+  createdBanner: {
+    backgroundColor: theme.green,
+    borderTopLeftRadius: 4,
+    borderTopRightRadius: 4,
+    marginBottom: Kb.Styles.globalMargins.large,
+    ...Kb.Styles.paddingV(Kb.Styles.globalMargins.xsmall),
+    textAlign: 'center',
+  },
+  flexReallyGrow: {
+    flexGrow: 1000,
+  },
+  hidden: {display: 'none'},
+  icon: {
+    left: '50%',
+    marginLeft: -24,
+    marginTop: -21,
+    position: 'absolute',
+    top: '50%',
+  },
+  instructions: {maxWidth: 200},
+  paddingTopForCreatedTeam: {paddingTop: Kb.Styles.globalMargins.xlarge},
+  placeholder: {
+    alignItems: 'center',
+    backgroundColor: theme.black_05,
+    borderColor: theme.black_50,
+    borderStyle: 'dotted',
+    borderWidth: 4,
+    display: 'flex',
+    justifyContent: 'center',
+  },
+  wizardContainer: {
+    ...Kb.Styles.padding(64, Kb.Styles.globalMargins.large),
+    backgroundColor: theme.blueGrey,
+  },
+}))
+
+export default AvatarUploadWrapper

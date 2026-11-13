@@ -1,26 +1,22 @@
 package engine
 
 import (
+	"testing"
+
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
-	"testing"
+	"github.com/stretchr/testify/require"
 )
 
-func assertEmail(t *testing.T, g *libkb.GlobalContext, expected string) {
-	res, err := g.API.Get(libkb.APIArg{
+func assertEmail(mctx libkb.MetaContext, t *testing.T, expected string) {
+	res, err := mctx.G().API.Get(mctx, libkb.APIArg{
 		Endpoint:    "me",
-		NeedSession: true,
+		SessionType: libkb.APISessionTypeREQUIRED,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	gotten, err := res.Body.AtPath("me.emails.primary.email").GetString()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotten != expected {
-		t.Fatalf("wanted email '%s', but got '%s'", expected, gotten)
-	}
+	require.NoError(t, err)
+	require.Equal(t, expected, gotten, "wanted email '%s', but got '%s'", expected, gotten)
 }
 
 func TestSignedEmailChange(t *testing.T) {
@@ -29,7 +25,8 @@ func TestSignedEmailChange(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "email")
 
-	assertEmail(t, tc.G, u.Email)
+	m := NewMetaContextForTest(tc)
+	assertEmail(m, t, u.Email)
 
 	newEmail := "new-" + u.Email
 	arg := &keybase1.EmailChangeArg{
@@ -37,12 +34,13 @@ func TestSignedEmailChange(t *testing.T) {
 	}
 
 	// using an empty secret ui to make sure existing pp doesn't come from ui prompt:
-	ctx := &Context{
+	uis := libkb.UIs{
 		SecretUI: &libkb.TestSecretUI{},
 	}
-	eng := NewEmailChange(arg, tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	m = m.WithUIs(uis)
+	eng := NewEmailChange(tc.G, arg)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
-	assertEmail(t, tc.G, newEmail)
+	assertEmail(m, t, newEmail)
 }

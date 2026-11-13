@@ -1,0 +1,105 @@
+import * as T from '@/constants/types'
+import {useOpen} from '@/fs/common/use-open'
+import {useRowStyles, StillCommon} from './common'
+import * as Kb from '@/common-adapters'
+import {
+  LastModifiedLine,
+  Filename,
+  useFsDismissUpload,
+  useFsDownloadIntent,
+  useFsPathItem,
+  useFsUploadStatus,
+} from '@/fs/common'
+import * as FS from '@/constants/fs'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type OwnProps = {
+  destinationPickerSource?: T.FS.MoveOrCopySource | T.FS.IncomingShareSource
+  path: T.FS.Path
+}
+
+const getDownloadingText = (intent: T.FS.DownloadIntent) => {
+  switch (intent) {
+    case T.FS.DownloadIntent.None:
+      return 'Downloading...'
+    case T.FS.DownloadIntent.CameraRoll:
+      return 'Saving...'
+    case T.FS.DownloadIntent.Share:
+      return 'Preparing...'
+    default:
+      return ''
+  }
+}
+
+const StillContainer = (p: OwnProps) => {
+  const theme = Kb.Styles.useTheme()
+  const rowStyles = useRowStyles()
+  const {destinationPickerSource, path} = p
+  const _pathItem = useFsPathItem(path, {loadOnMount: false, subscribe: false})
+  const dismissUpload = useFsDismissUpload()
+  const _uploads = useFsUploadStatus()
+  const writingToJournalUploadState = _uploads.writingToJournal.get(path)
+  const onOpen = useOpen({destinationPickerSource, path})
+
+  const dismissUploadError = writingToJournalUploadState?.error
+    ? () => dismissUpload(writingToJournalUploadState.uploadID)
+    : undefined
+  const intentIfDownloading = useFsDownloadIntent(path)
+  const isEmpty =
+    _pathItem.type === T.FS.PathType.Folder &&
+    _pathItem.progress === T.FS.ProgressType.Loaded &&
+    !_pathItem.children.size
+  const type = _pathItem.type
+  const uploading = _uploads.syncingPaths.has(path)
+  const writingToJournal = !!writingToJournalUploadState
+
+  return (
+    <StillCommon
+      path={path}
+      inDestinationPicker={!!destinationPickerSource}
+      onOpen={onOpen}
+      testID={TestIDs.FILES_ROW}
+      writingToJournal={writingToJournal}
+      uploadErrored={!!dismissUploadError}
+      content={
+        <>
+          <Filename path={path} type={FS.pathTypeToTextType(type)} style={rowStyles.rowText} />
+          {isEmpty && (
+            <Kb.Meta
+              title="empty"
+              backgroundColor={theme.greyDark}
+              style={{marginLeft: Kb.Styles.globalMargins.tiny, marginTop: Kb.Styles.globalMargins.xxtiny}}
+            />
+          )}
+        </>
+      }
+      status={
+        dismissUploadError ? (
+          <Kb.Text type="BodySmallError">
+            Upload has failed.{' '}
+            <Kb.Text
+              type="BodySmallPrimaryLink"
+              style={{color: theme.redDark}}
+              onClick={e => {
+                e.stopPropagation()
+                dismissUploadError()
+              }}
+            >
+              Dismiss
+            </Kb.Text>
+          </Kb.Text>
+        ) : intentIfDownloading ? (
+          <Kb.Text type="BodySmall">{getDownloadingText(intentIfDownloading)}</Kb.Text>
+        ) : writingToJournal ? (
+          <Kb.Meta title="Encrypting" backgroundColor={theme.blue} />
+        ) : uploading ? (
+          <Kb.Text type="BodySmall">Uploading ...</Kb.Text>
+        ) : (
+          type !== T.FS.PathType.Folder && <LastModifiedLine path={path} mode="row" />
+        )
+      }
+    />
+  )
+}
+
+export default StillContainer

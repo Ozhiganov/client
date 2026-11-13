@@ -24,7 +24,7 @@ type SaltpackSignArg struct {
 }
 
 // NewSaltpackSign creates a SaltpackSign engine.
-func NewSaltpackSign(arg *SaltpackSignArg, g *libkb.GlobalContext) *SaltpackSign {
+func NewSaltpackSign(g *libkb.GlobalContext, arg *SaltpackSignArg) *SaltpackSign {
 	return &SaltpackSign{
 		arg:          arg,
 		Contextified: libkb.NewContextified(g),
@@ -56,28 +56,32 @@ func (e *SaltpackSign) SubConsumers() []libkb.UIConsumer {
 }
 
 // Run starts the engine.
-func (e *SaltpackSign) Run(ctx *Context) error {
-	if err := e.loadKey(ctx); err != nil {
+func (e *SaltpackSign) Run(m libkb.MetaContext) error {
+	if err := e.loadKey(m); err != nil {
+		return err
+	}
+
+	saltpackVersion, err := libkb.SaltpackVersionFromArg(e.arg.Opts.SaltpackVersion)
+	if err != nil {
 		return err
 	}
 
 	if e.arg.Opts.Detached {
-		return libkb.SaltpackSignDetached(e.G(), e.arg.Source, e.arg.Sink, e.key, e.arg.Opts.Binary)
+		return libkb.SaltpackSignDetached(e.G(), e.arg.Source, e.arg.Sink, e.key, e.arg.Opts.Binary, saltpackVersion)
 	}
 
-	return libkb.SaltpackSign(e.G(), e.arg.Source, e.arg.Sink, e.key, e.arg.Opts.Binary)
+	return libkb.SaltpackSign(e.G(), e.arg.Source, e.arg.Sink, e.key, e.arg.Opts.Binary, saltpackVersion)
 }
 
-func (e *SaltpackSign) loadKey(ctx *Context) error {
-	me, err := libkb.LoadMe(libkb.NewLoadUserArg(e.G()))
+func (e *SaltpackSign) loadKey(m libkb.MetaContext) error {
+	loggedIn, uid, err := isLoggedInWithUIDAndError(m)
 	if err != nil {
 		return err
 	}
-	ska := libkb.SecretKeyArg{
-		Me:      me,
-		KeyType: libkb.DeviceSigningKeyType,
+	if !loggedIn {
+		return libkb.NewLoginRequiredError("login required for signing")
 	}
-	key, err := e.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(ska, "signing a message/file"))
+	key, err := m.G().ActiveDevice.SigningKeyWithUID(uid)
 	if err != nil {
 		return err
 	}

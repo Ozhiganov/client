@@ -1,0 +1,205 @@
+import * as Chat from '@/constants/chat'
+import * as Kb from '@/common-adapters'
+import type * as React from 'react'
+import * as T from '@/constants/types'
+import {copyToClipboard} from '@/util/storeless-actions'
+import {openURL} from '@/util/misc'
+import {replyPrivately, useThreadMessageTarget} from '../../message-commands'
+import {useConversationMetadata, useConversationParticipants} from '../../data-hooks'
+import {useCurrentUserState} from '@/stores/current-user'
+import {
+  useConversationThreadID,
+  useConversationThreadMessage,
+  useThreadMeta,
+} from '../../thread-context'
+import type {MessagePopupItems} from './hooks'
+import {useHeader, useHeaderForMessage, useItems, useModeration, useStorelessItems} from './hooks'
+
+type OwnProps = {
+  attachTo?: React.RefObject<Kb.MeasureRef | null>
+  conversationIDKey?: T.Chat.ConversationIDKey
+  message?: T.Chat.Message
+  mode?: 'modal' | 'bottomsheet'
+  ordinal: T.Chat.Ordinal
+  onHidden: () => void
+  position: Kb.Styles.Position
+  style?: Kb.Styles.StylesCrossPlatform
+  visible: boolean
+}
+
+const emptyMessage = Chat.makeMessageText({})
+
+const messageText = (message: T.Chat.Message) => {
+  switch (message.type) {
+    case 'text':
+      return message.text.stringValue()
+    case 'setDescription':
+      return message.newDescription.stringValue() || undefined
+    case 'systemGitPush':
+      switch (message.pushType) {
+        case T.RPCGen.GitPushType.createrepo:
+          return `created a new team repository called ${message.repo}`
+        case T.RPCGen.GitPushType.default:
+          return message.refs
+            ?.map(ref => {
+              const commits =
+                ref.commits?.map(
+                  c =>
+                    `• ${c.commitHash.substring(0, 8)} - ${c.message.endsWith('\n') ? c.message.substring(0, c.message.length - 1) : c.message}`
+                ) ?? []
+
+              const branchName = Chat.systemGitBranchName(ref)
+              const parts = [
+                `pushed ${ref.commits?.length ?? 0} commit${(ref.commits?.length ?? 0) > 1 ? 's' : ''} to ${message.repo}/${branchName}`,
+                ...commits,
+              ]
+              return parts.join('\n')
+            })
+            .join('\n')
+        default:
+          return undefined
+      }
+    default:
+      return undefined
+  }
+}
+
+const PopTextLoaded = (ownProps: OwnProps & {
+  header: React.ReactNode
+  itemsData: MessagePopupItems
+  message: T.Chat.Message
+  meta: T.Chat.ConversationMeta
+  onReplyPrivately: () => void
+  participantInfo: T.Chat.ParticipantInfo
+}) => {
+  const {attachTo, header, itemsData: i, message, meta, mode, onHidden, position, style, visible} = ownProps
+  const {conversationIDKey, author} = message
+  const text = messageText(message)
+  const you = useCurrentUserState(s => s.username)
+  const yourMessage = author === you
+  const {teamType, teamname} = meta
+  const isTeam = !!teamname
+  const numPart = ownProps.participantInfo.all.length
+  const canReplyPrivately = teamType === 'small' || teamType === 'big' || numPart > 2
+  const onCopy = () => {
+    if (text) {
+      copyToClipboard(text)
+    }
+  }
+
+  const onReplyPrivately = !yourMessage && canReplyPrivately ? ownProps.onReplyPrivately : undefined
+  const mapUnfurl = Chat.getMapUnfurl(message)
+  const onViewMap =
+    mapUnfurl?.mapInfo && !mapUnfurl.mapInfo.isLiveLocationDone
+      ? async () => openURL(mapUnfurl.url)
+      : undefined
+
+  const {itemBlock, itemFilter, itemFlag, itemReport} = useModeration(author, conversationIDKey, isTeam, numPart)
+
+  const {itemReaction, itemBot, itemCopyLink, itemReply, itemEdit, itemForward, itemPin, itemUnfurl, itemUnread} = i
+  const {itemDelete, itemExplode, itemKick, itemProfile} = i
+
+  const itemMap = onViewMap
+    ? ([{icon: 'iconfont-location', onClick: onViewMap, title: 'View on Google Maps'}] as const)
+    : []
+  const itemCopyText = text
+    ? ([{icon: 'iconfont-clipboard', onClick: onCopy, title: 'Copy text'}] as const)
+    : []
+  const itemReplyPrivately = onReplyPrivately
+    ? ([{icon: 'iconfont-reply', onClick: onReplyPrivately, title: 'Reply privately'}] as const)
+    : []
+
+  const items = [
+    ...itemReaction,
+    ...itemEdit,
+    ...itemExplode,
+    ...itemCopyText,
+    ...itemUnfurl,
+    ...itemReply,
+    ...itemUnread,
+    'Divider' as const,
+    ...itemDelete,
+    ...itemForward,
+    ...itemCopyLink,
+    ...itemReplyPrivately,
+    ...itemPin,
+    ...itemBot,
+    ...itemMap,
+    ...itemProfile,
+    ...itemKick,
+    ...itemBlock,
+    ...itemFilter,
+    ...itemReport,
+    ...itemFlag,
+  ]
+  const snapPoints = [8 * 40 + 25]
+
+  return (
+    <Kb.FloatingMenu
+      attachTo={attachTo}
+      closeOnSelect={true}
+      header={header}
+      items={items}
+      mode={mode}
+      onHidden={onHidden}
+      position={position}
+      containerStyle={style}
+      visible={visible}
+      snapPoints={snapPoints}
+      safeProviderStyle={safeProviderStyle}
+    />
+  )
+}
+
+const PopTextThread = (ownProps: OwnProps) => {
+  const {ordinal, onHidden} = ownProps
+  const conversationIDKey = useConversationThreadID()
+  const message = useConversationThreadMessage(ordinal) ?? emptyMessage
+  const meta = useThreadMeta(m => m)
+  const participantInfo = useConversationParticipants(conversationIDKey)
+  const itemsData = useItems(ordinal, onHidden)
+  const header = useHeader(ordinal, onHidden)
+  const target = useThreadMessageTarget(ordinal)
+  return (
+    <PopTextLoaded
+      {...ownProps}
+      header={header}
+      itemsData={itemsData}
+      message={message}
+      meta={meta}
+      onReplyPrivately={() => replyPrivately(target)}
+      participantInfo={participantInfo}
+    />
+  )
+}
+
+const PopTextStoreless = (ownProps: OwnProps & {
+  conversationIDKey: T.Chat.ConversationIDKey
+  message: T.Chat.Message
+}) => {
+  const {conversationIDKey, message, onHidden} = ownProps
+  const {meta, participants: participantInfo} = useConversationMetadata(conversationIDKey)
+  const itemsData = useStorelessItems({conversationIDKey, message, meta, onHidden, participantInfo})
+  const header = useHeaderForMessage(message, onHidden)
+  return (
+    <PopTextLoaded
+      {...ownProps}
+      header={header}
+      itemsData={itemsData}
+      meta={meta}
+      onReplyPrivately={() => replyPrivately({conversationIDKey, message})}
+      participantInfo={participantInfo}
+    />
+  )
+}
+
+const PopText = (ownProps: OwnProps) => {
+  const {conversationIDKey, message} = ownProps
+  if (conversationIDKey && message) {
+    return <PopTextStoreless {...ownProps} conversationIDKey={conversationIDKey} message={message} />
+  }
+  return <PopTextThread {...ownProps} />
+}
+
+const safeProviderStyle = {flex: 1} as const
+export default PopText

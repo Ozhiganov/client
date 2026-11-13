@@ -1,0 +1,33 @@
+import * as Kb from '@/common-adapters'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {openURL} from '@/util/misc'
+
+type PunycodeLinkWarningProps = {
+  display: string
+  punycode: string
+  url: string
+}
+
+const PunycodeLinkWarning = (props: PunycodeLinkWarningProps) => {
+  const theme = Kb.Styles.useTheme()
+  const {url, display, punycode} = props
+  const nav = useSafeNavigation()
+  const onCancel = () => nav.safeNavigateUp()
+  const onConfirm = () => {
+    void openURL(url)
+    nav.safeNavigateUp()
+  }
+  const description = `The link you clicked on appears to be ${display}, but actually points to ${punycode}.`
+  return (
+    <Kb.ConfirmModal
+      icon="iconfont-open-browser"
+      iconColor={theme.red}
+      description={description}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      confirmText="Yes, open in browser"
+    />
+  )
+}
+
+export default PunycodeLinkWarning

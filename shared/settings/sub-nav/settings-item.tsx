@@ -1,0 +1,110 @@
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+
+type SettingsItemProps = {
+  badgeNumber?: number
+  icon?: Kb.IconType
+  iconComponent?: React.ComponentType
+  inProgress?: boolean
+  largerBadgeMinWidthFix?: boolean
+  onClick: (t: string) => void
+  text: string
+  type: string
+  subText?: string
+  testID?: string
+  textColor?: Kb.Styles.Color
+  selected: boolean
+}
+
+function SettingsItem(props: SettingsItemProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {onClick: _onClick, type, selected} = props
+  const onClick = () => {
+    _onClick(type)
+  }
+  return (
+    <Kb.ClickableBox
+      onClick={onClick}
+      testID={props.testID}
+      direction="horizontal"
+      alignItems="center"
+      relative={true}
+      fullWidth={true}
+      style={Kb.Styles.collapseStyles([styles.item, selected && styles.selected] as const)}
+    >
+      {props.iconComponent ? (
+        <props.iconComponent />
+      ) : props.icon ? (
+        <Kb.Icon
+          fontSize={24}
+          type={props.icon}
+          color={theme.black_50}
+          style={{
+            marginRight: isMobile ? Kb.Styles.globalMargins.small : Kb.Styles.globalMargins.tiny,
+          }}
+        />
+      ) : null}
+      <Kb.Box2 direction="vertical">
+        <Kb.Text
+          type="BodySemibold"
+          style={Kb.Styles.collapseStyles([
+            selected ? styles.selectedText : styles.itemText,
+            props.textColor ? {color: props.textColor} : {},
+          ])}
+        >
+          {props.text}
+        </Kb.Text>
+        {props.text && props.subText && <Kb.Text type="BodySmall">{props.subText}</Kb.Text>}
+      </Kb.Box2>
+      {props.inProgress && <Kb.ProgressIndicator style={styles.progress} />}
+      {!!props.badgeNumber && props.badgeNumber > 0 && (
+        <Kb.Badge badgeNumber={props.badgeNumber} badgeStyle={styles.badge} />
+      )}
+    </Kb.ClickableBox>
+  )
+}
+export default SettingsItem
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  badge: {
+    marginLeft: 6,
+  },
+  item: Kb.Styles.platformStyles({
+    common: {
+      ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+    },
+    isElectron: {
+      height: 32,
+    },
+    isMobile: {
+      borderBottomColor: theme.black_10,
+      borderBottomWidth: Kb.Styles.hairlineWidth,
+      height: 56,
+    },
+  }),
+  itemText: Kb.Styles.platformStyles({
+    isElectron: {
+      color: theme.black_50,
+    },
+    isMobile: {
+      color: theme.black,
+    },
+  }),
+  progress: {
+    marginLeft: 6,
+  },
+  selected: Kb.Styles.platformStyles({
+    common: {
+      borderLeftColor: theme.blue,
+      borderLeftWidth: 3,
+      borderStyle: 'solid',
+    },
+    isTablet: {
+      borderRadius: 0,
+    },
+  }),
+  selectedText: {
+    color: theme.black,
+  },
+}))

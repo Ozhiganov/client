@@ -1,0 +1,11 @@
+import {runMode} from './platform'
+// An ugly error message from the service that we'd like to rewrite ourselves.
+export const invalidPasswordErrorString = 'Bad password: Invalid password. Server rejected login attempt..'
+
+export const defaultKBFSPath = runMode === 'prod' ? '/keybase' : `/keybase.${runMode}`
+export const defaultPrivatePrefix = '/private/'
+const defaultTeamPrefix = '/team/'
+
+export const privateFolderWithUsers = (users: ReadonlyArray<string>) =>
+  `${defaultKBFSPath}${defaultPrivatePrefix}${[...new Set(users)].join(',')}`
+export const teamFolder = (team: string) => `${defaultKBFSPath}${defaultTeamPrefix}${team}`

@@ -1,0 +1,464 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {copyToClipboard} from '@/util/storeless-actions'
+import {
+  deleteMessage,
+  pinMessage,
+  toggleReaction,
+  unfurlMessage,
+  useThreadMessageTarget,
+} from '../../message-commands'
+import {formatTimeForPopup, formatTimeForRevoked} from '@/util/timestamp'
+import {linkFromConvAndMessage} from '@/constants/deeplinks'
+import {useConversationParticipants} from '../../data-hooks'
+import {markConversationUnread} from '../../mark-unread'
+import {showForwardMessagePicker} from '../../fwd-msg'
+import {navToProfile, setThreadInputEditing, setThreadInputReplyTo} from '@/constants/router'
+import {
+  useConversationInputDispatchOptional,
+  type ConversationInputState,
+} from '../../input-area/input-state'
+import {useChatTeam, useChatTeamMembers} from '../../team-hooks'
+import {useCurrentUserState} from '@/stores/current-user'
+import {
+  useConversationThreadID,
+  useConversationThreadMessage,
+  useConversationThreadSetMarkAsUnread,
+  useThreadMeta,
+} from '../../thread-context'
+import ExplodingPopupHeader from './exploding-header'
+import MessagePopupHeader from './header'
+import ReactionItem from './reactionitem'
+
+const emptyText = Chat.makeMessageText({})
+
+const getConversationLabel = (
+  participantInfo: T.Chat.ParticipantInfo,
+  conv: T.Chat.ConversationMeta,
+  alwaysIncludeChannelName: boolean
+): string => {
+  if (conv.teamType === 'big') {
+    return conv.teamname + '#' + conv.channelname
+  }
+  if (conv.teamType === 'small') {
+    return alwaysIncludeChannelName ? conv.teamname + '#' + conv.channelname : conv.teamname
+  }
+  return Chat.getRowParticipants(participantInfo, '').join(',')
+}
+
+type ItemActions = {
+  deleteMessage: () => void
+  markAsUnread: (id: T.Chat.MessageID) => void
+  pinMessage: () => void
+  toggleReaction: (emoji: string) => void
+  unfurlMessage: () => void
+}
+
+const useItemsForMessage = (p: {
+  actions: ItemActions
+  conversationIDKey: T.Chat.ConversationIDKey
+  // Set only when this popup is rendered inside the thread's input provider, i.e. it is this
+  // conversation's composer we are driving. Absent for the phone modal route, the info panel and
+  // the attachment viewer, which name the conversation explicitly and reach its composer through
+  // the input-intent store instead.
+  inputDispatch?: ConversationInputState['dispatch']
+  message: T.Chat.Message
+  meta: T.Chat.ConversationMeta
+  onHidden: () => void
+  participantInfo: T.Chat.ParticipantInfo
+}) => {
+  const {actions, conversationIDKey, inputDispatch, message, meta, onHidden, participantInfo} = p
+  const ordinal = message.ordinal
+  const isAttach = message.type === 'attachment'
+  const {author, id, deviceName, timestamp, deviceRevokedAt} = message
+  const hasMessageID = !!T.Chat.messageIDToNumber(id)
+  const {teamID, teamname} = meta
+  const onReact = (emoji: string) => {
+    actions.toggleReaction(emoji)
+  }
+  const _onAddReaction = () => {
+    if (!hasMessageID) {
+      return
+    }
+    C.Router2.navigateAppend({
+      name: 'chatChooseEmoji',
+      params: {
+        conversationIDKey,
+        onPickAddToMessageID: id,
+        pickKey: 'reaction',
+      },
+    })
+  }
+  const onAddReaction = isMobile ? _onAddReaction : undefined
+
+  const {members: teamMembers} = useChatTeamMembers(teamID)
+  const {yourOperations} = useChatTeam(teamID, teamname)
+  const authorRoleInTeam = teamMembers.get(author)?.type
+  const authorIsBot =
+    teamname && teamMembers.size
+      ? authorRoleInTeam === 'restrictedbot' || authorRoleInTeam === 'bot'
+      : meta.teamType === 'adhoc' && participantInfo.name.length > 0
+        ? !participantInfo.name.includes(author)
+        : false
+  const _onInstallBot = () => {
+    C.Router2.navigateAppend({name: 'chatInstallBotPick', params: {botUsername: author}})
+  }
+  const onInstallBot = authorIsBot ? _onInstallBot : undefined
+
+  const itemReaction = onAddReaction && hasMessageID
+    ? ([
+        {
+          title: '',
+          unWrapped: true,
+          view: <ReactionItem onHidden={onHidden} onReact={onReact} showPicker={onAddReaction} />,
+        },
+        'Divider',
+      ] as const)
+    : []
+
+  const itemBot = onInstallBot
+    ? ([
+        {
+          icon: 'iconfont-nav-2-robot',
+          onClick: onInstallBot,
+          title: 'Install bot in another team or chat',
+        },
+      ] as const)
+    : []
+
+  const convLabel = getConversationLabel(participantInfo, meta, true)
+  const onCopyLink = () => {
+    copyToClipboard(linkFromConvAndMessage(convLabel, id))
+  }
+  const itemCopyLink = hasMessageID
+    ? ([{icon: 'iconfont-link', onClick: onCopyLink, title: 'Copy a link to this message'}] as const)
+    : []
+
+  const clearModals = C.Router2.clearModals
+  // Edit and Reply put something in the composer, so the composer has to be visible afterwards.
+  // From the attachment viewer this popup sits under a modal route, and nothing else dismisses it -
+  // the intent lands but the user is left staring at the modal that hid it. Delete already does this.
+  //
+  // Both arms of this fork and the one in _onEdit below land in the same reducer in the same
+  // tick - a mounted provider consumes a store write synchronously - so neither is a shortcut.
+  // The fork is about scope: with a provider above us the dispatch is by construction the one for
+  // the thread we are rendered inside, which is a second line of defence against a storeless popup
+  // driving the wrong conversation's composer.
+  // the modal goes first: the reply's focus waits for it
+  const onReply = () => {
+    clearModals()
+    if (inputDispatch) {
+      inputDispatch.reply(ordinal)
+    } else {
+      setThreadInputReplyTo(conversationIDKey, ordinal)
+    }
+  }
+  // where the user can't post, an edit or a reply could never be sent
+  const {cannotWrite} = meta
+  const itemReply = message.exploded || cannotWrite
+    ? []
+    : hasMessageID
+      ? ([{icon: 'iconfont-reply', onClick: onReply, title: 'Reply'}] as const)
+      : []
+
+  const _onEdit = () => {
+    if (inputDispatch) {
+      inputDispatch.setEditing(ordinal)
+    } else {
+      setThreadInputEditing(conversationIDKey, ordinal)
+    }
+    clearModals()
+  }
+
+  const you = useCurrentUserState(s => s.username)
+  const yourMessage = author === you
+  const onEdit = yourMessage ? _onEdit : undefined
+  const isEditable = hasMessageID && message.isEditable && yourMessage && !message.exploded && !cannotWrite
+  const itemEdit =
+    onEdit && isEditable
+      ? ([
+          {
+            icon: 'iconfont-edit',
+            onClick: onEdit,
+            title: 'Edit',
+          },
+        ] as const)
+      : []
+
+  const _onForward = () => {
+    showForwardMessagePicker(conversationIDKey, message)
+  }
+  const onForward = hasMessageID && (isAttach || (message.unfurls?.size ?? 0) > 0) ? _onForward : undefined
+  const itemForward = onForward
+    ? ([{icon: 'iconfont-forward', onClick: onForward, title: 'Forward'}] as const)
+    : []
+
+  const isTeam = !!teamname
+  const canPinMessage = (!isTeam || yourOperations.pinMessage) && !message.exploded
+  const onPinMessage = canPinMessage && hasMessageID ? actions.pinMessage : undefined
+  const itemPin = onPinMessage
+    ? ([{icon: 'iconfont-pin', onClick: onPinMessage, title: 'Pin message'}] as const)
+    : []
+
+  // an unfurl is a message the sender's device posts, so only your own messages can unfurl
+  const canUnfurl = hasMessageID && yourMessage && !message.exploded && !cannotWrite
+  const itemUnfurl =
+    canUnfurl && Chat.hasUnfurlableLink(message)
+      ? ([{icon: 'iconfont-identity-website', onClick: actions.unfurlMessage, title: 'Unfurl link'}] as const)
+      : []
+
+  const onMarkAsUnread = () => {
+    if (id) {
+      actions.markAsUnread(id)
+    }
+  }
+  const itemUnread = hasMessageID
+    ? ([{icon: 'iconfont-envelope-solid', onClick: onMarkAsUnread, title: 'Mark as unread'}] as const)
+    : []
+
+  const _onDelete = () => {
+    actions.deleteMessage()
+    clearModals()
+  }
+
+  const canDeleteHistory = meta.teamType === 'adhoc' || yourOperations.deleteChatHistory
+  const canExplodeNow =
+    message.exploding && (yourMessage || canDeleteHistory) && message.isDeleteable && !message.exploded
+  const _onExplodeNow = () => {
+    actions.deleteMessage()
+  }
+  const onExplodeNow = canExplodeNow ? _onExplodeNow : undefined
+  const canAdminDelete = yourOperations.deleteOtherMessages
+  const canModerate = yourMessage || canAdminDelete
+  // mirror the explode-now path: the server decides what is deletable at all
+  const isDeleteable = canModerate && message.isDeleteable
+  const onDelete = isDeleteable && !onExplodeNow ? _onDelete : undefined
+  const itemDelete =
+    onDelete && !onExplodeNow && !message.exploded
+      ? ([
+          {
+            danger: true,
+            disabled: !onDelete,
+            icon: 'iconfont-trash',
+            onClick: onDelete,
+            rightTitle: 'for everyone',
+            title: 'Delete',
+          },
+        ] as const)
+      : []
+  const itemExplode = onExplodeNow
+    ? ([
+        {
+          danger: true,
+          icon: 'iconfont-bomb',
+          onClick: onExplodeNow,
+          title: 'Explode now',
+        },
+      ] as const)
+    : []
+
+  const _onKick = () => {
+    C.Router2.navigateAppend({name: 'teamReallyRemoveMember', params: {members: [author], teamID}})
+  }
+  const authorInTeam = teamMembers.size ? teamMembers.has(author) : true
+  // kicking is about the author, not the message, so it does not depend on isDeleteable
+  const onKick = canModerate && !!teamID && !yourMessage && authorInTeam ? _onKick : undefined
+  const itemKick = onKick
+    ? ([
+        {
+          danger: true,
+          disabled: !onKick,
+          icon: 'iconfont-user-block',
+          onClick: onKick,
+          rightTitle: 'from the team',
+          title: 'Kick user',
+        },
+      ] as const)
+    : []
+
+  const onShowProfile = () => {
+    navToProfile(author)
+  }
+  const onViewProfile = author && !yourMessage ? onShowProfile : undefined
+  const profileSubtitle = `${deviceName} ${deviceRevokedAt ? 'REVOKED at' : '-'} ${
+    deviceRevokedAt ? `${formatTimeForRevoked(deviceRevokedAt)}` : formatTimeForPopup(timestamp)
+  }`
+  const itemProfile = onViewProfile
+    ? ([
+        {
+          icon: 'iconfont-person',
+          onClick: onViewProfile,
+          subTitle: isMobile ? profileSubtitle : undefined,
+          title: `View ${author}'s profile`,
+        },
+      ] as const)
+    : []
+  return {
+    itemBot,
+    itemCopyLink,
+    itemDelete,
+    itemEdit,
+    itemExplode,
+    itemForward,
+    itemKick,
+    itemPin,
+    itemProfile,
+    itemReaction,
+    itemReply,
+    itemUnfurl,
+    itemUnread,
+  }
+}
+
+export type MessagePopupItems = ReturnType<typeof useItemsForMessage>
+
+export const useModeration = (
+  author: string,
+  conversationIDKey: T.Chat.ConversationIDKey,
+  isTeam: boolean,
+  numPart: number
+) => {
+  const you = useCurrentUserState(s => s.username)
+  const yourMessage = author === you
+  const canModerate = !!author && !yourMessage
+  const blockModalSingle = !isTeam && numPart === 2
+  const blockTitle = isTeam ? 'Report user' : 'Block user'
+
+  const openBlockingModal = React.useCallback(
+    (extraProps?: {filterUserByDefault?: boolean; flagUserByDefault?: boolean; reportsUserByDefault?: boolean}) => {
+      C.Router2.navigateAppend({
+        name: 'chatBlockingModal',
+        params: {
+          blockUserByDefault: true,
+          context: blockModalSingle ? 'message-popup-single' : 'message-popup',
+          conversationIDKey,
+          username: author,
+          ...extraProps,
+        },
+      })
+    },
+    [blockModalSingle, conversationIDKey, author]
+  )
+
+  const onUserBlock = canModerate ? () => openBlockingModal() : undefined
+  const onUserFilter = isIOS && canModerate ? () => openBlockingModal({filterUserByDefault: true}) : undefined
+  const onUserReport = isIOS && canModerate ? () => openBlockingModal({reportsUserByDefault: true}) : undefined
+  const onUserFlag =
+    isIOS && canModerate
+      ? () => openBlockingModal({flagUserByDefault: true, reportsUserByDefault: true})
+      : undefined
+
+  const itemBlock = onUserBlock
+    ? ([{danger: true, icon: 'iconfont-user-block' as const, onClick: onUserBlock, title: blockTitle}] as const)
+    : []
+  const itemFilter = onUserFilter
+    ? ([{danger: true, icon: 'iconfont-user-block' as const, onClick: onUserFilter, title: 'Filter user'}] as const)
+    : []
+  const itemReport =
+    !isTeam && onUserReport
+      ? ([{danger: true, icon: 'iconfont-user-block' as const, onClick: onUserReport, title: 'Report user'}] as const)
+      : []
+  const itemFlag = onUserFlag
+    ? ([{danger: true, icon: 'iconfont-user-block' as const, onClick: onUserFlag, title: 'Flag content'}] as const)
+    : []
+
+  return {itemBlock, itemFilter, itemFlag, itemReport}
+}
+
+const useThreadItems = (ordinal: T.Chat.Ordinal, onHidden: () => void) => {
+  const conversationIDKey = useConversationThreadID()
+  const message = useConversationThreadMessage(ordinal) ?? emptyText
+  const meta = useThreadMeta(m => m)
+  const participantInfo = useConversationParticipants(conversationIDKey)
+  const target = useThreadMessageTarget(ordinal)
+  const setMarkAsUnread = useConversationThreadSetMarkAsUnread()
+  // Rendered inline in the thread, so the composer is right here in context.
+  const inputDispatch = useConversationInputDispatchOptional()
+  return useItemsForMessage({
+    actions: {
+      deleteMessage: () => deleteMessage(target),
+      markAsUnread: setMarkAsUnread,
+      pinMessage: () => pinMessage(target),
+      toggleReaction: emoji => toggleReaction(target, emoji),
+      unfurlMessage: () => unfurlMessage(target),
+    },
+    conversationIDKey,
+    inputDispatch,
+    message,
+    meta,
+    onHidden,
+    participantInfo,
+  })
+}
+
+export const useStorelessItems = (p: {
+  conversationIDKey: T.Chat.ConversationIDKey
+  message: T.Chat.Message
+  meta: T.Chat.ConversationMeta
+  onHidden: () => void
+  participantInfo: T.Chat.ParticipantInfo
+}) =>
+  useItemsForMessage({
+    actions: {
+      deleteMessage: () =>
+        deleteMessage({conversationIDKey: p.conversationIDKey, message: p.message, tlfName: p.meta.tlfname}),
+      markAsUnread: id => markConversationUnread(p.conversationIDKey, id),
+      pinMessage: () => pinMessage({conversationIDKey: p.conversationIDKey, messageID: p.message.id}),
+      toggleReaction: emoji =>
+        toggleReaction({conversationIDKey: p.conversationIDKey, message: p.message, tlfName: p.meta.tlfname}, emoji),
+      unfurlMessage: () => unfurlMessage({conversationIDKey: p.conversationIDKey, messageID: p.message.id}),
+    },
+    conversationIDKey: p.conversationIDKey,
+    message: p.message,
+    meta: p.meta,
+    onHidden: p.onHidden,
+    participantInfo: p.participantInfo,
+  })
+
+export const useItems = useThreadItems
+
+export const useHeaderForMessage = (message: T.Chat.Message, onHidden: () => void) => {
+  const you = useCurrentUserState(s => s.username)
+  const {author, deviceType, deviceName, botUsername, timestamp, exploding, explodingTime} = message
+  const yourMessage = author === you
+  const deviceRevokedAt = message.deviceRevokedAt || undefined
+  const mapUnfurl = Chat.getMapUnfurl(message)
+  const isLocation = !!mapUnfurl
+  const fileSize = message.type === 'attachment' ? message.fileSize : undefined
+
+  return exploding ? (
+    <ExplodingPopupHeader
+      onHidden={onHidden}
+      author={author}
+      hideTimer={message.submitState === 'pending' || message.submitState === 'failed'}
+      botUsername={botUsername}
+      deviceName={deviceName ?? ''}
+      deviceRevokedAt={deviceRevokedAt}
+      fileSize={fileSize}
+      explodesAt={message.exploded ? 0 : (explodingTime ?? 0)}
+      timestamp={timestamp}
+      yourMessage={yourMessage}
+    />
+  ) : (
+    <MessagePopupHeader
+      onHidden={onHidden}
+      author={author}
+      botUsername={botUsername}
+      deviceName={deviceName ?? ''}
+      deviceRevokedAt={deviceRevokedAt}
+      deviceType={deviceType ?? 'desktop'}
+      fileSize={fileSize}
+      isLast={false}
+      isLocation={isLocation}
+      timestamp={timestamp}
+      yourMessage={yourMessage}
+    />
+  )
+}
+
+export const useHeader = (ordinal: T.Chat.Ordinal, onHidden: () => void) => {
+  const message = useConversationThreadMessage(ordinal) ?? emptyText
+  return useHeaderForMessage(message, onHidden)
+}

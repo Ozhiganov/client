@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build darwin
+//go:build darwin
 
 package client
 
@@ -15,6 +15,7 @@ func getPlatformSpecificCommands(cl *libcmdline.CommandLine, g *libkb.GlobalCont
 	return []cli.Command{
 		NewCmdFuse(cl, g),
 		NewCmdInstall(cl, g),
+		newCmdInstallAuto(cl, g),
 		NewCmdLaunchd(cl, g),
 		NewCmdUninstall(cl, g),
 	}

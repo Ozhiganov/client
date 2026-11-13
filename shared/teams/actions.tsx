@@ -1,0 +1,241 @@
+import * as S from '@/constants/strings'
+import * as T from '@/constants/types'
+import {ignorePromise} from '@/constants/utils'
+import {clearModals, isModalUp, navigateAppend, navigateUp, navUpToScreen} from '@/constants/router'
+import logger from '@/logger'
+import {RPCError, logError} from '@/util/errors'
+import {fixCrop} from '@/util/crop'
+
+const newRequestsGregorPrefix = 'team.request_access:'
+const newRequestsGregorKey = (teamID: T.Teams.TeamID) => `${newRequestsGregorPrefix}${teamID}`
+
+// navigate to the contactRestricted screen for members skipped by an add-members RPC
+export const handleNotAdded = (notAdded?: ReadonlyArray<{username: string}>) => {
+  const usernames = notAdded?.map(elem => elem.username) ?? []
+  if (usernames.length) {
+    navigateAppend({
+      name: 'contactRestricted',
+      params: {source: 'teamAddSomeFailed', usernames},
+    })
+  }
+}
+
+// returns true (after navigating) when an add-members RPC failed because of the
+// targets' contact settings; other errors are the caller's to handle
+export const handleContactSettingsBlock = (error: RPCError) => {
+  if (error.code !== T.RPCGen.StatusCode.scteamcontactsettingsblock) {
+    return false
+  }
+  const users = (error.fields as Array<{key?: string; value?: string} | undefined> | undefined)
+    ?.filter(elem => elem?.key === 'usernames')
+    .map(elem => elem?.value)
+  // '' splits into [''], which would put a blank row on the contactRestricted screen
+  const usernames = users?.[0]?.split(',').filter(Boolean) ?? []
+  navigateAppend({
+    name: 'contactRestricted',
+    params: {source: 'teamAddAllFailed', usernames},
+  })
+  return true
+}
+
+export const addToTeam = (
+  teamID: T.Teams.TeamID,
+  users: Array<{assertion: string; role: T.Teams.TeamRoleType}>,
+  sendChatNotification: boolean
+) => {
+  const f = async () => {
+    try {
+      const res = await T.RPCGen.teamsTeamAddMembersMultiRoleRpcPromise(
+        {
+          sendChatNotification,
+          teamID,
+          users: users.map(({assertion, role}) => ({
+            assertion,
+            role: T.RPCGen.TeamRole[role],
+          })),
+        },
+        [
+          S.waitingKeyTeamsTeam(teamID),
+          S.waitingKeyTeamsAddMember(teamID, ...users.map(({assertion}) => assertion)),
+        ]
+      )
+      handleNotAdded(res.notAdded ?? undefined)
+    } catch (error) {
+      if (!(error instanceof RPCError)) {
+        return
+      }
+      if (handleContactSettingsBlock(error)) {
+        return
+      }
+      logger.error(`addToTeam failed for ${teamID}: ${error.desc}`)
+    }
+  }
+  ignorePromise(f())
+}
+
+export const clearNavBadges = () => {
+  const f = async () => {
+    try {
+      await T.RPCGen.gregorDismissCategoryRpcPromise({category: 'team.newly_added_to_team'})
+      await T.RPCGen.gregorDismissCategoryRpcPromise({category: 'team.delete'})
+    } catch (err) {
+      logError(err)
+    }
+  }
+  ignorePromise(f())
+}
+
+export type TeamExitContext = 'teams' | 'chat'
+
+// Out of a team that was just left or deleted: closes its modals and goes back to the root of the tab
+// the leave or delete was started from.
+export const exitTeamTo = (context: TeamExitContext) => {
+  clearModals()
+  navUpToScreen(context === 'chat' ? 'chatRoot' : 'teamsRoot')
+}
+
+export const deleteTeam = (teamID: T.Teams.TeamID, context: TeamExitContext) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsTeamDeleteRpcListener({
+        customResponseIncomingCallMap: {
+          'keybase.1.teamsUi.confirmRootTeamDelete': (_, response) => response.result(true),
+          'keybase.1.teamsUi.confirmSubteamDelete': (_, response) => response.result(true),
+        },
+        incomingCallMap: {},
+        params: {teamID},
+        waitingKey: S.waitingKeyTeamsDeleteTeam(teamID),
+      })
+      // the user may have gone elsewhere while the delete ran; only the confirm takes them away
+      if (!isModalUp('teamDeleteTeam', {teamID})) return
+      exitTeamTo(context)
+    } catch (error) {
+      if (error instanceof RPCError) {
+        logger.warn('error:', error.message)
+      }
+    }
+  }
+  ignorePromise(f())
+}
+
+export const ignoreRequest = (teamID: T.Teams.TeamID, teamname: string, username: string) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsTeamIgnoreRequestRpcPromise({name: teamname, username}, S.waitingKeyTeamsTeam(teamID))
+    } catch {}
+  }
+  ignorePromise(f())
+}
+
+// Settles (never rejects) once the leave has finished or failed.
+export const leaveTeam = async (teamname: string, permanent: boolean, context: TeamExitContext) => {
+  logger.info(`leaveTeam: Leaving ${teamname} from context ${context}`)
+  try {
+    await T.RPCGen.teamsTeamLeaveRpcPromise({name: teamname, permanent}, S.waitingKeyTeamsLeaveTeam(teamname))
+    logger.info(`leaveTeam: left ${teamname} successfully`)
+    exitTeamTo(context)
+  } catch (error) {
+    if (error instanceof RPCError) {
+      logger.warn('error:', error.message)
+    }
+  }
+}
+
+export const removeMember = (teamID: T.Teams.TeamID, username: string) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsTeamRemoveMemberRpcPromise(
+        {
+          member: {
+            assertion: {assertion: username, removeFromSubtree: false},
+            type: T.RPCGen.TeamMemberToRemoveType.assertion,
+          },
+          teamID,
+        },
+        [S.waitingKeyTeamsTeam(teamID), S.waitingKeyTeamsRemoveMember(teamID, username)]
+      )
+    } catch (err) {
+      logger.error('Failed to remove member', err)
+    }
+  }
+  ignorePromise(f())
+}
+
+export const removePendingInvite = (teamID: T.Teams.TeamID, inviteID: string) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsTeamRemoveMemberRpcPromise(
+        {
+          member: {inviteid: {inviteID}, type: T.RPCGen.TeamMemberToRemoveType.inviteid},
+          teamID,
+        },
+        [S.waitingKeyTeamsTeam(teamID), S.waitingKeyTeamsRemoveMember(teamID, inviteID)]
+      )
+    } catch (err) {
+      logger.error('Failed to remove pending invite', err)
+    }
+  }
+  ignorePromise(f())
+}
+
+export const renameTeam = (oldName: string, newNameString: string) => {
+  const f = async () => {
+    const prevName = {parts: oldName.split('.')}
+    const newName = {parts: newNameString.split('.')}
+    try {
+      await T.RPCGen.teamsTeamRenameRpcPromise({newName, prevName}, S.waitingKeyTeamsRename)
+    } catch {}
+  }
+  ignorePromise(f())
+}
+
+export const setMemberPublicity = (teamID: T.Teams.TeamID, showcase: boolean) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsSetTeamMemberShowcaseRpcPromise({isShowcased: showcase, teamID}, [
+        S.waitingKeyTeamsTeam(teamID),
+        S.waitingKeyTeamsSetMemberPublicity(teamID),
+      ])
+    } catch (error) {
+      if (error instanceof RPCError) {
+        logger.info(error.message)
+      }
+    }
+  }
+  ignorePromise(f())
+}
+
+export const teamSeen = (teamID: T.Teams.TeamID) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.gregorDismissCategoryRpcPromise({category: newRequestsGregorKey(teamID)})
+    } catch (error) {
+      if (error instanceof RPCError) {
+        logger.error(error.message)
+      }
+    }
+  }
+  ignorePromise(f())
+}
+
+export const uploadTeamAvatar = (
+  teamname: string,
+  filename: string,
+  sendChatNotification: boolean,
+  crop?: T.RPCGen.ImageCropRect
+) => {
+  const f = async () => {
+    try {
+      await T.RPCGen.teamsUploadTeamAvatarRpcPromise(
+        {crop: fixCrop(crop), filename, sendChatNotification, teamname},
+        S.waitingKeyProfileUploadAvatar
+      )
+      navigateUp()
+    } catch (error) {
+      if (error instanceof RPCError) {
+        logger.warn(`Error uploading team avatar: ${error.message}`)
+      }
+    }
+  }
+  ignorePromise(f())
+}

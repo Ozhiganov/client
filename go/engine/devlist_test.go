@@ -3,7 +3,11 @@
 
 package engine
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestDeviceList(t *testing.T) {
 	tc := SetupEngineTest(t, "devicelist")
@@ -11,27 +15,21 @@ func TestDeviceList(t *testing.T) {
 
 	CreateAndSignupFakeUserPaper(tc, "login")
 
-	ctx := &Context{LogUI: tc.G.UI.GetLogUI()}
 	eng := NewDevList(tc.G)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	m := NewMetaContextForTestWithLogUI(tc)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 	if len(eng.List()) != 2 {
 		for i, d := range eng.List() {
 			t.Logf("%d: %+v", i, d)
 		}
-		t.Errorf("devices: %d, expected 2", len(eng.List()))
+		require.Failf(t, "", "devices: %d, expected 2", len(eng.List()))
 	}
 	// Check that the device times are all actually set.
 	for _, d := range eng.List() {
-		if d.CTime == 0 {
-			t.Fatal("CTime not set")
-		}
-		if d.MTime == 0 {
-			t.Fatal("MTime not set")
-		}
-		if d.LastUsedTime == 0 {
-			t.Fatal("LastUsedTime not set")
-		}
+		require.NotZero(t, d.CTime, "CTime not set")
+		require.NotZero(t, d.MTime, "MTime not set")
+		require.NotZero(t, d.LastUsedTime, "LastUsedTime not set")
 	}
 }

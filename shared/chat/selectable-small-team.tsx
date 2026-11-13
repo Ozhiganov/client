@@ -1,0 +1,150 @@
+import * as Kb from '@/common-adapters'
+import {FilteredTopLine} from './top-line'
+import {BottomLine} from './inbox/row/small-team'
+import {Avatars, TeamAvatar} from './avatars'
+import {useInboxRowSmall} from '@/chat/inbox/rows-state'
+import * as T from '@/constants/types'
+
+type Props = {
+  conversationIDKey: T.Chat.ConversationIDKey
+  filter?: string
+  name: string
+  numSearchHits?: number
+  maxSearchHits?: number
+  participants?: Array<string>
+  isSelected: boolean
+  onSelectConversation: () => void
+}
+
+const getRowStyles = (isSelected: boolean, hasUnread: boolean, theme: Kb.Styles.Theme) => {
+  const backgroundColor = isSelected
+    ? theme.blue
+    : Kb.Styles.isPhone
+      ? undefined
+      : theme.blueGrey
+  const showBold = !isSelected && hasUnread
+  const usernameColor = isSelected ? theme.white : theme.black
+
+  return {
+    backgroundColor,
+    showBold,
+    usernameColor,
+  }
+}
+
+const SelectableSmallTeam = (props: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {conversationIDKey, isSelected, maxSearchHits, numSearchHits, onSelectConversation, name} = props
+  const row = useInboxRowSmall(conversationIDKey)
+  const isMuted = row.isMuted
+  const showBadge = row.hasBadge
+  const rowStyles = getRowStyles(isSelected, row.hasUnread, theme)
+  const {backgroundColor, showBold, usernameColor} = rowStyles
+  const isLocked = row.isLocked || row.participantNeedToRekey || row.youNeedToRekey
+  const teamname = row.teamDisplayName
+  const snippet = row.typingSnippet || row.snippet
+  const snippetDecoration = row.typingSnippet ? T.RPCChat.SnippetDecoration.none : row.snippetDecoration
+
+  // order participants by hit, if it's set
+  const filter = props.filter ?? ''
+  let participants =
+    props.participants ?? (row.participants.length > 0 ? [...row.participants] : name.split(','))
+  if (filter) {
+    // clone so we never mutate the caller's props.participants array in place
+    participants = [...participants].sort((a, b) => {
+      const ai = a.indexOf(filter)
+      const bi = b.indexOf(filter)
+      const av = ai === -1 ? Infinity : ai
+      const bv = bi === -1 ? Infinity : bi
+      return av - bv
+    })
+  }
+
+  if (!teamname && participants.length === 0) {
+    return (
+      <Kb.ClickableBox alignSelf="center" direction="vertical" style={styles.container} centerChildren={true} onClick={onSelectConversation}>
+        <Kb.ProgressIndicator style={styles.spinner} type="Small" />
+      </Kb.ClickableBox>
+    )
+  }
+  return (
+    <Kb.ClickableBox
+      direction="horizontal"
+      alignItems="center"
+      fullWidth={true}
+      fullHeight={true}
+      className={Kb.Styles.classNames('hover_background_color_blueGreyDark', 'overlay-icon-row', {
+        background_color_blue: isSelected,
+      })}
+      onClick={onSelectConversation}
+      style={Kb.Styles.collapseStyles([
+        styles.container,
+        styles.rowContainer,
+        {
+          backgroundColor: isSelected ? theme.blue : theme.white,
+        },
+      ])}
+    >
+        {teamname ? (
+          <TeamAvatar teamname={teamname} isMuted={isMuted} isSelected={isSelected} />
+        ) : (
+          <Avatars
+            backgroundColor={backgroundColor}
+            isMuted={isMuted}
+            isSelected={isSelected}
+            isLocked={isLocked}
+            participantOne={participants[0]}
+            participantTwo={participants[1]}
+          />
+        )}
+        <Kb.Box2 alignSelf="center" direction="vertical" flex={1}>
+          <FilteredTopLine
+            isSelected={isSelected}
+            numSearchHits={numSearchHits}
+            maxSearchHits={maxSearchHits}
+            participants={teamname ? [teamname] : participants}
+            showBold={showBold}
+            usernameColor={usernameColor}
+          />
+          {!numSearchHits && (
+            <BottomLine
+              conversationIDKey={conversationIDKey}
+              snippet={snippet}
+              snippetDecoration={snippetDecoration}
+              isSelected={isSelected}
+              allowBold={false}
+            />
+          )}
+        </Kb.Box2>
+        {showBadge && <Kb.Box2 alignSelf="center" direction="horizontal" noShrink={true} style={styles.badge} />}
+    </Kb.ClickableBox>
+  )
+}
+
+const rowHeight = isMobile ? 64 : 56
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  badge: {
+    backgroundColor: theme.orange,
+    borderRadius: 6,
+    ...Kb.Styles.size(Kb.Styles.globalMargins.tiny),
+  },
+  container: {
+    flexShrink: 0,
+    height: rowHeight,
+  },
+  rowContainer: Kb.Styles.platformStyles({
+    isElectron: {
+      ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xsmall),
+    },
+    isMobile: {
+      ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+    },
+  }),
+  spinner: {
+    alignSelf: 'center',
+  },
+}))
+
+export default SelectableSmallTeam

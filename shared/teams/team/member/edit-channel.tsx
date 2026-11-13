@@ -1,0 +1,136 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {invalidateTeamChannels} from '@/teams/common/team-channels-invalidation'
+import {useLoadedTeam} from '../use-loaded-team'
+
+type Props = {
+  channelname: string
+  description: string
+  teamID: T.Teams.TeamID
+  conversationIDKey: T.Chat.ConversationIDKey
+}
+
+const EditChannel = (props: Props) => {
+  const styles = useStyles()
+  const teamID = props.teamID
+  const conversationIDKey = props.conversationIDKey
+  const oldName = props.channelname
+  const oldDescription = props.description
+
+  const nav = useSafeNavigation()
+  const {
+    teamMeta: {teamname},
+  } = useLoadedTeam(teamID)
+
+  const [name, _setName] = React.useState(oldName)
+  const setName = (newName: string) => _setName(newName.replace(/[^a-zA-Z0-9_-]/, ''))
+
+  const [description, setDescription] = React.useState(oldDescription)
+  const updateChannelNameRPC = C.useRPC(T.RPCChat.localPostMetadataRpcPromise)
+  const updateTopicRPC = C.useRPC(T.RPCChat.localPostHeadlineRpcPromise)
+  const waitingKey = C.waitingKeyTeamsUpdateChannelName(teamID)
+
+  const updateChannelName = async (newChannelName: string) =>
+    await new Promise<void>((resolve, reject) => {
+      updateChannelNameRPC(
+        [
+          {
+            channelName: newChannelName,
+            conversationID: T.Chat.keyToConversationID(conversationIDKey),
+            identifyBehavior: T.RPCGen.TLFIdentifyBehavior.chatGui,
+            tlfName: teamname,
+            tlfPublic: false,
+          },
+          waitingKey,
+        ],
+        () => resolve(),
+        reject
+      )
+    })
+  const updateTopic = async (newTopic: string) =>
+    await new Promise<void>((resolve, reject) => {
+      updateTopicRPC(
+        [
+          {
+            conversationID: T.Chat.keyToConversationID(conversationIDKey),
+            headline: newTopic,
+            identifyBehavior: T.RPCGen.TLFIdentifyBehavior.chatGui,
+            tlfName: teamname,
+            tlfPublic: false,
+          },
+          waitingKey,
+        ],
+        () => resolve(),
+        reject
+      )
+    })
+
+  const onSave = () => {
+    const ps = [
+      ...(oldName !== name ? [updateChannelName(name)] : []),
+      ...(oldDescription !== description ? [updateTopic(description)] : []),
+    ]
+    Promise.all(ps)
+      .then(() => {
+        // renaming a channel or editing its description fires no
+        // teamChangedByID, so the shared channel caches would keep serving the
+        // old name and description for their stale window
+        if (ps.length) {
+          invalidateTeamChannels(teamID)
+        }
+        nav.safeNavigateUp()
+      })
+      .catch(() => {})
+  }
+  const waiting = C.Waiting.useAnyWaiting(waitingKey)
+
+  return (
+    <Kb.ModalScreen
+      footer={
+        <Kb.Button
+          label="Save"
+          onClick={onSave}
+          fullWidth={true}
+          disabled={oldName === name && description === oldDescription}
+          waiting={waiting}
+        />
+      }
+    >
+      <Kb.Box2 direction="vertical" fullWidth={true} gap="tiny">
+        <Kb.Input3
+          textType="BodySemibold"
+          autoFocus={true}
+          maxLength={16}
+          onChangeText={setName}
+          prefix={`#`}
+          placeholder="channelname"
+          value={name}
+          disabled={oldName === 'general'}
+          containerStyle={styles.channelNameinput}
+        />
+        {oldName === 'general' && (
+          <Kb.Text type="BodySmall">{"You can't edit the #general channel's name."}</Kb.Text>
+        )}
+        <Kb.Input3
+          textType="BodySemibold"
+          placeholder="Description"
+          value={description}
+          rowsMin={3}
+          rowsMax={3}
+          multiline={true}
+          onChangeText={setDescription}
+          maxLength={280}
+        />
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  channelNameinput: Kb.Styles.padding(Kb.Styles.globalMargins.tiny),
+}))
+
+export default EditChannel

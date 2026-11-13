@@ -1,0 +1,244 @@
+import * as React from 'react'
+import * as T from '@/constants/types'
+import {emojiIndexByChar} from '@/common-adapters/markdown/emoji-gen'
+import libphonenumber from 'google-libphonenumber'
+import countriesRaw from './country-data/countries.json'
+import supportedCodesRaw from './sms-support/data.json'
+
+const PNF = libphonenumber.PhoneNumberFormat
+
+const phoneUtil = libphonenumber.PhoneNumberUtil.getInstance()
+const ValidationResult = libphonenumber.PhoneNumberUtil.ValidationResult
+const supported = phoneUtil.getSupportedRegions()
+let _defaultPhoneCountry: string | undefined
+let _defaultPhoneCountryPromise: Promise<string | undefined> | undefined
+
+export type CountryData = {
+  alpha2: string
+  callingCode: string
+  emoji: string
+  emojiText: string
+  example: string
+  name: string
+  pickerText: string
+}
+
+let _countryDataLoaded = false
+const _countryDataRaw: {[key: string]: CountryData} = {}
+const _codeToCountryRaw: {[key: string]: string} = {}
+
+const load = () => {
+  if (_countryDataLoaded) return
+  _countryDataLoaded = true
+
+  const countries = countriesRaw as Array<{
+    alpha2: string
+    status: string
+    emoji: string
+    name: string
+    countryCallingCodes: Array<string>
+  }>
+  const supportedCodes = supportedCodesRaw as {[key: string]: boolean}
+
+  countries.forEach(curr => {
+    if (
+      curr.alpha2 &&
+      (curr.status === 'assigned' || curr.status === 'user assigned') &&
+      supportedCodes[curr.alpha2] &&
+      curr.countryCallingCodes.length &&
+      supported.includes(curr.alpha2 as (typeof supported)[number])
+    ) {
+      const emojiText: string = emojiIndexByChar[curr.emoji || -1] || ''
+      // see here for why we check status is 'assigned'
+      // https://github.com/OpenBookPrices/country-data/tree/011dbb6658b0df5a36690af7086baa3e5c20c30c#status-notes
+      _countryDataRaw[curr.alpha2] = {
+        alpha2: curr.alpha2,
+        callingCode: curr.countryCallingCodes[0] ?? '',
+        emoji: curr.emoji || '',
+        emojiText,
+        example: phoneUtil.format(phoneUtil.getExampleNumber(curr.alpha2), PNF.NATIONAL),
+        name: curr.name,
+        pickerText:
+          (isMobile ? `${curr.emoji} ` : '') +
+          `${curr.name} ${curr.countryCallingCodes[0]?.replace(' ', '\xa0') ?? ''}`,
+      }
+
+      // Skip all the non-GB UK numbers. This way we avoid having to write all the
+      // sub-country-prefix matching code for UK.
+      if (
+        curr.countryCallingCodes.length === 1 &&
+        curr.countryCallingCodes[0] === '+44' &&
+        curr.alpha2 !== 'GB'
+      ) {
+        return
+      }
+
+      for (const code of curr.countryCallingCodes) {
+        _codeToCountryRaw[code.slice(1)] = curr.alpha2
+      }
+    }
+  })
+}
+
+export const countryData: () => {[key: string]: CountryData} = () => {
+  load()
+  return _countryDataRaw
+}
+export const codeToCountry: () => {[key: string]: string} = () => {
+  load()
+  return _codeToCountryRaw
+}
+
+const canadianAreaCodes: {[key: string]: boolean} = {
+  '204': true,
+  '226': true,
+  '236': true,
+  '249': true,
+  '250': true,
+  '289': true,
+  '306': true,
+  '343': true,
+  '365': true,
+  '403': true,
+  '416': true,
+  '418': true,
+  '431': true,
+  '437': true,
+  '438': true,
+  '450': true,
+  '506': true,
+  '514': true,
+  '519': true,
+  '548': true,
+  '579': true,
+  '581': true,
+  '587': true,
+  '604': true,
+  '613': true,
+  '639': true,
+  '647': true,
+  '672': true,
+  '705': true,
+  '709': true,
+  '778': true,
+  '780': true,
+  '782': true,
+  '807': true,
+  '819': true,
+  '825': true,
+  '867': true,
+  '873': true,
+  '902': true,
+  '905': true,
+}
+
+export const areaCodeIsCanadian = (input: string): boolean => {
+  return !!canadianAreaCodes[input]
+}
+
+export const validateNumber = (rawNumber: string, region?: string) => {
+  try {
+    const phoneNumber = phoneUtil.parse(rawNumber, region || '')
+    const valid = phoneUtil.isPossibleNumber(phoneNumber)
+    return {
+      e164: phoneUtil.format(phoneNumber, PNF.E164),
+      phoneNumber,
+      valid,
+    }
+  } catch {
+    return {e164: '', valid: false}
+  }
+}
+
+export const formatPhoneNumber = (rawNumber: string) => {
+  const phoneNumber = phoneUtil.parse(rawNumber, '')
+  return `+${phoneNumber.getCountryCode()} ${phoneUtil.format(phoneNumber, PNF.NATIONAL)}`
+}
+
+export const formatAnyPhoneNumbers = (rawText: string) => {
+  const found = rawText.match(/(\+)?(\d)+/)
+  const rawNumber = found ? found[0] : ''
+  if (!rawNumber) return rawText
+  const validatedNumber = validateNumber(rawNumber)
+  const phoneNumber = validatedNumber.phoneNumber
+  if (!validatedNumber.valid || !phoneNumber) return rawText
+  const replacement = `+${phoneNumber.getCountryCode()} ${phoneUtil.format(phoneNumber, PNF.NATIONAL)}`
+  return rawText.replace(rawNumber, replacement)
+}
+
+// Return phone number in international format, e.g. +1 800 555 0123
+// or e.164 if parsing fails
+export const e164ToDisplay = (e164: string): string => {
+  try {
+    const phoneNumber = phoneUtil.parse(e164)
+    if (phoneNumber.getCountryCode() === 1) {
+      return '+1 ' + phoneUtil.format(phoneNumber, PNF.NATIONAL)
+    }
+    return phoneUtil.format(phoneNumber, PNF.INTERNATIONAL)
+  } catch {
+    return e164
+  }
+}
+
+export const AsYouTypeFormatter = libphonenumber.AsYouTypeFormatter
+
+export const formatPhoneNumberInternational = (rawNumber: string): string | undefined => {
+  try {
+    const phoneNumber = phoneUtil.parse(rawNumber)
+    return phoneUtil.format(phoneNumber, PNF.INTERNATIONAL)
+  } catch {
+    return undefined
+  }
+}
+
+// Get phone number in e.164, or null if we can't parse it.
+export const getE164 = (phoneNumber: string, countryCode?: string) => {
+  try {
+    const parsed = countryCode ? phoneUtil.parse(phoneNumber, countryCode) : phoneUtil.parse(phoneNumber)
+    const reason = phoneUtil.isPossibleNumberWithReason(parsed)
+    if (reason !== ValidationResult.IS_POSSIBLE) {
+      return null
+    }
+    return phoneUtil.format(parsed, PNF.E164)
+  } catch {
+    return null
+  }
+}
+
+const loadDefaultPhoneCountry = async () => {
+  if (_defaultPhoneCountry) {
+    return _defaultPhoneCountry
+  }
+  if (!_defaultPhoneCountryPromise) {
+    _defaultPhoneCountryPromise = T.RPCGen.accountGuessCurrentLocationRpcPromise({
+      defaultCountry: 'US',
+    })
+      .then(country => {
+        _defaultPhoneCountry = country
+        return country
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        _defaultPhoneCountryPromise = undefined
+      })
+  }
+  return _defaultPhoneCountryPromise
+}
+
+export const useDefaultPhoneCountry = () => {
+  const [defaultCountry, setDefaultCountry] = React.useState(_defaultPhoneCountry)
+
+  React.useEffect(() => {
+    let canceled = false
+    void loadDefaultPhoneCountry().then(country => {
+      if (!canceled) {
+        setDefaultCountry(country)
+      }
+    })
+    return () => {
+      canceled = true
+    }
+  }, [])
+
+  return defaultCountry
+}

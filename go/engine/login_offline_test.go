@@ -1,0 +1,139 @@
+package engine
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/keybase/client/go/libkb"
+	"github.com/keybase/clockwork"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLoginOffline(t *testing.T) {
+	tc := SetupEngineTest(t, "login")
+	defer tc.Cleanup()
+
+	u1 := CreateAndSignupFakeUser(tc, "login")
+	Logout(tc)
+	u1.LoginOrBust(tc)
+
+	// do a upak load to make sure it is cached
+	arg := libkb.NewLoadUserByUIDArg(context.TODO(), tc.G, u1.UID())
+	_, _, err := tc.G.GetUPAKLoader().Load(arg)
+	require.NoError(t, err)
+
+	// Simulate restarting the service by wiping out the
+	// passphrase stream cache and cached secret keys
+	clearCaches(tc.G)
+	tc.G.GetUPAKLoader().ClearMemory()
+
+	// set server uri to nonexistent ip so api calls will fail
+	prev := os.Getenv("KEYBASE_SERVER_URI")
+	os.Setenv("KEYBASE_SERVER_URI", "http://127.0.0.127:3333")
+	defer os.Setenv("KEYBASE_SERVER_URI", prev)
+	err = tc.G.ConfigureAPI()
+	require.NoError(t, err)
+
+	eng := NewLoginOffline(tc.G)
+	m := NewMetaContextForTest(tc)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
+	}
+	uv, deviceID, deviceName, skey, ekey := tc.G.ActiveDevice.AllFields()
+	require.False(t, uv.IsNil(), "uid is nil, expected it to exist")
+	require.True(t, uv.Uid.Equal(u1.UID()), "uid: %v, expected %v", uv, u1)
+
+	require.False(t, deviceID.IsNil(), "deviceID is nil, expected it to exist")
+
+	require.Equal(t, defaultDeviceName, deviceName, "device name: %q, expected %q", deviceName, defaultDeviceName)
+
+	require.NotNil(t, skey, "signing key is nil, expected it to exist")
+
+	require.NotNil(t, ekey, "encryption key is nil, expected it to exist")
+
+	require.Equal(t, defaultDeviceName, tc.G.ActiveDevice.Name(), "device name: %q, expected %q", tc.G.ActiveDevice.Name(), defaultDeviceName)
+}
+
+// Use fake clock to test login offline after significant delay
+// (make sure upak loader won't use network)
+func TestLoginOfflineDelay(t *testing.T) {
+	tc := SetupEngineTest(t, "login")
+	defer tc.Cleanup()
+
+	fakeClock := clockwork.NewFakeClockAt(time.Now())
+	tc.G.SetClock(fakeClock)
+
+	u1 := CreateAndSignupFakeUser(tc, "login")
+	Logout(tc)
+	u1.LoginOrBust(tc)
+
+	// do a upak load to make sure it is cached
+	arg := libkb.NewLoadUserByUIDArg(context.TODO(), tc.G, u1.UID())
+	_, _, err := tc.G.GetUPAKLoader().Load(arg)
+	require.NoError(t, err)
+
+	// Simulate restarting the service by wiping out the
+	// passphrase stream cache and cached secret keys
+	clearCaches(tc.G)
+	tc.G.GetUPAKLoader().ClearMemory()
+
+	// set server uri to nonexistent ip so api calls will fail
+	prev := os.Getenv("KEYBASE_SERVER_URI")
+	os.Setenv("KEYBASE_SERVER_URI", "http://127.0.0.127:3333")
+	defer os.Setenv("KEYBASE_SERVER_URI", prev)
+	err = tc.G.ConfigureAPI()
+	require.NoError(t, err)
+
+	// advance the clock past the cache timeout
+	fakeClock.Advance(libkb.CachedUserTimeout * 10)
+
+	eng := NewLoginOffline(tc.G)
+	m := NewMetaContextForTest(tc)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
+	}
+	uv, deviceID, deviceName, skey, ekey := tc.G.ActiveDevice.AllFields()
+	require.False(t, uv.IsNil(), "uid is nil, expected it to exist")
+	require.True(t, uv.Uid.Equal(u1.UID()), "uid: %v, expected %v", uv, u1.UID())
+
+	require.False(t, deviceID.IsNil(), "deviceID is nil, expected it to exist")
+
+	require.Equal(t, defaultDeviceName, deviceName, "device name: %q, expected %q", deviceName, defaultDeviceName)
+
+	require.NotNil(t, skey, "signing key is nil, expected it to exist")
+
+	require.NotNil(t, ekey, "encryption key is nil, expected it to exist")
+}
+
+// Login offline with nothing in upak cache for self user.
+func TestLoginOfflineNoUpak(t *testing.T) {
+	tc := SetupEngineTest(t, "login")
+	defer tc.Cleanup()
+
+	u1 := CreateAndSignupFakeUser(tc, "login")
+	Logout(tc)
+	u1.LoginOrBust(tc)
+
+	// Simulate restarting the service by wiping out the
+	// passphrase stream cache and cached secret keys
+	tc.SimulateServiceRestart()
+	tc.G.GetUPAKLoader().ClearMemory()
+
+	// invalidate the cache for uid
+	tc.G.GetUPAKLoader().Invalidate(context.Background(), u1.UID())
+
+	// set server uri to nonexistent ip so api calls will fail
+	prev := os.Getenv("KEYBASE_SERVER_URI")
+	os.Setenv("KEYBASE_SERVER_URI", "http://127.0.0.127:3333")
+	defer os.Setenv("KEYBASE_SERVER_URI", prev)
+	err := tc.G.ConfigureAPI()
+	require.NoError(t, err)
+
+	eng := NewLoginOffline(tc.G)
+	m := NewMetaContextForTest(tc)
+	err = RunEngine2(m, eng)
+	require.NoError(t, err,
+		"LoginOffline should still work after upak cache invalidation; got %s", err)
+}

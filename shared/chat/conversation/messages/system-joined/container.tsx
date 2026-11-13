@@ -1,0 +1,74 @@
+import type * as T from '@/constants/types'
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import UserNotice from '../user-notice'
+import {getAddedUsernames} from '../system-users-added-to-conv/container'
+import {formatTimeForChat} from '@/util/timestamp'
+import {useThreadMeta} from '../../thread-context'
+
+type OwnProps = {message: T.Chat.MessageSystemJoined}
+
+function JoinedContainer(p: OwnProps) {
+  const styles = useStyles()
+  const {message} = p
+  const {joiners, author, leavers, timestamp} = message
+  const {channelname, teamType, teamname} = useThreadMeta(
+    C.useShallow(m => ({channelname: m.channelname, teamType: m.teamType, teamname: m.teamname}))
+  )
+  const joiners2 = !joiners?.length && !leavers?.length ? [author] : joiners
+  const isBigTeam = teamType === 'big'
+  const multiProps = {channelname, isBigTeam, teamname, timestamp}
+  return (
+    <Kb.Box2 direction="vertical" style={styles.container} fullWidth={true} alignSelf="flex-start">
+      {joiners2?.length ? <MultiUserJoinedNotice {...multiProps} who={joiners2} join={true} /> : null}
+      {leavers?.length ? <MultiUserJoinedNotice {...multiProps} who={leavers} join={false} /> : null}
+    </Kb.Box2>
+  )
+}
+
+const MultiUserJoinedNotice = (p: {
+  who: ReadonlyArray<string>
+  join: boolean
+  isBigTeam: boolean
+  channelname: string
+  teamname: string
+  timestamp: number
+}) => {
+  const styles = useStyles()
+  const {who, join, isBigTeam, channelname, teamname, timestamp} = p
+
+  const shorten = isMobile && who.length > 1
+  const joinStr = ` ${join ? 'joined' : 'left'}${shorten ? '' : isBigTeam ? ` #${channelname}` : ` ${teamname}`}`
+
+  const ts = timestamp ? (
+    <Kb.Text type="BodyTiny" style={styles.timestamp}>
+      {' ' + formatTimeForChat(timestamp)}
+    </Kb.Text>
+  ) : null
+
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} alignSelf="flex-start" relative={true}>
+      <UserNotice>
+        <Kb.Box2 direction="horizontal" gap="xtiny" fullWidth={true} alignSelf="flex-start" relative={true}>
+          <Kb.Text type="Body">•</Kb.Text>
+          <Kb.Text type="BodySmall" lineClamp={2} title={who.join(', ')}>
+            {getAddedUsernames(who)}
+            {joinStr}
+            {shorten ? null : ts}
+          </Kb.Text>
+          <Kb.AvatarLine usernames={who} maxShown={3} size={16} layout="horizontal" alignSelf="flex-start" />
+        </Kb.Box2>
+      </UserNotice>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      container: {marginLeft: -40, paddingBottom: 4},
+      timestamp: Kb.Styles.platformStyles({isElectron: {lineHeight: 19}}),
+    }) as const
+)
+
+export default JoinedContainer

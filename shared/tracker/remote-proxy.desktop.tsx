@@ -1,0 +1,371 @@
+// A mirror of the remote tracker windows.
+import * as React from 'react'
+import * as RemoteGen from '@/constants/remote-actions'
+import * as T from '@/constants/types'
+import {generateGUIID, ignorePromise} from '@/constants/utils'
+import {waitingKeyTracker, waitingKeyTrackerProfileLoad} from '@/constants/waiting-keys'
+import useSerializeProps from '../desktop/remote/use-serialize-props.desktop'
+import useBrowserWindow from '../desktop/remote/use-browser-window.desktop'
+import {useUsersState} from '@/stores/users'
+import {useFollowerState} from '@/stores/followers'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useConfigState} from '@/stores/config'
+import {useEngineActionListener} from '@/engine/action-listener'
+import {
+  cloneDetails,
+  identifyResultToDetailsState,
+  makeDetails,
+  updateTrackerDetailsBlocked,
+  updateTrackerDetailsReset,
+  updateTrackerDetailsResult,
+  updateTrackerDetailsRow,
+  updateTrackerDetailsSummary,
+  updateTrackerDetailsUserCard,
+} from './model'
+import {registerRemoteActionHandler} from '@/desktop/renderer/remote-event-handler.desktop'
+import logger from '@/logger'
+import {isQuietCancel, RPCError} from '@/util/errors'
+
+const MAX_TRACKERS = 5
+const windowOpts = {hasShadow: false, height: 470, transparent: true, width: 320}
+
+type PopupState = {
+  showTrackerSet: Set<string>
+  usernameToDetails: Map<string, T.Tracker.Details>
+}
+
+type LoadPayload = RemoteGen.TrackerLoadPayload['payload']
+
+const initialPopupState = (): PopupState => ({
+  showTrackerSet: new Set(),
+  usernameToDetails: new Map(),
+})
+
+const guiIDToUsername = (state: PopupState, guiID: string) => {
+  const details = [...state.usernameToDetails.values()].find(d => d.guiID === guiID)
+  return details?.username
+}
+
+const updateResult = (state: PopupState, guiID: string, result: T.Tracker.DetailsState, reason?: string) => {
+  const username = guiIDToUsername(state, guiID)
+  if (!username) {
+    return state
+  }
+  const current = state.usernameToDetails.get(username)
+  if (!current) {
+    return state
+  }
+  const usernameToDetails = new Map(state.usernameToDetails)
+  usernameToDetails.set(username, updateTrackerDetailsResult(current, result, reason))
+  return {...state, usernameToDetails}
+}
+
+// onFailed: the identify failed in the service. A cancel (an account switch, the session going
+// away) is not a failure of this user's identify, so it leaves the popup as it is.
+export const runPopupIdentify = async (
+  params: {assertion: string; guiID: string; ignoreCache: boolean},
+  onFailed: () => void
+) => {
+  try {
+    await T.RPCGen.identify3Identify3RpcListener({
+      // The identify3Ui events are handled by the engine action listeners below
+      globalFallthrough: ['keybase.1.identify3Ui.'],
+      incomingCallMap: {},
+      params,
+      waitingKey: waitingKeyTrackerProfileLoad,
+    })
+  } catch (error) {
+    if (!(error instanceof RPCError) || isQuietCancel(error)) {
+      return
+    }
+    logger.error(`Error loading tracker popup: ${error.message}`)
+    onFailed()
+  }
+}
+
+const RemoteTracker = (props: {details: T.Tracker.Details; trackerUsername: string}) => {
+  const {details, trackerUsername} = props
+  const blockMap = useUsersState(s => s.blockMap)
+  const followers = useFollowerState(s => s.followers)
+  const following = useFollowerState(s => s.following)
+  const username = useCurrentUserState(s => s.username)
+  const httpSrv = useConfigState(s => s.httpSrv)
+
+  const windowComponent = 'tracker'
+  const windowParam = trackerUsername
+  useBrowserWindow({
+    windowComponent,
+    windowOpts,
+    windowParam,
+    windowPositionBottomRight: true,
+    windowTitle: `Tracker - ${trackerUsername}`,
+  })
+
+  useSerializeProps(
+    {
+      assertions: details.assertions ? [...details.assertions.values()] : undefined,
+      bio: details.bio,
+      blocked: blockMap.get(trackerUsername)?.chatBlocked || false,
+      followThem: following.has(trackerUsername),
+      followersCount: details.followersCount,
+      followingCount: details.followingCount,
+      followsYou: followers.has(trackerUsername),
+      fullname: details.fullname,
+      guiID: details.guiID,
+      hidFromFollowers: details.hidFromFollowers,
+      httpSrvAddress: httpSrv.address,
+      httpSrvToken: httpSrv.token,
+      isYou: username === trackerUsername,
+      location: details.location,
+      reason: details.reason,
+      state: details.state,
+      teamShowcase: details.teamShowcase,
+      trackerUsername,
+    },
+    windowComponent,
+    windowParam
+  )
+
+  return null
+}
+
+const RemoteTrackers = () => {
+  const [popupState, setPopupState] = React.useState<PopupState>(initialPopupState)
+  const popupStateRef = React.useRef(popupState)
+
+  React.useEffect(() => {
+    popupStateRef.current = popupState
+  }, [popupState])
+
+  const load = React.useCallback((p: LoadPayload) => {
+    const {assertion, forceDisplay, fromDaemon, guiID, ignoreCache = false, reason} = p
+    setPopupState(prev => {
+      const showTrackerSet = new Set(prev.showTrackerSet)
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      if (forceDisplay) {
+        showTrackerSet.add(assertion)
+      }
+      const details = cloneDetails(usernameToDetails.get(assertion) ?? makeDetails(assertion))
+      usernameToDetails.set(assertion, {
+        ...details,
+        assertions: new Map(),
+        guiID,
+        reason,
+        state: 'checking',
+        username: assertion,
+      })
+      return {showTrackerSet, usernameToDetails}
+    })
+
+    if (fromDaemon) {
+      return
+    }
+
+    ignorePromise(
+      runPopupIdentify({assertion, guiID, ignoreCache}, () =>
+        setPopupState(prev => updateResult(prev, guiID, 'error'))
+      )
+    )
+  }, [])
+
+  const closeTracker = React.useCallback((guiID: string) => {
+    setPopupState(prev => {
+      const username = guiIDToUsername(prev, guiID)
+      if (!username) {
+        return prev
+      }
+      const showTrackerSet = new Set(prev.showTrackerSet)
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      showTrackerSet.delete(username)
+      usernameToDetails.delete(username)
+      return {showTrackerSet, usernameToDetails}
+    })
+  }, [])
+
+  const changeFollow = React.useCallback((guiID: string, follow: boolean) => {
+    const f = async () => {
+      try {
+        await T.RPCGen.identify3Identify3FollowUserRpcPromise({follow, guiID}, waitingKeyTracker)
+        setPopupState(prev =>
+          updateResult(prev, guiID, 'valid', `Successfully ${follow ? 'followed' : 'unfollowed'}!`)
+        )
+      } catch {
+        setPopupState(prev =>
+          updateResult(prev, guiID, 'error', `Failed to ${follow ? 'follow' : 'unfollow'}`)
+        )
+      }
+    }
+    ignorePromise(f())
+  }, [])
+
+  const ignore = React.useCallback((guiID: string) => {
+    const f = async () => {
+      try {
+        await T.RPCGen.identify3Identify3IgnoreUserRpcPromise({guiID}, waitingKeyTracker)
+        setPopupState(prev => updateResult(prev, guiID, 'valid', 'Successfully ignored'))
+      } catch {
+        setPopupState(prev => updateResult(prev, guiID, 'error', 'Failed to ignore'))
+      }
+    }
+    ignorePromise(f())
+  }, [])
+
+  React.useEffect(
+    () =>
+      registerRemoteActionHandler('tracker', action => {
+        switch (action.type) {
+          case RemoteGen.trackerChangeFollow:
+            changeFollow(action.payload.guiID, action.payload.follow)
+            break
+          case RemoteGen.trackerIgnore:
+            ignore(action.payload.guiID)
+            break
+          case RemoteGen.trackerCloseTracker:
+            closeTracker(action.payload.guiID)
+            break
+          case RemoteGen.trackerLoad:
+            load(action.payload)
+            break
+        }
+      }),
+    [changeFollow, closeTracker, ignore, load]
+  )
+
+  useEngineActionListener('keybase.1.NotifyTracking.trackingChanged', action => {
+    const username = action.payload.params.username
+    if (!popupStateRef.current.usernameToDetails.has(username)) {
+      return
+    }
+    load({
+      assertion: username,
+      forceDisplay: false,
+      fromDaemon: false,
+      guiID: generateGUIID(),
+      ignoreCache: true,
+      inTracker: true,
+      reason: '',
+    })
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3Result', action => {
+    const {guiID, result} = action.payload.params
+    setPopupState(prev => updateResult(prev, guiID, identifyResultToDetailsState(result)))
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3ShowTracker', action => {
+    const {assertion, forceDisplay = false, guiID, reason} = action.payload.params
+    load({
+      assertion,
+      forceDisplay,
+      fromDaemon: true,
+      guiID,
+      ignoreCache: false,
+      inTracker: true,
+      reason: reason.reason,
+    })
+  })
+
+  useEngineActionListener('keybase.1.NotifyTracking.notifyUserBlocked', action => {
+    setPopupState(prev => {
+      if (!prev.usernameToDetails.size) {
+        return prev
+      }
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      let changed = false
+      for (const username of usernameToDetails.keys()) {
+        const current = usernameToDetails.get(username)
+        if (!current) {
+          continue
+        }
+        const nextDetails = updateTrackerDetailsBlocked(current, action.payload.params.b)
+        if (nextDetails !== current) {
+          changed = true
+          usernameToDetails.set(username, nextDetails)
+        }
+      }
+      return changed ? {...prev, usernameToDetails} : prev
+    })
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3UpdateRow', action => {
+    const {row} = action.payload.params
+    setPopupState(prev => {
+      const username = guiIDToUsername(prev, row.guiID)
+      if (!username) {
+        return prev
+      }
+      const current = prev.usernameToDetails.get(username)
+      if (!current) {
+        return prev
+      }
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      usernameToDetails.set(username, updateTrackerDetailsRow(current, row))
+      return {...prev, usernameToDetails}
+    })
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3UserReset', action => {
+    const {guiID} = action.payload.params
+    setPopupState(prev => {
+      const username = guiIDToUsername(prev, guiID)
+      if (!username) {
+        return prev
+      }
+      const current = prev.usernameToDetails.get(username)
+      if (!current) {
+        return prev
+      }
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      usernameToDetails.set(username, updateTrackerDetailsReset(current))
+      return {...prev, usernameToDetails}
+    })
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3UpdateUserCard', action => {
+    const {guiID, card} = action.payload.params
+    setPopupState(prev => {
+      const username = guiIDToUsername(prev, guiID)
+      if (!username) {
+        return prev
+      }
+      const current = prev.usernameToDetails.get(username)
+      if (!current) {
+        return prev
+      }
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      usernameToDetails.set(username, updateTrackerDetailsUserCard(current, card))
+      return {...prev, usernameToDetails}
+    })
+  })
+
+  useEngineActionListener('keybase.1.identify3Ui.identify3Summary', action => {
+    const {summary} = action.payload.params
+    setPopupState(prev => {
+      const username = guiIDToUsername(prev, summary.guiID)
+      if (!username) {
+        return prev
+      }
+      const current = prev.usernameToDetails.get(username)
+      if (!current) {
+        return prev
+      }
+      const usernameToDetails = new Map(prev.usernameToDetails)
+      usernameToDetails.set(username, updateTrackerDetailsSummary(current, summary))
+      return {...prev, usernameToDetails}
+    })
+  })
+
+  return (
+    <>
+      {[...popupState.showTrackerSet].reduce<Array<React.ReactNode>>((arr, username) => {
+        const details = popupState.usernameToDetails.get(username)
+        if (arr.length < MAX_TRACKERS && details) {
+          arr.push(<RemoteTracker key={username} trackerUsername={username} details={details} />)
+        }
+        return arr
+      }, [])}
+    </>
+  )
+}
+
+export default RemoteTrackers

@@ -1,0 +1,151 @@
+import type * as React from 'react'
+import * as Styles from '@/styles'
+import {Box2, ClickableBox} from './box'
+import ProgressIndicator from './progress-indicator'
+import Text from './text'
+import SwitchToggle from './switch-toggle'
+import WithTooltip from './with-tooltip'
+import type {MeasureRef} from './measure-ref'
+import type {TextType} from './text.shared'
+
+const Kb = {
+  Box2,
+  ClickableBox,
+  ProgressIndicator,
+  Text,
+  WithTooltip,
+}
+
+type Props = {
+  align?: 'left' | 'right' // default to 'left',
+  allowLabelClick?: boolean
+  children?: React.ReactNode
+  color?: 'blue' | 'green' | 'red' // default to 'blue',
+  disabled?: boolean
+  gapInBetween?: boolean // inserts flex:1 gap between toggle and text,
+  gapSize?: number // inserts a gap of N pixels between toggle and text
+  label: string | React.ReactNode
+  labelSubtitle?: string // only effective when label is a string,
+  labelTooltip?: string // only effective when label is a string,
+  labelType?: TextType // only effective when label is a string,
+  on: boolean
+  onClick: () => void
+  style?: Styles.StylesCrossPlatform
+  // on the toggle
+  testID?: string
+}
+
+const LabelContainer = (props: Props) =>
+  // We put the tooltip on the whole thing on desktop.
+  {
+  const styles = useStyles()
+  return isMobile && props.labelTooltip ? (
+      <Kb.WithTooltip
+        tooltip={props.labelTooltip}
+        containerStyle={Styles.collapseStyles([Styles.globalStyles.flexBoxColumn, styles.labelContainer])}
+        showOnPressMobile={true}
+      >
+        {props.children}
+      </Kb.WithTooltip>
+    ) : (
+      <Kb.ClickableBox alignSelf="center"
+        onClick={props.allowLabelClick ? props.onClick : undefined}
+        direction="vertical"
+        style={styles.labelContainer}
+      >
+        {props.children}
+      </Kb.ClickableBox>
+    )
+}
+
+const getStyle = (props: Props, styles: ReturnType<typeof useStyles>) =>
+  Styles.collapseStyles([
+    styles.container,
+    props.align !== 'right' ? Styles.globalStyles.flexBoxRow : Styles.globalStyles.flexBoxRowReverse,
+    props.style,
+  ])
+
+function Switch(props: Props & {ref?: React.Ref<MeasureRef>}) {
+  const styles = useStyles()
+  const {ref} = props
+  const content = (
+    <>
+      <Kb.ClickableBox alignSelf="center" onClick={props.disabled ? undefined : props.onClick} ref={ref} direction="vertical" testID={props.testID}>
+        <SwitchToggle
+          on={props.on}
+          color={props.color || 'blue'}
+          style={Styles.collapseStyles([
+            props.align === 'left' && styles.switchLeft,
+            props.align === 'right' && styles.switchRight,
+            props.disabled && styles.disabled,
+            !!props.labelSubtitle && styles.switch,
+          ] as const)}
+        />
+      </Kb.ClickableBox>
+      {!!props.gapInBetween && <Kb.Box2 alignSelf="center" direction="vertical" flex={1} />}
+      {!!props.gapSize && <Kb.Box2 alignSelf="center" direction="vertical" style={{width: props.gapSize}} />}
+      {typeof props.label === 'string' ? (
+        <LabelContainer {...props}>
+          <Kb.Text type={props.labelType ?? 'BodySemibold'}>{props.label}</Kb.Text>
+          {!!props.labelSubtitle && <Kb.Text type="BodySmall">{props.labelSubtitle}</Kb.Text>}
+        </LabelContainer>
+      ) : props.labelSubtitle ? (
+        <LabelContainer {...props}>
+          {props.label}
+          <Kb.Text type="BodySmall">{props.labelSubtitle}</Kb.Text>
+        </LabelContainer>
+      ) : (
+        props.label
+      )}
+    </>
+  )
+
+  return isMobile || !props.labelTooltip ? (
+    <Kb.Box2
+      direction={props.align !== 'right' ? 'horizontal' : 'horizontalReverse'}
+      style={Styles.collapseStyles([styles.container, props.style])}
+    >
+      {content}
+    </Kb.Box2>
+  ) : (
+    <Kb.WithTooltip
+      containerStyle={getStyle(props, styles)}
+      tooltip={props.labelTooltip || ''}
+      position={props.align !== 'right' ? 'top left' : 'top right'}
+    >
+      {content}
+    </Kb.WithTooltip>
+  )
+}
+
+export default Switch
+
+const useStyles = Styles.createStyleHook(() => ({
+  container: Styles.platformStyles({
+    isElectron: {
+      alignItems: 'center',
+      minHeight: 24,
+    },
+    isMobile: {
+      alignItems: 'flex-start',
+      flexShrink: 1,
+      minHeight: 32,
+    },
+  }),
+  disabled: {opacity: 0.3},
+  labelContainer: {flexShrink: 1},
+  switch: Styles.platformStyles({
+    isMobile: {
+      bottom: Styles.globalMargins.xtiny,
+      position: 'relative',
+    },
+  }),
+  switchLeft: Styles.platformStyles({
+    isElectron: {marginRight: 10},
+    isMobile: {marginRight: 12},
+  }),
+  switchRight: Styles.platformStyles({
+    isElectron: {marginLeft: 10},
+    isMobile: {marginLeft: 12},
+  }),
+}))

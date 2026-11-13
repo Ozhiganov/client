@@ -4,10 +4,9 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"strings"
-
-	"golang.org/x/net/context"
 
 	"github.com/keybase/cli"
 	"github.com/keybase/client/go/libcmdline"
@@ -27,10 +26,6 @@ type CmdSigsList struct {
 	types   map[string]bool
 
 	username string
-
-	user  *libkb.User
-	sigs  []libkb.TypedChainLink
-	ksigs []keybase1.Sig
 }
 
 func (s *CmdSigsList) ParseTypes(ctx *cli.Context) error {
@@ -47,8 +42,8 @@ func (s *CmdSigsList) ParseTypes(ctx *cli.Context) error {
 	}
 
 	ret := make(map[string]bool)
-	v := strings.Split(tmp, ",")
-	for _, i := range v {
+	v := strings.SplitSeq(tmp, ",")
+	for i := range v {
 		ok, found := types[i]
 		if !ok || !found {
 			return fmt.Errorf("Unknown signature type: %s", i)
@@ -174,7 +169,7 @@ func (s *CmdSigsList) Run() error {
 		if err != nil {
 			return err
 		}
-		s.G().UI.GetTerminalUI().Output(json)
+		_ = s.G().UI.GetTerminalUI().Output(json)
 		return nil
 	}
 

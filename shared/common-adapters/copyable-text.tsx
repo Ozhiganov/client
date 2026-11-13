@@ -1,0 +1,115 @@
+import * as React from 'react'
+import {useTimeout} from './use-timers'
+import Text from './text'
+import {Box2} from './box'
+import {TouchableHighlight} from 'react-native'
+import {setStringAsync} from 'expo-clipboard'
+import * as Styles from '@/styles'
+
+export type Props = {
+  value: string
+  style?: object
+  textStyle?: object
+}
+
+const CopyableText = (props: Props) => {
+  const styles = useStyles()
+  const theme = Styles.useTheme()
+  const [hasCopied, setHasCopied] = React.useState(false)
+  const setHasCopiedFalseLater = useTimeout(() => setHasCopied(false), 5000)
+
+  if (!isMobile) {
+    return (
+      <textarea
+        style={Styles.castStyleDesktop(Styles.collapseStyles([styles.base, props.style]))}
+        readOnly={true}
+        value={props.value}
+        onClick={e => {
+          const target = e.target as unknown as {focus: () => void; select: () => void}
+          target.focus()
+          target.select()
+        }}
+      />
+    )
+  }
+
+  const handleCopy = () => {
+    setStringAsync(props.value)
+      .then(() => {})
+      .catch(() => {})
+    setHasCopied(true)
+    setHasCopiedFalseLater()
+  }
+  return (
+    <TouchableHighlight
+      activeOpacity={0.6}
+      underlayColor={theme.white}
+      onPress={() => handleCopy()}
+      style={props.style}
+    >
+      <Box2 direction="vertical" fullWidth={true} relative={true} style={styles.base}>
+        <Text style={Styles.collapseStyles([styles.text, props.textStyle])} type="BodySmall">
+          {props.value}
+        </Text>
+        <Box2 alignSelf="center" direction="horizontal" alignItems="center" style={styles.copyToast}>
+          <Text style={styles.copyToastText} type="Body">
+            {hasCopied ? 'Copied!' : 'Tap to copy'}
+          </Text>
+        </Box2>
+      </Box2>
+    </TouchableHighlight>
+  )
+}
+
+const useStyles = Styles.createStyleHook(
+  theme =>
+    ({
+      base: Styles.platformStyles({
+        common: {
+          ...Styles.globalStyles.fontTerminal,
+          alignItems: 'flex-start',
+          backgroundColor: theme.greyLight,
+          ...Styles.globalStyles.rounded,
+          color: theme.black,
+          fontSize: 13,
+          padding: 10,
+          textAlign: 'left',
+        },
+        isElectron: {
+          ...Styles.border(theme.black_10, 1),
+          justifyContent: 'stretch',
+          lineHeight: '17px',
+          overflowX: 'hidden',
+          overflowY: 'auto',
+          resize: 'none',
+          whiteSpace: 'pre-wrap',
+          wordWrap: 'break-word',
+        },
+        isMobile: {
+          borderColor: theme.black_10,
+          borderWidth: 1,
+          // Guarantee that the first line of text is shown above the 'Tap to Copy' toast
+          minHeight:
+            Styles.globalMargins.medium + Styles.globalMargins.tiny + 2 * Styles.globalMargins.small + 24,
+        },
+      }),
+      copyToast: {
+        ...Styles.paddingH(Styles.globalMargins.medium),
+        // the box's alignSelf center centers the absolute pill horizontally
+        backgroundColor: theme.black_50,
+        borderRadius: Styles.globalMargins.large,
+        bottom: Styles.globalMargins.small,
+        height: Styles.globalMargins.medium + Styles.globalMargins.tiny,
+        position: 'absolute',
+      },
+      copyToastText: {
+        color: theme.white,
+      },
+      text: {
+        ...Styles.globalStyles.fontTerminal,
+        color: theme.black,
+      },
+    }) as const
+)
+
+export default CopyableText

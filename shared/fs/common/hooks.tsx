@@ -1,0 +1,1456 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import {useEngineActionListener} from '@/engine/action-listener'
+import {NavigationContext} from '@react-navigation/core'
+import logger from '@/logger'
+import {useCurrentUserState} from '@/stores/current-user'
+import * as FS from '@/constants/fs'
+import {RPCError} from '@/util/errors'
+import isEqual from 'lodash/isEqual'
+import {
+  favoritesResultToTlfs,
+  folderToTlf,
+  makeEntry,
+  makePathItemsFromDirents,
+  updatePathItem,
+} from './rpc-state'
+import {
+  useFsErrorActionOrThrow,
+  useFsRedbarActions,
+  useFsSoftErrorActions,
+  useFsSoftErrors,
+} from './error-state'
+import {
+  finishedDownloadWithIntentMobile as finishedDownloadWithIntentInPlatform,
+  saveFinishedDownloadToPublicDownloads,
+} from '@/util/fs-platform'
+import {requestPermissionsToWrite} from '@/util/platform-specific'
+import {clientID as fsClientID, makeUUID} from './client'
+import {useFsDaemonActions, useKbfsDaemonStatus} from './daemon'
+
+const isPathItem = (path: T.FS.Path) => T.FS.getPathLevel(path) > 2 || FS.hasSpecialFileElement(path)
+
+const emptyPathItems = new Map<T.FS.Path, T.FS.PathItem>()
+
+const makeEmptyTlfs = (): T.FS.Tlfs => ({
+  additionalTlfs: new Map(),
+  loaded: false,
+  private: new Map(),
+  public: new Map(),
+  team: new Map(),
+})
+
+const emptyTlfs = makeEmptyTlfs()
+
+const useSafeIsFocused = () => {
+  const navigation = React.useContext(NavigationContext)
+  const subscribe = React.useCallback(
+    (listener: () => void) => {
+      if (!navigation) {
+        return () => {}
+      }
+      const unsubscribeFocus = navigation.addListener('focus', listener)
+      const unsubscribeBlur = navigation.addListener('blur', listener)
+      return () => {
+        unsubscribeFocus()
+        unsubscribeBlur()
+      }
+    },
+    [navigation]
+  )
+  return React.useSyncExternalStore(
+    subscribe,
+    () => navigation?.isFocused() ?? true,
+    () => true
+  )
+}
+
+type FsSubscription = {
+  count: number
+  subscribed: boolean
+  subscriptionID: string
+  unsubscribeTimer?: ReturnType<typeof setTimeout>
+}
+
+type FsSubscriptionManager = {
+  subscriptions: Map<string, FsSubscription>
+}
+
+type FsDataContextType = {
+  downloads: T.FS.Downloads
+  downloadInfos: ReadonlyMap<string, T.FS.DownloadInfo>
+  loadAdditionalTlf: (tlfPath: T.FS.Path) => void
+  loadDownloadInfo: (downloadID: string) => void
+  loadDownloadStatus: () => void
+  loadFolderChildren: (path: T.FS.Path, initialLoadRecursive: boolean) => void
+  loadPathMetadata: (path: T.FS.Path) => void
+  loadTlfs: () => void
+  pathItems: T.FS.PathItems
+  recordDownloadStarted: (downloadID: string, path: T.FS.Path, type: DownloadStartType) => void
+  subscriptionManager: FsSubscriptionManager
+  tlfs: T.FS.Tlfs
+}
+
+const FsDataContext = React.createContext<FsDataContextType | null>(null)
+
+// The mobile bottom sheet teleports popup children to the app root (gorhom
+// portal), outside this per-screen provider. Content rendered inside a sheet
+// must capture the value in the source tree with useFsDataContextValue and
+// re-provide it across the portal with FsDataContextBridge.
+export const useFsDataContextValue = () => React.useContext(FsDataContext)
+
+export const FsDataContextBridge = ({
+  children,
+  value,
+}: {
+  children: React.ReactNode
+  value: FsDataContextType | null
+}) => <FsDataContext value={value}>{children}</FsDataContext>
+
+type DownloadStartType = 'download' | 'share' | 'saveMedia'
+
+const downloadIntentFromStartType = (type: DownloadStartType): T.FS.DownloadIntent | undefined =>
+  type === 'share'
+    ? T.FS.DownloadIntent.Share
+    : type === 'saveMedia'
+      ? T.FS.DownloadIntent.CameraRoll
+      : undefined
+
+type FsSharedData = {
+  downloads: T.FS.Downloads
+  downloadInfos: ReadonlyMap<string, T.FS.DownloadInfo>
+  pathItems: T.FS.PathItems
+  tlfs: T.FS.Tlfs
+}
+
+const makeEmptyDownloads = (): T.FS.Downloads => ({
+  regularDownloads: [],
+  state: new Map(),
+})
+
+const emptyDownloads = makeEmptyDownloads()
+
+const makeEmptyFsSharedData = (): FsSharedData => ({
+  downloads: makeEmptyDownloads(),
+  downloadInfos: new Map(),
+  pathItems: new Map(),
+  tlfs: makeEmptyTlfs(),
+})
+
+type SetFsSharedData = React.Dispatch<React.SetStateAction<FsSharedData>>
+
+const unsubscribeFsSubscription = (subscriptionID: string) => {
+  C.ignorePromise(
+    T.RPCGen.SimpleFSSimpleFSUnsubscribeRpcPromise({
+      clientID: fsClientID,
+      identifyBehavior: T.RPCGen.TLFIdentifyBehavior.fsGui,
+      subscriptionID,
+    }).catch(() => {})
+  )
+}
+
+const resetFsSubscriptionManager = (manager: FsSubscriptionManager) => {
+  manager.subscriptions.forEach(subscription => {
+    if (subscription.unsubscribeTimer) {
+      clearTimeout(subscription.unsubscribeTimer)
+      delete subscription.unsubscribeTimer
+    }
+    if (subscription.subscribed) {
+      unsubscribeFsSubscription(subscription.subscriptionID)
+    }
+  })
+  manager.subscriptions.clear()
+}
+
+const setDownloadInfos = (
+  setFsSharedData: SetFsSharedData,
+  updater: (
+    prevDownloadInfos: ReadonlyMap<string, T.FS.DownloadInfo>
+  ) => ReadonlyMap<string, T.FS.DownloadInfo>
+) => {
+  setFsSharedData(prevData =>
+    C.produce(prevData, draft => {
+      const downloadInfos = updater(prevData.downloadInfos)
+      if (downloadInfos !== prevData.downloadInfos) {
+        draft.downloadInfos = T.castDraft(downloadInfos)
+      }
+    })
+  )
+}
+
+const setDownloads = (setFsSharedData: SetFsSharedData, downloads: T.FS.Downloads) => {
+  setFsSharedData(prevData =>
+    C.produce(prevData, draft => {
+      if (!isEqual(downloads, prevData.downloads)) {
+        draft.downloads = T.castDraft(downloads)
+      }
+    })
+  )
+}
+
+const setPathItems = (
+  setFsSharedData: SetFsSharedData,
+  updater: (prevPathItems: T.FS.PathItems) => T.FS.PathItems
+) => {
+  setFsSharedData(prevData =>
+    C.produce(prevData, draft => {
+      const pathItems = updater(prevData.pathItems)
+      if (pathItems !== prevData.pathItems) {
+        draft.pathItems = T.castDraft(pathItems)
+      }
+    })
+  )
+}
+
+const setTlfs = (setFsSharedData: SetFsSharedData, updater: (prevTlfs: T.FS.Tlfs) => T.FS.Tlfs) => {
+  setFsSharedData(prevData =>
+    C.produce(prevData, draft => {
+      const tlfs = updater(prevData.tlfs)
+      if (tlfs !== prevData.tlfs) {
+        draft.tlfs = T.castDraft(tlfs)
+      }
+    })
+  )
+}
+
+type ErrorToActionOrThrow = (error: unknown, path?: T.FS.Path) => void
+type SoftErrorSetter = (path: T.FS.Path, softError?: T.FS.SoftError) => void
+
+const loadDownloadInfoAsync = async (
+  downloadID: string,
+  loadingDownloadInfos: Set<string>,
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow
+) => {
+  try {
+    const res = await T.RPCGen.SimpleFSSimpleFSGetDownloadInfoRpcPromise({
+      downloadID,
+    })
+    setDownloadInfos(setFsSharedData, prevDownloadInfos => {
+      const old = prevDownloadInfos.get(downloadID)
+      const nextDownloadInfos = new Map(prevDownloadInfos)
+      nextDownloadInfos.set(downloadID, {
+        filename: res.filename,
+        intent: old?.intent,
+        isRegularDownload: res.isRegularDownload,
+        path: T.FS.stringToPath('/keybase' + res.path.path),
+        startTime: res.startTime,
+      })
+      return nextDownloadInfos
+    })
+  } catch (error) {
+    errorToActionOrThrow(error)
+  } finally {
+    loadingDownloadInfos.delete(downloadID)
+  }
+}
+
+const loadDownloadStatusAsync = async (
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow
+) => {
+  try {
+    const res = await T.RPCGen.SimpleFSSimpleFSGetDownloadStatusRpcPromise()
+    const regularDownloads = [...(res.regularDownloadIDs || [])]
+    const state = new Map(
+      (res.states || []).map(s => [
+        s.downloadID,
+        {
+          canceled: s.canceled,
+          done: s.done,
+          endEstimate: s.endEstimate,
+          error: s.error,
+          localPath: s.localPath,
+          progress: s.progress,
+        },
+      ])
+    )
+    setDownloads(setFsSharedData, {regularDownloads, state})
+  } catch (error) {
+    errorToActionOrThrow(error)
+  }
+}
+
+const loadPathMetadataAsync = async (
+  path: T.FS.Path,
+  loadingPathMetadata: Set<T.FS.Path>,
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow,
+  setPathSoftError: SoftErrorSetter,
+  setTlfSoftError: SoftErrorSetter
+) => {
+  try {
+    const dirent = await T.RPCGen.SimpleFSSimpleFSStatRpcPromise({
+      path: FS.pathToRPCPath(path),
+      refreshSubscription: false,
+    })
+    const pathItem = makeEntry(dirent)
+    setPathItems(setFsSharedData, prevPathItems => {
+      const nextPathItems = new Map(prevPathItems)
+      const oldPathItem = FS.getPathItem(prevPathItems, path)
+      nextPathItems.set(path, updatePathItem(oldPathItem, pathItem))
+      return nextPathItems
+    })
+    setPathSoftError(path)
+    const tlfPath = FS.getTlfPath(path)
+    if (tlfPath) {
+      setTlfSoftError(tlfPath)
+    }
+  } catch (error) {
+    errorToActionOrThrow(error, path)
+  } finally {
+    loadingPathMetadata.delete(path)
+  }
+}
+
+const loadFolderChildrenAsync = async (
+  rootPath: T.FS.Path,
+  initialLoadRecursive: boolean,
+  loadKey: string,
+  loadingFolderChildren: Set<string>,
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow
+) => {
+  try {
+    const opID = makeUUID()
+    if (initialLoadRecursive) {
+      await T.RPCGen.SimpleFSSimpleFSListRecursiveToDepthRpcPromise({
+        depth: 1,
+        filter: T.RPCGen.ListFilter.filterSystemHidden,
+        opID,
+        path: FS.pathToRPCPath(rootPath),
+        refreshSubscription: false,
+      })
+    } else {
+      await T.RPCGen.SimpleFSSimpleFSListRpcPromise({
+        filter: T.RPCGen.ListFilter.filterSystemHidden,
+        opID,
+        path: FS.pathToRPCPath(rootPath),
+        refreshSubscription: false,
+      })
+    }
+
+    await T.RPCGen.SimpleFSSimpleFSWaitRpcPromise({opID})
+    const result = await T.RPCGen.SimpleFSSimpleFSReadListRpcPromise({opID})
+    const entries = result.entries || []
+
+    setPathItems(setFsSharedData, prevPathItems => {
+      const nextPathItems = new Map(prevPathItems)
+      const loadedPathItems = makePathItemsFromDirents({
+        entries,
+        isRecursive: initialLoadRecursive,
+        rootPath,
+        rootPathItem: FS.getPathItem(prevPathItems, rootPath),
+      })
+      loadedPathItems.forEach((pathItemFromAction, path) => {
+        const oldPathItem = FS.getPathItem(nextPathItems, path)
+        const nextPathItem = updatePathItem(oldPathItem, pathItemFromAction)
+        if (oldPathItem.type === T.FS.PathType.Folder) {
+          oldPathItem.children.forEach(name => {
+            if (nextPathItem.type !== T.FS.PathType.Folder || !nextPathItem.children.has(name)) {
+              nextPathItems.delete(T.FS.pathConcat(path, name))
+            }
+          })
+        }
+        nextPathItems.set(path, nextPathItem)
+      })
+      return nextPathItems
+    })
+  } catch (error) {
+    errorToActionOrThrow(error, rootPath)
+  } finally {
+    loadingFolderChildren.delete(loadKey)
+  }
+}
+
+const loadTlfsAsync = async (
+  username: string,
+  loadTlfsInProgressRef: {current: boolean},
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow
+) => {
+  try {
+    const results = await T.RPCGen.SimpleFSSimpleFSListFavoritesRpcPromise()
+    setTlfs(setFsSharedData, prevTlfs => {
+      const nextTlfs = favoritesResultToTlfs(results, username, prevTlfs.additionalTlfs)
+      return isEqual(nextTlfs, prevTlfs) ? prevTlfs : nextTlfs
+    })
+  } catch (error) {
+    errorToActionOrThrow(error)
+  } finally {
+    loadTlfsInProgressRef.current = false
+  }
+}
+
+const loadAdditionalTlfAsync = async (
+  tlfPath: T.FS.Path,
+  username: string,
+  loadingAdditionalTlfs: Set<T.FS.Path>,
+  setFsSharedData: SetFsSharedData,
+  errorToActionOrThrow: ErrorToActionOrThrow
+) => {
+  if (T.FS.getPathLevel(tlfPath) !== 3) {
+    logger.warn('loadAdditionalTlf called on non-TLF path')
+    loadingAdditionalTlfs.delete(tlfPath)
+    return
+  }
+  try {
+    const result = await T.RPCGen.SimpleFSSimpleFSGetFolderRpcPromise({
+      path: FS.pathToRPCPath(tlfPath).kbfs,
+    })
+    const next = folderToTlf({
+      folder: result.folder,
+      isFavorite: result.isFavorite,
+      isIgnored: result.isIgnored,
+      isNew: result.isNew,
+      username,
+    })
+    if (!next) {
+      return
+    }
+    setTlfs(setFsSharedData, prevTlfs => {
+      const additionalTlfs = new Map(prevTlfs.additionalTlfs)
+      additionalTlfs.set(tlfPath, next.tlf)
+      return {
+        ...prevTlfs,
+        additionalTlfs,
+      }
+    })
+  } catch (error) {
+    if (error instanceof RPCError && error.code === T.RPCGen.StatusCode.scteamcontactsettingsblock) {
+      const fields = error.fields as undefined | Array<{key?: string; value?: string}>
+      const users = fields?.filter(elem => elem.key === 'usernames')
+      const usernames = users?.map(elem => elem.value ?? '') ?? []
+      C.Router2.navigateUp()
+      C.Router2.navigateAppend({
+        name: 'contactRestricted',
+        params: {source: 'newFolder', usernames},
+      })
+    }
+    errorToActionOrThrow(error, tlfPath)
+  } finally {
+    loadingAdditionalTlfs.delete(tlfPath)
+  }
+}
+
+export const FsDataProvider = ({
+  children,
+  initialLastModifiedTimestamp,
+  initialPath,
+  initialPathType,
+}: {
+  children: React.ReactNode
+  initialLastModifiedTimestamp?: number
+  initialPath?: T.FS.Path
+  initialPathType?: T.FS.PathType
+}) => {
+  const username = useCurrentUserState(s => s.username)
+  return (
+    <FsDataProviderForUsername
+      key={username}
+      username={username}
+      initialLastModifiedTimestamp={initialLastModifiedTimestamp}
+      initialPath={initialPath}
+      initialPathType={initialPathType}
+    >
+      {children}
+    </FsDataProviderForUsername>
+  )
+}
+
+const FsDataProviderForUsername = ({
+  children,
+  initialLastModifiedTimestamp,
+  initialPath,
+  initialPathType,
+  username,
+}: {
+  children: React.ReactNode
+  initialLastModifiedTimestamp?: number
+  initialPath?: T.FS.Path
+  initialPathType?: T.FS.PathType
+  username: string
+}) => {
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  const {setPathSoftError, setTlfSoftError} = useFsSoftErrorActions()
+  const [fsSharedData, setFsSharedData] = React.useState(() => {
+    if (initialPath && initialPathType === T.FS.PathType.File) {
+      const pathItems = new Map<T.FS.Path, T.FS.PathItem>()
+      pathItems.set(initialPath, {
+        ...FS.emptyFile,
+        lastModifiedTimestamp: initialLastModifiedTimestamp ?? 0,
+        name: T.FS.getPathName(initialPath),
+      })
+      return {...makeEmptyFsSharedData(), pathItems}
+    }
+    return makeEmptyFsSharedData()
+  })
+  const [subscriptionManager] = React.useState<FsSubscriptionManager>(() => ({subscriptions: new Map()}))
+  const seenDownloadIDsRef = React.useRef(new Set<string>())
+  const loadingDownloadInfosRef = React.useRef(new Set<string>())
+  const loadingPathMetadataRef = React.useRef(new Set<T.FS.Path>())
+  const loadingFolderChildrenRef = React.useRef(new Set<string>())
+  // loads asked for while the same load was in flight: each runs once more after it, since what it
+  // was asked for (a change, a new subscription) may have come after the in-flight one read
+  const reloadFolderChildrenRef = React.useRef(new Set<string>())
+  const reloadPathMetadataRef = React.useRef(new Set<T.FS.Path>())
+  const loadingAdditionalTlfsRef = React.useRef(new Set<T.FS.Path>())
+  const loadTlfsInProgressRef = React.useRef(false)
+  const {downloads, downloadInfos, pathItems, tlfs} = fsSharedData
+
+  React.useEffect(() => {
+    return () => {
+      resetFsSubscriptionManager(subscriptionManager)
+    }
+  }, [subscriptionManager])
+
+  React.useEffect(() => {
+    const reloadFolderChildren = reloadFolderChildrenRef.current
+    const reloadPathMetadata = reloadPathMetadataRef.current
+    // a load still in flight when this account's provider goes runs nothing more after it
+    return () => {
+      reloadFolderChildren.clear()
+      reloadPathMetadata.clear()
+    }
+  }, [])
+
+  const loadDownloadInfo = (downloadID: string) => {
+    const loadingDownloadInfos = loadingDownloadInfosRef.current
+    if (loadingDownloadInfos.has(downloadID)) {
+      return
+    }
+    loadingDownloadInfos.add(downloadID)
+    C.ignorePromise(
+      loadDownloadInfoAsync(downloadID, loadingDownloadInfos, setFsSharedData, errorToActionOrThrow)
+    )
+  }
+
+  const recordDownloadStarted = (downloadID: string, path: T.FS.Path, type: DownloadStartType) => {
+    const downloadIntent = downloadIntentFromStartType(type)
+    setDownloadInfos(setFsSharedData, prevDownloadInfos => {
+      const old = prevDownloadInfos.get(downloadID)
+      const nextDownloadInfos = new Map(prevDownloadInfos)
+      nextDownloadInfos.set(downloadID, {
+        filename: old?.filename ?? T.FS.getPathName(path),
+        intent: downloadIntent ?? old?.intent,
+        isRegularDownload: type === 'download',
+        path,
+        startTime: old?.startTime ?? 0,
+      })
+      return nextDownloadInfos
+    })
+  }
+
+  const loadMissingDownloadInfo = React.useEffectEvent((downloadID: string) => {
+    if (!downloadInfos.has(downloadID)) {
+      loadDownloadInfo(downloadID)
+    }
+  })
+  React.useEffect(() => {
+    const activeDownloadIDs = [...downloads.state.keys()]
+    const activeDownloadIDSet = new Set(activeDownloadIDs)
+    const seenDownloadIDs = seenDownloadIDsRef.current
+    setDownloadInfos(setFsSharedData, prevDownloadInfos => {
+      let nextDownloadInfos: Map<string, T.FS.DownloadInfo> | undefined
+      prevDownloadInfos.forEach((_, downloadID) => {
+        if (activeDownloadIDSet.has(downloadID) || !seenDownloadIDs.has(downloadID)) {
+          return
+        }
+        if (nextDownloadInfos === undefined) {
+          nextDownloadInfos = new Map(prevDownloadInfos)
+        }
+        nextDownloadInfos.delete(downloadID)
+        seenDownloadIDs.delete(downloadID)
+      })
+      return nextDownloadInfos ?? prevDownloadInfos
+    })
+    activeDownloadIDs.forEach(downloadID => {
+      seenDownloadIDs.add(downloadID)
+    })
+    activeDownloadIDs.forEach(loadMissingDownloadInfo)
+  }, [downloads.state])
+
+  const loadDownloadStatus = () => {
+    C.ignorePromise(loadDownloadStatusAsync(setFsSharedData, errorToActionOrThrow))
+  }
+
+  const loadPathMetadata = (path: T.FS.Path) => {
+    const loadingPathMetadata = loadingPathMetadataRef.current
+    const reload = reloadPathMetadataRef.current
+    if (loadingPathMetadata.has(path)) {
+      reload.add(path)
+      return
+    }
+    loadingPathMetadata.add(path)
+    const load = loadPathMetadataAsync(
+      path,
+      loadingPathMetadata,
+      setFsSharedData,
+      errorToActionOrThrow,
+      setPathSoftError,
+      setTlfSoftError
+    )
+    C.ignorePromise(
+      load.finally(() => {
+        if (reload.delete(path)) {
+          loadPathMetadata(path)
+        }
+      })
+    )
+  }
+
+  const loadFolderChildren = (rootPath: T.FS.Path, initialLoadRecursive: boolean) => {
+    const loadKey = `${rootPath}:${initialLoadRecursive ? 'recursive' : 'shallow'}`
+    const loadingFolderChildren = loadingFolderChildrenRef.current
+    const reload = reloadFolderChildrenRef.current
+    if (loadingFolderChildren.has(loadKey)) {
+      reload.add(loadKey)
+      return
+    }
+    loadingFolderChildren.add(loadKey)
+    const load = loadFolderChildrenAsync(
+      rootPath,
+      initialLoadRecursive,
+      loadKey,
+      loadingFolderChildren,
+      setFsSharedData,
+      errorToActionOrThrow
+    )
+    C.ignorePromise(
+      load.finally(() => {
+        if (reload.delete(loadKey)) {
+          loadFolderChildren(rootPath, initialLoadRecursive)
+        }
+      })
+    )
+  }
+
+  const loadTlfs = () => {
+    if (loadTlfsInProgressRef.current) {
+      return
+    }
+    loadTlfsInProgressRef.current = true
+    C.ignorePromise(loadTlfsAsync(username, loadTlfsInProgressRef, setFsSharedData, errorToActionOrThrow))
+  }
+
+  const loadAdditionalTlf = (tlfPath: T.FS.Path) => {
+    const loadingAdditionalTlfs = loadingAdditionalTlfsRef.current
+    if (loadingAdditionalTlfs.has(tlfPath)) {
+      return
+    }
+    loadingAdditionalTlfs.add(tlfPath)
+    C.ignorePromise(
+      loadAdditionalTlfAsync(tlfPath, username, loadingAdditionalTlfs, setFsSharedData, errorToActionOrThrow)
+    )
+  }
+
+  return (
+    <FsDataContext
+      value={{
+        downloads,
+        downloadInfos,
+        loadAdditionalTlf,
+        loadDownloadInfo,
+        loadDownloadStatus,
+        loadFolderChildren,
+        loadPathMetadata,
+        loadTlfs,
+        pathItems,
+        recordDownloadStarted,
+        subscriptionManager,
+        tlfs,
+      }}
+    >
+      {children}
+    </FsDataContext>
+  )
+}
+
+const useFsLoadOnMountAndFocus = ({
+  enabled = true,
+  load,
+  reloadKey,
+}: {
+  enabled?: boolean
+  load: () => void
+  reloadKey?: unknown
+}) => {
+  const connected = useKbfsDaemonStatus().rpcStatus === T.FS.KbfsDaemonRpcStatus.Connected
+  const focused = useSafeIsFocused()
+  const lastLoadRef = React.useRef<{reloadKey?: unknown; time: number}>({time: 0})
+  const loadOnMountAndFocus = React.useEffectEvent(() => {
+    if (!connected || !enabled || !focused) {
+      return
+    }
+    const now = Date.now()
+    const lastLoad = lastLoadRef.current
+    if (Object.is(lastLoad.reloadKey, reloadKey) && now - lastLoad.time < 250) {
+      return
+    }
+    lastLoadRef.current = {reloadKey, time: now}
+    load()
+  })
+  const [stableLoadOnMountAndFocus] = React.useState(() => () => loadOnMountAndFocus())
+  React.useEffect(() => {
+    if (connected && enabled && focused) {
+      loadOnMountAndFocus()
+    }
+  }, [connected, enabled, focused, reloadKey])
+  C.Router2.useSafeFocusEffect(stableLoadOnMountAndFocus)
+}
+
+const subscriptionUnsubscribeDelayMs = 1000
+
+const cancelScheduledSubscriptionUnsubscribe = (subscription: FsSubscription) => {
+  if (!subscription.unsubscribeTimer) {
+    return
+  }
+  clearTimeout(subscription.unsubscribeTimer)
+  delete subscription.unsubscribeTimer
+}
+
+const scheduleFsSubscriptionUnsubscribeIfUnused = (
+  manager: FsSubscriptionManager,
+  subscriptionKey: string,
+  subscription: FsSubscription
+) => {
+  if (subscription.count > 0 || subscription.unsubscribeTimer) {
+    return
+  }
+  if (!subscription.subscribed) {
+    return
+  }
+  subscription.unsubscribeTimer = setTimeout(() => {
+    const currentSubscription = manager.subscriptions.get(subscriptionKey)
+    if (
+      currentSubscription !== subscription ||
+      currentSubscription.count > 0 ||
+      !currentSubscription.subscribed
+    ) {
+      return
+    }
+    manager.subscriptions.delete(subscriptionKey)
+    unsubscribeFsSubscription(subscription.subscriptionID)
+  }, subscriptionUnsubscribeDelayMs)
+}
+
+const releaseFsSubscription = (
+  manager: FsSubscriptionManager,
+  subscriptionKey: string,
+  subscription: FsSubscription
+) => {
+  subscription.count--
+  scheduleFsSubscriptionUnsubscribeIfUnused(manager, subscriptionKey, subscription)
+}
+
+const useFsSubscriptionEffect = ({
+  enabled = true,
+  errorPath,
+  onSubscribed,
+  subscribe,
+  subscriptionKey,
+}: {
+  enabled?: boolean
+  errorPath?: T.FS.Path
+  // called once the service holds the subscription and it is still wanted: a change made before
+  // then sent no notification, so whatever was loaded before it is reloaded here
+  onSubscribed?: () => void
+  subscribe: (subscriptionID: string) => Promise<unknown>
+  subscriptionKey: string
+}) => {
+  const connected = useKbfsDaemonStatus().rpcStatus === T.FS.KbfsDaemonRpcStatus.Connected
+  const routeData = React.useContext(FsDataContext)
+  const username = useCurrentUserState(s => s.username)
+  const subscriptionManager = routeData?.subscriptionManager
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  const onError = React.useEffectEvent((error: unknown) => {
+    errorToActionOrThrow(error, errorPath)
+  })
+  const subscribeEvent = React.useEffectEvent(subscribe)
+  const onSubscribedEvent = React.useEffectEvent(() => onSubscribed?.())
+  React.useEffect(() => {
+    if (!connected || !enabled) {
+      return
+    }
+
+    const manager = subscriptionManager
+    if (manager) {
+      const existingSubscription = manager.subscriptions.get(subscriptionKey)
+      if (existingSubscription) {
+        cancelScheduledSubscriptionUnsubscribe(existingSubscription)
+        existingSubscription.count++
+        return () => {
+          const currentSubscription = manager.subscriptions.get(subscriptionKey)
+          if (currentSubscription !== existingSubscription) {
+            return
+          }
+          releaseFsSubscription(manager, subscriptionKey, currentSubscription)
+        }
+      }
+    }
+
+    const subscriptionID = makeUUID()
+    const subscription = {count: 1, subscribed: false, subscriptionID}
+    manager?.subscriptions.set(subscriptionKey, subscription)
+    const removeSubscription = () => {
+      if (manager?.subscriptions.get(subscriptionKey) === subscription) {
+        manager.subscriptions.delete(subscriptionKey)
+      }
+    }
+    const f = async () => {
+      try {
+        const subscribed = await subscribeEvent(subscriptionID)
+        if (subscribed === false) {
+          removeSubscription()
+          return
+        }
+        subscription.subscribed = true
+        if (!manager) {
+          if (subscription.count === 0) {
+            unsubscribeFsSubscription(subscriptionID)
+          }
+          return
+        }
+        if (manager.subscriptions.get(subscriptionKey) !== subscription) {
+          unsubscribeFsSubscription(subscriptionID)
+          return
+        }
+        scheduleFsSubscriptionUnsubscribeIfUnused(manager, subscriptionKey, subscription)
+        if (subscription.count > 0) {
+          onSubscribedEvent()
+        }
+      } catch (error) {
+        removeSubscription()
+        onError(error)
+      }
+    }
+    C.ignorePromise(f())
+    return () => {
+      if (!manager) {
+        subscription.count--
+        if (subscription.subscribed) {
+          unsubscribeFsSubscription(subscriptionID)
+        }
+        return
+      }
+      const currentSubscription = manager.subscriptions.get(subscriptionKey)
+      if (currentSubscription !== subscription) {
+        return
+      }
+      releaseFsSubscription(manager, subscriptionKey, currentSubscription)
+    }
+  }, [connected, enabled, errorPath, subscriptionKey, subscriptionManager, username])
+}
+
+const useFsPathSubscriptionEffect = (
+  path: T.FS.Path,
+  topic: T.RPCGen.PathSubscriptionTopic,
+  enabled: boolean,
+  onSubscribed: () => void
+) => {
+  const pathString = T.FS.pathToString(path)
+  useFsSubscriptionEffect({
+    enabled: enabled && T.FS.getPathLevel(path) >= 3,
+    errorPath: path,
+    onSubscribed,
+    subscribe: async subscriptionID => {
+      try {
+        await T.RPCGen.SimpleFSSimpleFSSubscribePathRpcPromise({
+          clientID: fsClientID,
+          deduplicateIntervalSecond: 1,
+          identifyBehavior: T.RPCGen.TLFIdentifyBehavior.fsGui,
+          kbfsPath: pathString,
+          subscriptionID,
+          topic,
+        })
+        return true
+      } catch (error) {
+        if (!(error instanceof RPCError)) {
+          throw error
+        }
+        if (error.code !== T.RPCGen.StatusCode.scteamcontactsettingsblock) {
+          throw error
+        }
+        return false
+      }
+    },
+    subscriptionKey: `path:${pathString}:${topic}`,
+  })
+}
+
+type FsPathItemOptions = {
+  loadOnMount?: boolean
+  subscribe?: boolean
+}
+
+const useFsNonPathSubscriptionEffect = (topic: T.RPCGen.SubscriptionTopic, enabled = true) => {
+  useFsSubscriptionEffect({
+    enabled,
+    subscribe: async subscriptionID => {
+      await T.RPCGen.SimpleFSSimpleFSSubscribeNonPathRpcPromise({
+        clientID: fsClientID,
+        deduplicateIntervalSecond: 1,
+        identifyBehavior: T.RPCGen.TLFIdentifyBehavior.fsGui,
+        subscriptionID,
+        topic,
+      })
+    },
+    subscriptionKey: `nonpath:${topic}`,
+  })
+}
+
+const useLoadedPathItems = () => {
+  const routeData = React.useContext(FsDataContext)
+  return routeData?.pathItems ?? emptyPathItems
+}
+
+const useLoadedTlfs = () => {
+  const routeData = React.useContext(FsDataContext)
+  return routeData?.tlfs ?? emptyTlfs
+}
+
+export const useFsLoadedPathItems = () => useLoadedPathItems()
+
+export const useFsReloadTlfs = () => {
+  const routeData = React.useContext(FsDataContext)
+  return () => {
+    routeData?.loadTlfs()
+  }
+}
+
+export const useFsRefreshTlf = (path: T.FS.Path) => {
+  const routeData = React.useContext(FsDataContext)
+  const tlfs = useLoadedTlfs()
+  const tlfPath = FS.getTlfPath(path)
+  return () => {
+    if (!routeData || !tlfPath) {
+      return
+    }
+    if (FS.getTlfFromPathInFavoritesOnly(tlfs, tlfPath) !== FS.unknownTlf) {
+      routeData.loadTlfs()
+      return
+    }
+    routeData.loadAdditionalTlf(tlfPath)
+  }
+}
+
+export const useFsPathItem = (path: T.FS.Path, _options?: FsPathItemOptions) =>
+  FS.getPathItem(useLoadedPathItems(), path)
+
+export const useFsPathMetadata = (path: T.FS.Path, _options?: FsPathItemOptions) =>
+  useFsPathItem(path)
+
+export const useFsFolderChildren = (path: T.FS.Path, _options?: {initialLoadRecursive?: boolean}) =>
+  FS.getPathItem(useLoadedPathItems(), path)
+
+export const useFsFolderChildItems = (
+  path: T.FS.Path,
+  options?: {
+    initialLoadRecursive?: boolean
+  }
+) => {
+  const pathItem = useFsFolderChildren(path, options)
+  const pathItems = useLoadedPathItems()
+  const childPaths =
+    pathItem.type === T.FS.PathType.Folder
+      ? [...pathItem.children].map(name => T.FS.pathConcat(path, name))
+      : []
+  const childItems = childPaths.map(childPath => FS.getPathItem(pathItems, childPath))
+  return {childItems, childPaths, pathItem}
+}
+
+export const useFsTlfs = () => useLoadedTlfs()
+
+export const useFsScreenCoordinator = (path: T.FS.Path) => {
+  const routeData = React.useContext(FsDataContext)
+  const focused = useSafeIsFocused()
+  const pathIsItem = isPathItem(path)
+  const pathItem = useFsPathItem(path)
+  const isFile = pathItem.type === T.FS.PathType.File
+  const isMaybeFolder = !isFile
+
+  useFsPathSubscriptionEffect(path, T.RPCGen.PathSubscriptionTopic.stat, focused && pathIsItem, () =>
+    routeData?.loadPathMetadata(path)
+  )
+  useFsPathSubscriptionEffect(
+    path,
+    T.RPCGen.PathSubscriptionTopic.children,
+    focused && pathIsItem && isMaybeFolder,
+    () => routeData?.loadFolderChildren(path, true)
+  )
+  useFsNonPathSubscriptionEffect(T.RPCGen.SubscriptionTopic.favorites, focused)
+
+  useEngineActionListener(
+    'keybase.1.NotifyFS.FSSubscriptionNotifyPath',
+    action => {
+      const {clientID, path: updatedPath, topics} = action.payload.params
+      if (clientID !== fsClientID || updatedPath !== T.FS.pathToString(path)) {
+        return
+      }
+      if (isMaybeFolder && topics?.includes(T.RPCGen.PathSubscriptionTopic.children)) {
+        routeData?.loadFolderChildren(path, true)
+      }
+      if (topics?.includes(T.RPCGen.PathSubscriptionTopic.stat)) {
+        routeData?.loadPathMetadata(path)
+      }
+    },
+    focused && pathIsItem
+  )
+
+  useEngineActionListener(
+    'keybase.1.NotifyFS.FSSubscriptionNotify',
+    action => {
+      const {clientID, topic} = action.payload.params
+      if (clientID === fsClientID && topic === T.RPCGen.SubscriptionTopic.favorites) {
+        routeData?.loadTlfs()
+      }
+    },
+    focused
+  )
+
+  useFsLoadOnMountAndFocus({
+    enabled: !!routeData,
+    load: () => routeData?.loadTlfs(),
+  })
+
+  useFsLoadOnMountAndFocus({
+    enabled: pathIsItem && !!routeData && isMaybeFolder,
+    load: () => routeData?.loadFolderChildren(path, true),
+    reloadKey: path,
+  })
+
+  useFsLoadOnMountAndFocus({
+    enabled: pathIsItem && !!routeData,
+    load: () => routeData?.loadPathMetadata(path),
+    reloadKey: path,
+  })
+}
+
+// The path-item-action menu shows stat info and children counts for its target
+// path, which the screen coordinator may never load (e.g. a TLF row at the
+// Files tab root), so the menu triggers its own loads while open.
+export const useFsLoadPathItemInfoOnMount = (path: T.FS.Path) => {
+  const routeData = React.useContext(FsDataContext)
+  const pathItem = useFsPathItem(path)
+  const pathIsItem = isPathItem(path)
+  // Only load children once the item is known to be a folder (TLF-level paths
+  // are always folders); the metadata load above flips the type and re-enables
+  // this. Loading eagerly on Unknown would fire a bogus list RPC on files.
+  const isFolder = FS.isFolder(path, pathItem)
+  useFsLoadOnMountAndFocus({
+    enabled: pathIsItem && !!routeData,
+    load: () => routeData?.loadPathMetadata(path),
+    reloadKey: path,
+  })
+  useFsLoadOnMountAndFocus({
+    enabled: pathIsItem && isFolder && !!routeData,
+    load: () => routeData?.loadFolderChildren(path, false),
+    reloadKey: path,
+  })
+}
+
+export const useFsTlf = (path: T.FS.Path, options?: {loadOnMount?: boolean}) => {
+  const routeData = React.useContext(FsDataContext)
+  const tlfPath = FS.getTlfPath(path)
+  const tlfs = useFsTlfs()
+  const tlf = FS.getTlfFromPath(tlfs, path)
+  const loadAdditionalTlf = routeData?.loadAdditionalTlf
+  const focused = useSafeIsFocused()
+  const tlfPathToLoad =
+    tlfPath &&
+    tlfs.loaded &&
+    FS.getTlfFromPathInFavoritesOnly(tlfs, tlfPath) === FS.unknownTlf &&
+    options?.loadOnMount !== false
+      ? tlfPath
+      : undefined
+  const active = focused && !!loadAdditionalTlf && !!tlfPathToLoad
+  const loadCurrentTlf = React.useEffectEvent(() => {
+    if (loadAdditionalTlf && tlfPathToLoad) {
+      loadAdditionalTlf(tlfPathToLoad)
+    }
+  })
+  const [stableLoadCurrentTlf] = React.useState(() => () => loadCurrentTlf())
+  Kb.useInterval(
+    () => {
+      loadCurrentTlf()
+    },
+    active ? 10000 : undefined
+  )
+  React.useEffect(() => {
+    loadCurrentTlf()
+  }, [active, tlfPathToLoad])
+  C.Router2.useSafeFocusEffect(stableLoadCurrentTlf)
+  return tlf
+}
+
+export const useFsOnlineStatus = () => {
+  const {onlineStatusChanged} = useFsDaemonActions()
+  const focused = useSafeIsFocused()
+  const loadOnlineStatus = React.useEffectEvent((retries: number) => {
+    const checkOnlineStatus = async (remainingRetries: number): Promise<void> => {
+      try {
+        const onlineStatus = await T.RPCGen.SimpleFSSimpleFSGetOnlineStatusRpcPromise({
+          clientID: fsClientID,
+        })
+        onlineStatusChanged(onlineStatus)
+      } catch (error) {
+        if (remainingRetries > 0) {
+          logger.warn(
+            `failed to check if we are connected to MDServer: ${String(error)}; n=${remainingRetries}`
+          )
+          await C.timeoutPromise(2000)
+          return checkOnlineStatus(remainingRetries - 1)
+        }
+        logger.warn(
+          `failed to check if we are connected to MDServer : ${String(error)}; n=${remainingRetries}, throwing`
+        )
+        throw error
+      }
+    }
+    C.ignorePromise(checkOnlineStatus(retries))
+  })
+  useFsNonPathSubscriptionEffect(T.RPCGen.SubscriptionTopic.onlineStatus)
+  useEngineActionListener(
+    'keybase.1.NotifyFS.FSSubscriptionNotify',
+    action => {
+      const {clientID, topic} = action.payload.params
+      if (clientID === fsClientID && topic === T.RPCGen.SubscriptionTopic.onlineStatus) {
+        loadOnlineStatus(1)
+      }
+    },
+    focused
+  )
+  useFsLoadOnMountAndFocus({
+    load: () => loadOnlineStatus(2),
+  })
+}
+
+export const useFsPathInfo = (path: T.FS.Path, knownPathInfo = FS.emptyPathInfo): T.FS.PathInfo => {
+  const alreadyKnown = knownPathInfo !== FS.emptyPathInfo
+  const pathInfoVersionRef = React.useRef(0)
+  const [pathInfoState, setPathInfoState] = React.useState<{
+    path: T.FS.Path
+    pathInfo: T.FS.PathInfo
+  }>(() => ({path, pathInfo: alreadyKnown ? knownPathInfo : FS.emptyPathInfo}))
+  React.useEffect(() => {
+    if (alreadyKnown) {
+      pathInfoVersionRef.current += 1
+    }
+  }, [alreadyKnown, knownPathInfo, path])
+  useFsLoadOnMountAndFocus({
+    enabled: !alreadyKnown,
+    load: () => {
+      const version = ++pathInfoVersionRef.current
+      const requestPath = path
+      const f = async () => {
+        const nextPathInfo = await T.RPCGen.kbfsMountGetKBFSPathInfoRpcPromise({
+          standardPath: T.FS.pathToString(requestPath),
+        })
+        if (pathInfoVersionRef.current !== version) {
+          return
+        }
+        setPathInfoState({
+          path: requestPath,
+          pathInfo: {
+            deeplinkPath: nextPathInfo.deeplinkPath,
+            platformAfterMountPath: nextPathInfo.platformAfterMountPath,
+          },
+        })
+      }
+      C.ignorePromise(f())
+    },
+    reloadKey: path,
+  })
+  return alreadyKnown
+    ? knownPathInfo
+    : pathInfoState.path === path
+      ? pathInfoState.pathInfo
+      : FS.emptyPathInfo
+}
+
+export const useFsSoftError = (path: T.FS.Path): T.FS.SoftError | undefined => {
+  const softErrors = useFsSoftErrors()
+  return softErrors ? FS.getSoftError(softErrors, path) : undefined
+}
+
+export const useFsDownloadInfo = (downloadID: string): T.FS.DownloadInfo => {
+  const routeData = React.useContext(FsDataContext)
+  const info = routeData?.downloadInfos.get(downloadID) || FS.emptyDownloadInfo
+  useFsLoadOnMountAndFocus({
+    enabled: !!downloadID && !!routeData,
+    load: () => routeData?.loadDownloadInfo(downloadID),
+    reloadKey: downloadID,
+  })
+  return info
+}
+
+export const useFsDownloadIntent = (path: T.FS.Path): T.FS.DownloadIntent | undefined => {
+  const routeData = React.useContext(FsDataContext)
+  return routeData ? FS.getDownloadIntent(path, routeData.downloadInfos, routeData.downloads.state) : undefined
+}
+
+export const useFsDownloadStatus = () => {
+  const routeData = React.useContext(FsDataContext)
+  const loadDownloadStatus = routeData?.loadDownloadStatus
+  const focused = useSafeIsFocused()
+  useFsNonPathSubscriptionEffect(T.RPCGen.SubscriptionTopic.downloadStatus, !!loadDownloadStatus)
+  useEngineActionListener(
+    'keybase.1.NotifyFS.FSSubscriptionNotify',
+    action => {
+      const {clientID, topic} = action.payload.params
+      if (clientID === fsClientID && topic === T.RPCGen.SubscriptionTopic.downloadStatus) {
+        loadDownloadStatus?.()
+      }
+    },
+    !!loadDownloadStatus && focused
+  )
+  useFsLoadOnMountAndFocus({
+    enabled: !!loadDownloadStatus,
+    load: () => loadDownloadStatus?.(),
+  })
+  return routeData?.downloads ?? emptyDownloads
+}
+
+export const useFsDownloadState = (downloadID: string) => {
+  const routeData = React.useContext(FsDataContext)
+  return routeData?.downloads.state.get(downloadID) || FS.emptyDownloadState
+}
+
+export const useFsDownload = () => {
+  const routeData = React.useContext(FsDataContext)
+  return (
+    path: T.FS.Path,
+    type: DownloadStartType,
+    onStarted?: (downloadID: string, downloadIntent?: T.FS.DownloadIntent) => void
+  ) => {
+    const f = async () => {
+      await requestPermissionsToWrite()
+      const downloadID = await T.RPCGen.SimpleFSSimpleFSStartDownloadRpcPromise({
+        isRegularDownload: type === 'download',
+        path: FS.pathToRPCPath(path).kbfs,
+      })
+      const downloadIntent = downloadIntentFromStartType(type)
+      routeData?.recordDownloadStarted(downloadID, path, type)
+      onStarted?.(downloadID, downloadIntent)
+    }
+    C.ignorePromise(f())
+  }
+}
+
+export const useFsCancelDownload = () => {
+  return (downloadID: string) => {
+    const f = async () => {
+      await T.RPCGen.SimpleFSSimpleFSCancelDownloadRpcPromise({downloadID})
+    }
+    C.ignorePromise(f())
+  }
+}
+
+export const useFsDismissDownload = () => {
+  return (downloadID: string) => {
+    const f = async () => {
+      await T.RPCGen.SimpleFSSimpleFSDismissDownloadRpcPromise({downloadID})
+    }
+    C.ignorePromise(f())
+  }
+}
+
+export const useFsUpload = () => {
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  return (parentPath: T.FS.Path, localPath: string) => {
+    const f = async () => {
+      try {
+        await T.RPCGen.SimpleFSSimpleFSStartUploadRpcPromise({
+          sourceLocalPath: T.FS.getNormalizedLocalPath(localPath),
+          targetParentPath: FS.pathToRPCPath(parentPath).kbfs,
+        })
+      } catch (error) {
+        errorToActionOrThrow(error, parentPath)
+      }
+    }
+    C.ignorePromise(f())
+  }
+}
+
+export const useFsDismissUpload = () => {
+  return (uploadID: string) => {
+    const f = async () => {
+      try {
+        await T.RPCGen.SimpleFSSimpleFSDismissUploadRpcPromise({uploadID})
+      } catch {}
+    }
+    C.ignorePromise(f())
+  }
+}
+
+export const useFsFileContext = (
+  path: T.FS.Path
+): {
+  fileContext: T.FS.FileContext
+  onUrlError: React.Dispatch<React.SetStateAction<string>>
+  pathItem: T.FS.PathItem
+} => {
+  const pathItem = useFsPathItem(path)
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  const fileContextVersionRef = React.useRef(0)
+  const [urlError, setUrlError] = React.useState('')
+  const reloadKey = `${path}:${pathItem.type}:${urlError}`
+  const [fileContextState, setFileContextState] = React.useState<{
+    fileContext: T.FS.FileContext
+    reloadKey: string
+  }>(() => ({
+    fileContext: FS.emptyFileContext,
+    reloadKey,
+  }))
+  const fileContext =
+    fileContextState.reloadKey === reloadKey ? fileContextState.fileContext : FS.emptyFileContext
+  React.useEffect(() => {
+    if (pathItem.type !== T.FS.PathType.File) {
+      fileContextVersionRef.current += 1
+    }
+  }, [pathItem.type, reloadKey])
+  useFsLoadOnMountAndFocus({
+    enabled: pathItem.type === T.FS.PathType.File,
+    load: () => {
+      const version = ++fileContextVersionRef.current
+      const requestReloadKey = reloadKey
+      const f = async () => {
+        try {
+          if (urlError) {
+            logger.info(`urlError: ${urlError}`)
+          }
+          const res = await T.RPCGen.SimpleFSSimpleFSGetGUIFileContextRpcPromise({
+            path: FS.pathToRPCPath(path).kbfs,
+          })
+          if (fileContextVersionRef.current !== version) {
+            return
+          }
+          setFileContextState({
+            fileContext: {
+              contentType: res.contentType,
+              url: res.url,
+              viewType: res.viewType,
+            },
+            reloadKey: requestReloadKey,
+          })
+        } catch (err) {
+          if (fileContextVersionRef.current !== version) {
+            return
+          }
+          errorToActionOrThrow(err)
+        }
+      }
+      C.ignorePromise(f())
+    },
+    reloadKey,
+  })
+  return {
+    fileContext,
+    onUrlError: setUrlError,
+    pathItem,
+  }
+}
+
+export const useFsWatchDownloadForMobile = isMobile
+  ? (downloadID: string, downloadIntent?: T.FS.DownloadIntent): boolean => {
+      const dlInfo = useFsDownloadInfo(downloadID)
+      const {fileContext} = useFsFileContext(dlInfo.path)
+      const {redbar} = useFsRedbarActions()
+      const errorToActionOrThrow = useFsErrorActionOrThrow()
+      const dismissDownload = useFsDismissDownload()
+
+      const dlState = useFsDownloadState(downloadID)
+      const finished = dlState !== FS.emptyDownloadState && !FS.downloadIsOngoing(dlState)
+      const mimeType = fileContext.contentType
+
+      const [justDoneWithIntent, setJustDoneWithIntent] = React.useState(false)
+      const handledIntentKeyRef = React.useRef<string>('')
+
+      React.useEffect(() => {
+        setJustDoneWithIntent(false)
+      }, [downloadID, downloadIntent])
+
+      React.useEffect(() => {
+        if (!downloadID || downloadIntent === undefined || !finished || !mimeType) {
+          setJustDoneWithIntent(false)
+          return
+        }
+        const handledIntentKey = `${downloadID}:${downloadIntent}`
+        if (handledIntentKeyRef.current === handledIntentKey) {
+          return
+        }
+        const f = async () => {
+          if (downloadIntent === T.FS.DownloadIntent.None) {
+            await saveFinishedDownloadToPublicDownloads(downloadID, dlState, dlInfo, mimeType, redbar)
+            handledIntentKeyRef.current = handledIntentKey
+            return
+          }
+          // Both failure paths below report done the way the success path does.
+          // Without it the download sits in the footer with nothing left to
+          // dismiss it, and whoever is waiting on the intent never hears back --
+          // for a share that means a popup left mounted and permanently hidden.
+          if (dlState.error) {
+            handledIntentKeyRef.current = handledIntentKey
+            redbar(dlState.error)
+            dismissDownload(downloadID)
+            setJustDoneWithIntent(true)
+            return
+          }
+          try {
+            await finishedDownloadWithIntentInPlatform(dlState, downloadIntent, mimeType)
+            handledIntentKeyRef.current = handledIntentKey
+            dismissDownload(downloadID)
+            setJustDoneWithIntent(true)
+          } catch (err) {
+            handledIntentKeyRef.current = handledIntentKey
+            dismissDownload(downloadID)
+            setJustDoneWithIntent(true)
+            errorToActionOrThrow(err)
+          }
+        }
+        C.ignorePromise(f())
+      }, [
+        dismissDownload,
+        dlInfo,
+        dlState,
+        errorToActionOrThrow,
+        finished,
+        mimeType,
+        downloadID,
+        downloadIntent,
+        redbar,
+      ])
+      return justDoneWithIntent
+    }
+  : () => false
+
+export const useFuseClosedSourceConsent = (disabled: boolean, invert = false) => {
+  const theme = Kb.Styles.useTheme()
+  const [agreed, setAgreed] = React.useState(false)
+
+  const component = C.isDarwin ? (
+    <Kb.Checkbox
+      disabled={disabled}
+      checked={agreed}
+      onCheck={(v: boolean) => setAgreed(v)}
+      checkboxStyle={invert ? {backgroundColor: theme.white} : undefined}
+      checkboxColor={invert ? theme.black : undefined}
+      labelComponent={
+        <Kb.Text
+          type="BodySmall"
+          style={invert ? {color: theme.white} : undefined}
+          onClick={() => setAgreed(a => !a)}
+        >
+          {`I understand that a closed-source kernel extension (FUSE for macOS) will be installed.`}
+        </Kb.Text>
+      }
+    />
+  ) : undefined
+
+  return {
+    canContinue: !C.isDarwin || agreed,
+    component,
+  }
+}

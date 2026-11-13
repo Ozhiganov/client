@@ -1,0 +1,107 @@
+import * as Kb from '@/common-adapters'
+import type * as T from '@/constants/types'
+import {e164ToDisplay} from '@/util/phone-numbers'
+
+export type Props = {
+  username: string
+  service: T.TB.ServiceIdWithContact
+  tooltip: string
+  onRemove: () => void
+}
+
+const removeSize = isMobile ? 22 : 16
+
+const UserBubble = (props: Props) => {
+  const styles = useStyles()
+  const isKeybase = props.service === 'keybase'
+  let {username} = props
+  let title = !isKeybase ? `${props.username}@${props.service}` : undefined
+  if (!isKeybase) {
+    // Show placeholder avatar instead of an icon
+    username = 'invalidusernameforplaceholderavatar'
+    if (props.service === 'phone') {
+      // Username is the assertion username here (E164 without '+'), add '+' to
+      // obtain a valid number for formatting.
+      title = e164ToDisplay('+' + props.username)
+    }
+  }
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" className="hover-container" relative={true} style={styles.bubbleContainer}>
+      <Kb.WithTooltip tooltip={props.tooltip} position="top center">
+        <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.bubble}>
+          <Kb.NameWithIcon
+            colorFollowing={true}
+            hideFollowingOverlay={true}
+            horizontal={false}
+            size="smaller"
+            // Display `username` for Keybase users for linking to profile pages
+            // and for follow. Display `title` for non-Keybase users that always
+            // stay gray and is not a link.
+            username={username}
+            title={title}
+            titleStyle={styles.userBubbleTitle}
+          />
+        </Kb.Box2>
+        <Kb.Box2 alignSelf="center" direction="horizontal" className="hover-visible" alignItems="center" style={styles.remove} justifyContent="center">
+          <RemoveBubble onRemove={props.onRemove} />
+        </Kb.Box2>
+      </Kb.WithTooltip>
+    </Kb.Box2>
+  )
+}
+
+const RemoveBubble = ({onRemove}: {onRemove: () => void}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  return (
+    <Kb.ClickableBox alignSelf="center" onClick={onRemove} direction="vertical">
+      <Kb.Icon
+        type="iconfont-close"
+        color={theme.black_50_on_white}
+        fontSize={isMobile ? 14 : 12}
+        style={styles.removeIcon}
+        className="hover_color_black"
+      />
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      bubble: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.marginH(Kb.Styles.globalMargins.tiny),
+        },
+        isElectron: {
+          flexShrink: 1,
+        },
+      }),
+      bubbleContainer: Kb.Styles.platformStyles({isMobile: {width: 91}}),
+      // TODO: the service icons are too high without this - are they right?
+      remove: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.white,
+          borderRadius: 100,
+          ...Kb.Styles.size(removeSize),
+          position: 'absolute',
+          top: 0,
+        },
+        isElectron: {
+          cursor: 'pointer',
+          marginRight: Kb.Styles.globalMargins.tiny,
+          right: -4,
+        },
+        isMobile: {
+          right: 12,
+        },
+      }),
+      removeIcon: {
+        position: 'relative',
+        top: 1,
+      },
+      userBubbleTitle: {color: theme.black},
+    }) as const
+)
+
+export default UserBubble

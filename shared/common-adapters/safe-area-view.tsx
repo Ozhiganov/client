@@ -1,0 +1,38 @@
+import {View} from 'react-native'
+import {SafeAreaView, useSafeAreaInsets as useSafeAreaInsetsNative} from 'react-native-safe-area-context'
+import * as Styles from '@/styles'
+import type * as React from 'react'
+import type {StylesCrossPlatform} from '@/styles'
+
+type Props = {
+  children?: React.ReactNode
+  style?: StylesCrossPlatform
+  edges?: ReadonlyArray<'top' | 'right' | 'bottom' | 'left'>
+}
+
+const SafeAreaViewTopNative = (p: Props) => {
+  const nativeStyles = useNativeStyles()
+  const {children, style} = p
+  const insets = useSafeAreaInsetsNative()
+  return (
+    <View style={[{paddingTop: insets.top}, nativeStyles.topSafeArea, style]} pointerEvents="box-none">
+      {children}
+    </View>
+  )
+}
+
+// desktop has no insets; both exports pass children straight through
+const PassThrough = (props: Props): React.ReactNode => props.children ?? null
+
+const useNativeStyles = Styles.createStyleHook(theme => ({
+  topSafeArea: {backgroundColor: theme.white, flexGrow: 0},
+}))
+
+export const SafeAreaViewTop = isMobile ? SafeAreaViewTopNative : PassThrough
+
+const desktopInsets = {bottom: 0, left: 0, right: 0, top: 0}
+export const useSafeAreaInsets = isMobile
+  ? useSafeAreaInsetsNative
+  : () => desktopInsets
+
+export default isMobile ? SafeAreaView : PassThrough

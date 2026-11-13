@@ -1,0 +1,261 @@
+import * as C from '@/constants'
+import * as CryptoRoutes from '@/constants/crypto'
+import * as Chat from '@/constants/chat'
+import * as T from '@/constants/types'
+import {isPathSaltpack, isPathSaltpackEncrypted, isPathSaltpackSigned} from '@/util/path'
+import captialize from 'lodash/capitalize'
+import * as Kb from '@/common-adapters'
+import type {StyleOverride} from '@/common-adapters/markdown'
+import {getEditStyle, messageAttachmentHasProgress, ShowToastAfterSaving} from './shared'
+import {makeUUID} from '@/util/uuid'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+import {showPDFViewer, useConversationAttachmentActions} from '../../attachment-actions'
+
+type OwnProps = {
+  isEditing: boolean
+  message: T.Chat.MessageAttachment
+  ordinal: T.Chat.Ordinal
+  showPopup: () => void
+}
+
+function FileContainer(p: OwnProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {isEditing, message, ordinal} = p
+  const {attachmentDownload, messageAttachmentNativeShare} = useConversationAttachmentActions()
+  const {
+    conversationIDKey,
+    downloadPath,
+    fileName: _fileName,
+    fileType,
+    transferErrMsg,
+    transferProgress: progress,
+    transferState,
+  } = message
+  const hasMessageID = !!T.Chat.messageIDToNumber(message.id)
+  const title = message.decoratedText?.stringValue() || message.title || message.fileName
+
+  const switchTab = C.Router2.switchTab
+  const navigateAppend = C.Router2.navigateAppend
+  const onSaltpackFileOpen = (
+    path: string,
+    name: typeof CryptoRoutes.decryptTab | typeof CryptoRoutes.verifyTab
+  ) => {
+    switchTab(C.Tabs.cryptoTab)
+    navigateAppend(
+      {
+        name,
+        params: {
+          entryNonce: makeUUID(),
+          seedInputPath: path,
+          seedInputType: 'file',
+        },
+      },
+      true
+    )
+  }
+  const _onShowInFinder = () => {
+    if (downloadPath) {
+      openLocalPathInSystemFileManagerDesktop(downloadPath)
+    }
+  }
+
+  const onDownload = () => {
+    if (!hasMessageID) {
+      return
+    }
+    if (isMobile) {
+      messageAttachmentNativeShare(ordinal, true)
+    } else if (!downloadPath) {
+      if (fileType === 'application/pdf') {
+        showPDFViewer(conversationIDKey, message)
+      } else {
+        switch (transferState) {
+          case 'uploading':
+          case 'downloading':
+          case 'mobileSaving':
+            return
+          default:
+        }
+        attachmentDownload(ordinal)
+      }
+    }
+  }
+
+  const arrowColor = isMobile
+    ? ''
+    : downloadPath
+      ? theme.green
+      : transferState === 'downloading'
+        ? theme.blue
+        : ''
+  const hasProgress = messageAttachmentHasProgress(transferState)
+
+  const errorMsg = transferErrMsg || ''
+  const fileName = _fileName
+  const isSaltpackFile = !!fileName && isPathSaltpack(fileName)
+  const onShowInFinder = !isMobile && downloadPath ? _onShowInFinder : undefined
+  const showMessageMenu = hasMessageID ? p.showPopup : undefined
+
+  const progressLabel = Chat.messageAttachmentTransferStateToProgressLabel(transferState)
+  const iconType = isSaltpackFile ? 'icon-file-saltpack-32' : 'icon-file-32'
+  const cryptoRoute = isPathSaltpackEncrypted(fileName)
+    ? CryptoRoutes.decryptTab
+    : isPathSaltpackSigned(fileName)
+      ? CryptoRoutes.verifyTab
+      : undefined
+  const actionTitle = captialize(cryptoRoute?.replace('Tab', ''))
+
+  const styleOverride = isMobile
+    ? ({paragraph: getEditStyle(isEditing)} as StyleOverride)
+    : undefined
+
+  return (
+    <Kb.ClickableBox direction="vertical" fullWidth={true} onLongPress={showMessageMenu} onClick={hasMessageID ? onDownload : undefined}>
+      <ShowToastAfterSaving transferState={transferState} />
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        relative={true}
+        style={Kb.Styles.collapseStyles([styles.containerStyle, getEditStyle(isEditing), styles.filename])}
+      >
+        <Kb.Box2 direction="horizontal" fullWidth={true} gap="tiny" centerChildren={true}>
+          <Kb.ImageIcon type={iconType} style={styles.iconStyle} />
+          <Kb.Box2 direction="vertical" fullWidth={true} flex={1}>
+            {fileName === title ? (
+              // if the title is the filename, don't try to parse it as markdown
+              <Kb.Text
+                type="BodySemibold"
+                style={Kb.Styles.collapseStyles([
+                  isSaltpackFile && styles.saltpackFileName,
+                  getEditStyle(isEditing),
+                  styles.filename,
+                ])}
+              >
+                {fileName}
+              </Kb.Text>
+            ) : (
+              <Kb.Markdown
+                messageType="attachment"
+                selectable={true}
+                style={getEditStyle(isEditing)}
+                styleOverride={styleOverride}
+                allowFontScaling={true}
+              >
+                {title}
+              </Kb.Markdown>
+            )}
+            {fileName !== title && (
+              <Kb.Text
+                type="BodyTiny"
+                onClick={hasMessageID ? onDownload : undefined}
+                style={Kb.Styles.collapseStyles([
+                  isSaltpackFile && styles.saltpackFileName,
+                  getEditStyle(isEditing),
+                ])}
+              >
+                {fileName}
+              </Kb.Text>
+            )}
+          </Kb.Box2>
+        </Kb.Box2>
+        {!isMobile && isSaltpackFile && cryptoRoute && (
+          <Kb.Box2 direction="vertical" fullWidth={true} alignItems="flex-start" style={styles.saltpackOperationContainer}>
+            <Kb.Button
+              mode="Secondary"
+              small={true}
+              label={actionTitle}
+              style={styles.saltpackOperation}
+              onClick={() => onSaltpackFileOpen(fileName, cryptoRoute)}
+            />
+          </Kb.Box2>
+        )}
+        {!!arrowColor && (
+          <Kb.Box2 alignSelf="center" direction="horizontal" centerChildren={true} style={styles.downloadedIconWrapperStyle}>
+            <Kb.Icon type="iconfont-download" style={styles.downloadedIcon} color={arrowColor} />
+          </Kb.Box2>
+        )}
+        {!!progressLabel && (
+          <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="center" style={styles.progressOverlay}>
+            <Kb.Text type="BodySmall" style={styles.progressLabelStyle}>
+              {progressLabel}
+            </Kb.Text>
+            {hasProgress && <Kb.ProgressBar ratio={progress} />}
+          </Kb.Box2>
+        )}
+        {!!errorMsg && (
+          <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="center">
+            <Kb.Text type="BodySmall" style={styles.error}>
+              Failed to download.{' '}
+              <Kb.Text type="BodySmall" style={styles.retry} onClick={hasMessageID ? onDownload : undefined}>
+                Retry
+              </Kb.Text>
+            </Kb.Text>
+          </Kb.Box2>
+        )}
+        {onShowInFinder && (
+          <Kb.Text type="BodySmallPrimaryLink" onClick={onShowInFinder} style={styles.linkStyle}>
+            Show in {Kb.Styles.fileUIName}
+          </Kb.Text>
+        )}
+      </Kb.Box2>
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      containerStyle: Kb.Styles.platformStyles({
+        isElectron: {...Kb.Styles.desktopStyles.clickable},
+      }),
+      downloadedIcon: {
+        maxHeight: 14,
+        position: 'relative',
+        top: 1,
+      },
+      downloadedIconWrapperStyle: {
+        ...Kb.Styles.padding(3, 0, 3, 3),
+        borderRadius: 20,
+        bottom: 0,
+        position: 'absolute',
+        right: Kb.Styles.globalMargins.small,
+      },
+      error: {color: theme.redDark},
+      filename: Kb.Styles.platformStyles({isElectron: {...Kb.Styles.desktopStyles.clickable}}),
+      iconStyle: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.size(32),
+        },
+        isElectron: {
+          display: 'block',
+          height: 35,
+          ...Kb.Styles.desktopStyles.clickable,
+        },
+      }),
+      linkStyle: {color: theme.black_50},
+      progressLabelStyle: {
+        color: theme.black_50,
+        marginRight: Kb.Styles.globalMargins.tiny,
+      },
+      progressOverlay: {
+        backgroundColor: theme.greyLight,
+        bottom: 0,
+        left: 0,
+        opacity: 0.9,
+        position: 'absolute',
+        width: 'auto',
+      },
+      retry: {
+        color: theme.redDark,
+        textDecorationLine: 'underline',
+      },
+      saltpackFileName: {color: theme.greenDark},
+      saltpackOperation: Kb.Styles.platformStyles({isTablet: {alignSelf: 'flex-start'}}),
+      saltpackOperationContainer: {
+        marginTop: Kb.Styles.globalMargins.xtiny,
+      },
+    }) as const
+)
+
+export default FileContainer

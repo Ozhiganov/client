@@ -33,7 +33,7 @@ func NewPager() Pager {
 	}
 }
 
-func (p Pager) encode(input interface{}) ([]byte, error) {
+func (p Pager) encode(input any) ([]byte, error) {
 	var data []byte
 	enc := codec.NewEncoderBytes(&data, p.codec)
 	if err := enc.Encode(input); err != nil {
@@ -42,15 +42,15 @@ func (p Pager) encode(input interface{}) ([]byte, error) {
 	return data, nil
 }
 
-func (p Pager) decode(data []byte, res interface{}) error {
+func (p Pager) decode(data []byte, res any) error {
 	dec := codec.NewDecoderBytes(data, p.codec)
 	err := dec.Decode(res)
 	return err
 }
 
 func (p Pager) GetPage(getcond func(bool) string, page *chat1.Pagination,
-	pivot interface{}) (string, bool, error) {
-
+	pivot any,
+) (string, bool, error) {
 	var dat []byte
 	var cond string
 	var prev bool
@@ -74,7 +74,7 @@ func (p Pager) GetPage(getcond func(bool) string, page *chat1.Pagination,
 	return cond, prev, nil
 }
 
-func (p Pager) MakePage(length, reqed int, next interface{}, prev interface{}) (*chat1.Pagination, error) {
+func (p Pager) MakePage(length, reqed int, next any, prev any) (*chat1.Pagination, error) {
 	prevEncoded, err := p.encode(prev)
 	if err != nil {
 		return nil, err
@@ -88,7 +88,7 @@ func (p Pager) MakePage(length, reqed int, next interface{}, prev interface{}) (
 		Num:      length,
 		Next:     nextEncoded,
 		Previous: prevEncoded,
-		Last:     (length < reqed),
+		Last:     (length < reqed) || length == 0,
 	}, nil
 }
 
@@ -122,7 +122,7 @@ func (p InboxPager) MakePage(res []InboxEntry, reqed int) (*chat1.Pagination, er
 	return p.Pager.MakePage(len(res), reqed, nextPF, prevPF)
 }
 
-// threadPager provides a covenient interface to pager for the thread use case
+// threadPager provides a convenient interface to pager for the thread use case
 type ThreadPager struct {
 	Pager
 }
@@ -135,18 +135,30 @@ func NewThreadPager() ThreadPager {
 	return ThreadPager{Pager: NewPager()}
 }
 
-func (p ThreadPager) MakePage(res []Message, reqed int) (*chat1.Pagination, error) {
+func (p ThreadPager) MakePage(res []Message, reqed int, maxDeletedUpto chat1.MessageID) (*chat1.Pagination, error) {
 	if len(res) == 0 {
-		return &chat1.Pagination{Num: 0}, nil
+		return &chat1.Pagination{Num: 0, Last: true}, nil
 	}
 
 	// Get first and last message IDs to encode in the result
 	prevMsgID := res[0].GetMessageID()
 	nextMsgID := res[len(res)-1].GetMessageID()
 
-	return p.Pager.MakePage(len(res), reqed, nextMsgID, prevMsgID)
+	page, err := p.Pager.MakePage(len(res), reqed, nextMsgID, prevMsgID)
+	if err != nil {
+		return page, err
+	}
+	if prevMsgID.Min(nextMsgID) <= maxDeletedUpto {
+		// If any message is prior to the nukepoint, say this is the last page.
+		page.Last = true
+	}
+	return page, nil
 }
 
 func (p ThreadPager) MakeIndex(msg Message) ([]byte, error) {
 	return p.encode(msg.GetMessageID())
+}
+
+func (p ThreadPager) MakeIndexByID(msgID chat1.MessageID) ([]byte, error) {
+	return p.encode(msgID)
 }

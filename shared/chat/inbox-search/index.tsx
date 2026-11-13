@@ -1,0 +1,617 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import Rover from './background'
+import SelectableBigTeamChannel from '../selectable-big-team-channel'
+import SelectableSmallTeam from '../selectable-small-team'
+import TeamInfo from '../../profile/user/teams/teaminfo'
+import type * as T from '@/constants/types'
+import {Bot} from '../conversation/info-panel/bot'
+import {TeamAvatar} from '../avatars'
+import {inboxWidth} from '../inbox/row/sizes'
+import {
+  inboxSearchMaxTextMessages,
+  inboxSearchPreviewSectionSize,
+  type InboxSearchController,
+  type InboxSearchVisibleResultCounts,
+} from '../inbox/use-inbox-search'
+import {showTeamByName} from '@/teams/team-page-actions'
+import {registerExternalResetter} from '@/util/zustand'
+
+type OwnProps = {
+  header?: React.ReactElement | null
+  search: Pick<InboxSearchController, 'searchInfo' | 'selectResult' | 'setVisibleResultCounts'>
+}
+
+export type NameResult = {
+  conversationIDKey: T.Chat.ConversationIDKey
+  name: string
+  sizeType: 'big' | 'small'
+  type: 'name'
+}
+
+export type TextResult = {
+  conversationIDKey: T.Chat.ConversationIDKey
+  sizeType: 'big' | 'small'
+  type: 'text'
+  name: string
+  numHits: number
+  query: string
+}
+
+export type BotResult = {
+  type: 'bot'
+  bot: T.RPCGen.FeaturedBot
+}
+
+export type OpenTeamResult = {
+  type: 'openTeam'
+  hit: T.Chat.InboxSearchOpenTeamHit
+}
+
+type Item = NameResult | TextResult | BotResult | OpenTeamResult
+
+// section derivation rebuilds these small descriptors every render; keep
+// identities stable so the memoized rows can bail
+const nameResultCache = new Map<string, NameResult>()
+const textResultCache = new Map<string, TextResult>()
+const openTeamItemCache = new WeakMap<T.Chat.InboxSearchOpenTeamHit, OpenTeamResult>()
+const botItemCache = new WeakMap<T.RPCGen.FeaturedBot, BotResult>()
+
+// module scope outlives sign-out; these hold conversation and username hits
+registerExternalResetter('chat-inbox-search-item-caches', () => {
+  nameResultCache.clear()
+  textResultCache.clear()
+})
+
+export const canonNameResult = (next: NameResult) => {
+  if (nameResultCache.size > 4096) {
+    nameResultCache.clear()
+  }
+  const old = nameResultCache.get(next.conversationIDKey)
+  if (old) {
+    if (old.name === next.name && old.sizeType === next.sizeType) {
+      return old
+    }
+  }
+  nameResultCache.set(next.conversationIDKey, next)
+  return next
+}
+
+export const canonTextResult = (next: TextResult) => {
+  if (textResultCache.size > 4096) {
+    textResultCache.clear()
+  }
+  const old = textResultCache.get(next.conversationIDKey)
+  if (old) {
+    if (old.name === next.name && old.sizeType === next.sizeType && old.numHits === next.numHits && old.query === next.query) {
+      return old
+    }
+  }
+  textResultCache.set(next.conversationIDKey, next)
+  return next
+}
+
+export const canonOpenTeamItem = (hit: T.Chat.InboxSearchOpenTeamHit): OpenTeamResult => {
+  let item = openTeamItemCache.get(hit)
+  if (!item) {
+    item = {hit, type: 'openTeam'}
+    openTeamItemCache.set(hit, item)
+  }
+  return item
+}
+
+export const canonBotItem = (bot: T.RPCGen.FeaturedBot): BotResult => {
+  let item = botItemCache.get(bot)
+  if (!item) {
+    item = {bot, type: 'bot'}
+    botItemCache.set(bot, item)
+  }
+  return item
+}
+
+type HitRowProps = {
+  isSelected: boolean
+  item: NameResult | TextResult
+  onSelectHit: (item: NameResult | TextResult, realIndex: number) => void
+  realIndex: number
+}
+
+// React.memo, not just compiler memo: the section list calls renderItem outside
+// the compiler's memo graph, so the shallow prop bail here is what lets rows
+// skip on each search keystroke
+const HitRow = React.memo(function HitRow(p: HitRowProps) {
+  const {isSelected, item, onSelectHit, realIndex} = p
+  const numHits = item.type === 'text' ? item.numHits : undefined
+  const Component = item.sizeType === 'big' ? SelectableBigTeamChannel : SelectableSmallTeam
+  return (
+    <Component
+      conversationIDKey={item.conversationIDKey}
+      isSelected={isSelected}
+      name={item.name}
+      numSearchHits={numHits}
+      maxSearchHits={inboxSearchMaxTextMessages}
+      onSelectConversation={() => onSelectHit(item, realIndex)}
+    />
+  )
+})
+
+export default function InboxSearchContainer(ownProps: OwnProps) {
+  const styles = useStyles()
+  const {
+    search: {searchInfo: _inboxSearch, selectResult, setVisibleResultCounts},
+  } = ownProps
+  const navigateAppend = C.Router2.navigateAppend
+  const onInstallBot = React.useEffectEvent((username: string) => {
+    navigateAppend({name: 'chatInstallBotPick', params: {botUsername: username}})
+  })
+  const onSelectConversation = (
+    conversationIDKey: T.Chat.ConversationIDKey,
+    selectedIndex: number,
+    query: string
+  ) => {
+    selectResult(conversationIDKey, query.length > 0 ? query : undefined, selectedIndex)
+  }
+  const {header} = ownProps
+  const {indexPercent, nameResults: _nameResults, nameResultsUnread, nameStatus, textStatus} = _inboxSearch
+  const {botsResults: _botsResults, botsResultsSuggested, botsStatus} = _inboxSearch
+  const {openTeamsResults: _openTeamsResults, openTeamsResultsSuggested, openTeamsStatus} = _inboxSearch
+  const {selectedIndex, textResults: _textResults} = _inboxSearch
+
+  const [botsAll, setBotsAll] = React.useState(false)
+  const [botsCollapsed, setBotsCollapsed] = React.useState(false)
+  const [nameCollapsed, setNameCollapsed] = React.useState(false)
+  const [openTeamsAll, setOpenTeamsAll] = React.useState(false)
+  const [openTeamsCollapsed, setOpenTeamsCollapsed] = React.useState(false)
+  const [textCollapsed, setTextCollapsed] = React.useState(false)
+  const toggleCollapseName = () => setNameCollapsed(s => !s)
+  const toggleCollapseText = () => setTextCollapsed(s => !s)
+  const toggleCollapseOpenTeams = () => setOpenTeamsCollapsed(s => !s)
+  const toggleOpenTeamsAll = () => setOpenTeamsAll(s => !s)
+  const toggleCollapseBots = () => setBotsCollapsed(s => !s)
+  const toggleBotsAll = () => setBotsAll(s => !s)
+
+  const renderOpenTeams: Section['renderItem'] = ({item, index, section}) => {
+    if (item.type !== 'openTeam') return null
+    const fullSection = section as Section
+    const {hit} = item
+    const realIndex = index + fullSection.indexOffset
+    return (
+      <OpenTeamRow
+        description={hit.description}
+        name={hit.name}
+        memberCount={hit.memberCount}
+        inTeam={hit.inTeam}
+        publicAdmins={hit.publicAdmins}
+        isSelected={!isMobile && selectedIndex === realIndex}
+      />
+    )
+  }
+
+  const renderBots: Section['renderItem'] = ({item, index, section}) => {
+    if (item.type !== 'bot') return null
+    const fullSection = section as Section
+    const realIndex = index + fullSection.indexOffset
+    return (
+      <Bot
+        {...item.bot}
+        onClick={onInstallBot}
+        firstItem={index === 0}
+        hideHover={true}
+        isSelected={!isMobile && selectedIndex === realIndex}
+      />
+    )
+  }
+
+  const selectText = (item: Item, index: number) => {
+    if (item.type === 'text') {
+      onSelectConversation(item.conversationIDKey, index, item.query)
+    }
+  }
+
+  const selectBot = (item: Item) => {
+    if (item.type !== 'bot') return
+    onInstallBot(item.bot.botUsername)
+  }
+
+  const renderNameHeader = (section: Section) => {
+    return (
+      <Kb.SectionDivider
+        collapsed={section.isCollapsed}
+        label={section.title}
+        onToggleCollapsed={section.onCollapse}
+        showSpinner={section.status === 'inprogress'}
+      />
+    )
+  }
+
+  const renderHeaderWithMore = (
+    section: Section,
+    resultsLength: number,
+    collapsed: boolean,
+    showAll: boolean,
+    toggleAll: () => void
+  ) => {
+    const showMore = resultsLength > 3 && !collapsed
+    const label = (
+      <Kb.Box2 alignSelf="center" direction="horizontal" gap="xtiny">
+        <Kb.Text type="BodySmallSemibold">{section.title}</Kb.Text>
+        {showMore && (
+          <Kb.Text
+            onClick={(e: React.BaseSyntheticEvent) => {
+              e.stopPropagation()
+              toggleAll()
+            }}
+            type="BodySmallSecondaryLink"
+          >
+            {!showAll ? '(more)' : '(less)'}
+          </Kb.Text>
+        )}
+      </Kb.Box2>
+    )
+    return (
+      <Kb.SectionDivider
+        collapsed={section.isCollapsed}
+        label={label}
+        onToggleCollapsed={section.onCollapse}
+        showSpinner={section.status === 'inprogress'}
+      />
+    )
+  }
+
+  const renderTeamHeader = (section: Section) =>
+    renderHeaderWithMore(section, _openTeamsResults.length, openTeamsCollapsed, openTeamsAll, toggleOpenTeamsAll)
+
+  const renderBotsHeader = (section: Section) =>
+    renderHeaderWithMore(section, _botsResults.length, botsCollapsed, botsAll, toggleBotsAll)
+
+  const renderTextHeader = (section: Section) => {
+    const ratio = (indexPercent ?? 0) / 100.0
+    return (
+      <Kb.Box2 direction="vertical" fullWidth={true} style={styles.textHeader}>
+        <Kb.SectionDivider
+          collapsed={section.isCollapsed}
+          label={section.title}
+          onToggleCollapsed={section.onCollapse}
+          showSpinner={section.status === 'inprogress'}
+        />
+        {textStatus === 'error' ? (
+          <Kb.Box2 direction="horizontal" style={styles.percentContainer} fullWidth={true}>
+            <Kb.Text type="BodyTiny" style={styles.errorText} center={true}>
+              Search failed, please try again, or contact Keybase describing the problem.
+            </Kb.Text>
+          </Kb.Box2>
+        ) : indexPercent !== undefined && indexPercent < 100 ? (
+          <Kb.Box2 direction="horizontal" gap="xtiny" style={styles.percentContainer} fullWidth={true}>
+            <Kb.Text type="BodyTiny">Indexing...</Kb.Text>
+            {isMobile ? (
+              <Kb.ProgressBar style={styles.progressBar} ratio={ratio} />
+            ) : (
+              <Kb.WithTooltip
+                containerStyle={styles.progressBar}
+                position="bottom center"
+                tooltip={`${indexPercent}% complete`}
+              >
+                <Kb.ProgressBar style={styles.progressBar} ratio={ratio} />
+              </Kb.WithTooltip>
+            )}
+          </Kb.Box2>
+        ) : null}
+      </Kb.Box2>
+    )
+  }
+
+  function renderHit(h: {item: Item; index: number; section: Section}) {
+    if (h.item === emptyUnreadPlaceholder) {
+      return (
+        <Kb.Text style={styles.emptyUnreadPlaceholder} type="BodySmall" center={true}>
+          No unread messages or conversations
+        </Kb.Text>
+      )
+    }
+
+    if (h.item.type !== 'text' && h.item.type !== 'name') return null
+
+    const {item, section, index} = h
+    const realIndex = index + section.indexOffset
+    return (
+      <HitRow
+        item={item}
+        isSelected={!isMobile && selectedIndex === realIndex}
+        onSelectHit={onSelectHit}
+        realIndex={realIndex}
+      />
+    )
+  }
+
+  const selectName = (item: Item, index: number) => {
+    if (item.type !== 'name') return
+    onSelectConversation(item.conversationIDKey, index, '')
+  }
+
+  const onSelectHit = React.useEffectEvent((item: NameResult | TextResult, realIndex: number) => {
+    if (item.type === 'name') {
+      selectName(item, realIndex)
+    } else {
+      selectText(item, realIndex)
+    }
+  })
+
+  const nameResults: Array<NameResult> = nameCollapsed
+    ? []
+    : _nameResults.length
+      ? _nameResults.map(r =>
+          canonNameResult({
+            conversationIDKey: r.conversationIDKey,
+            name: r.name,
+            sizeType: r.teamType,
+            type: 'name',
+          })
+        )
+      : nameResultsUnread
+        ? [emptyUnreadPlaceholder]
+        : []
+
+  const textResults: Array<TextResult> = textCollapsed
+    ? []
+    : _textResults.map(r =>
+        canonTextResult({
+          conversationIDKey: r.conversationIDKey,
+          name: r.name,
+          numHits: r.numHits,
+          query: r.query,
+          sizeType: r.teamType,
+          type: 'text',
+        })
+      )
+
+  const openTeamsResults = openTeamsCollapsed
+    ? []
+    : openTeamsAll
+      ? _openTeamsResults
+      : _openTeamsResults.slice(0, inboxSearchPreviewSectionSize)
+
+  const botsResults =
+    botsCollapsed ? [] : botsAll ? _botsResults : _botsResults.slice(0, inboxSearchPreviewSectionSize)
+  const indexOffset = botsResults.length + openTeamsResults.length + nameResults.length
+
+  const visibleResultCounts = React.useMemo<InboxSearchVisibleResultCounts>(
+    () => ({
+      bots: botsResults.length,
+      names: nameResults.length,
+      openTeams: openTeamsResults.length,
+      text: textCollapsed || nameResultsUnread ? 0 : _textResults.length,
+    }),
+    [
+      botsResults.length,
+      nameResults.length,
+      openTeamsResults.length,
+      textCollapsed,
+      nameResultsUnread,
+      _textResults.length,
+    ]
+  )
+
+  React.useLayoutEffect(() => {
+    setVisibleResultCounts(visibleResultCounts)
+  }, [setVisibleResultCounts, visibleResultCounts])
+
+  const nameSection: Section = {
+    data: nameResults,
+    indexOffset: 0,
+    isCollapsed: nameCollapsed,
+    onCollapse: toggleCollapseName,
+    onSelect: selectName,
+    renderHeader: renderNameHeader,
+    renderItem: renderHit as Section['renderItem'],
+    status: nameStatus,
+    title: nameResultsUnread ? 'Unread' : 'Chats',
+  }
+  const openTeamsSection: Section = {
+    data: openTeamsResults.map(canonOpenTeamItem),
+    indexOffset: nameResults.length,
+    isCollapsed: openTeamsCollapsed,
+    onCollapse: toggleCollapseOpenTeams,
+    onSelect: () => {}, // ignored
+    renderHeader: renderTeamHeader,
+    renderItem: renderOpenTeams,
+    status: openTeamsStatus,
+    title: openTeamsResultsSuggested ? 'Suggested teams' : 'Open teams',
+  }
+  const botsSection: Section = {
+    data: botsResults.map(canonBotItem),
+    indexOffset: openTeamsResults.length + nameResults.length,
+    isCollapsed: botsCollapsed,
+    onCollapse: toggleCollapseBots,
+    onSelect: selectBot,
+    renderHeader: renderBotsHeader,
+    renderItem: renderBots,
+    status: botsStatus,
+    title: botsResultsSuggested ? 'Suggested bots' : 'Featured bots',
+  }
+  const messagesSection: Section = {
+    data: textResults,
+    indexOffset,
+    isCollapsed: textCollapsed,
+    onCollapse: toggleCollapseText,
+    onSelect: selectText,
+    renderHeader: renderTextHeader,
+    renderItem: renderHit as Section['renderItem'],
+    status: textStatus,
+    title: 'Messages',
+  }
+  const sections: Array<Section> = [
+    nameSection,
+    openTeamsSection,
+    botsSection,
+    ...(!nameResultsUnread ? [messagesSection] : []),
+  ]
+
+  return (
+    <Kb.Box2 style={styles.container} direction="vertical" fullWidth={true} fullHeight={true} relative={true}>
+      <Rover />
+      <Kb.SectionList
+        ListHeaderComponent={header ?? undefined}
+        contentInsetAdjustmentBehavior={isMobile ? 'automatic' : undefined}
+        stickySectionHeadersEnabled={true}
+        renderSectionHeader={({section}: {section: Section}) => section.renderHeader(section)}
+        keyboardShouldPersistTaps="handled"
+        sections={sections}
+      />
+    </Kb.Box2>
+  )
+}
+
+type SectionExtra = {
+  indexOffset: number
+  isCollapsed: boolean
+  onCollapse: () => void
+  onSelect: (item: Item, index: number) => void
+  renderHeader: (section: Section) => React.ReactElement
+  status: T.Chat.InboxSearchStatus
+  title: string
+}
+
+type Section = Kb.SectionType<Item> & SectionExtra
+
+export const emptyUnreadPlaceholder = {
+  conversationIDKey: '',
+  name: '---EMPTYRESULT---',
+  sizeType: 'small',
+  type: 'name',
+} as const
+
+const rowHeight = isMobile ? 64 : 56
+type OpenTeamProps = T.Chat.InboxSearchOpenTeamHit & {isSelected: boolean}
+// memo so identity-stable open-team hits bail when other sections update
+const OpenTeamRow = React.memo(function OpenTeamRow(p: OpenTeamProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {name, description, memberCount, publicAdmins, inTeam, isSelected} = p
+  const showingDueToSelect = React.useRef(false)
+
+  const clearModals = C.Router2.clearModals
+  const navigateAppend = C.Router2.navigateAppend
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    return (
+      <TeamInfo
+        attachTo={attachTo}
+        description={description}
+        inTeam={inTeam}
+        isOpen={true}
+        name={name}
+        membersCount={memberCount}
+        position="right center"
+        onChat={undefined}
+        onHidden={hidePopup}
+        onJoinTeam={() => navigateAppend({name: 'teamJoinTeamDialog', params: {initialTeamname: name}})}
+        onViewTeam={() => {
+          clearModals()
+          void showTeamByName(name)
+        }}
+        publicAdmins={publicAdmins}
+        visible={true}
+      />
+    )
+  }
+  const {hidePopup, showingPopup, popup, popupAnchor, showPopup} = Kb.usePopup2(makePopup)
+
+  React.useEffect(() => {
+    if (!showingPopup && isSelected && !showingDueToSelect.current) {
+      showingDueToSelect.current = true
+      showPopup()
+    } else if (showingPopup && !isSelected && showingDueToSelect.current) {
+      showingDueToSelect.current = false
+      hidePopup()
+    }
+  }, [showingDueToSelect, showPopup, hidePopup, showingPopup, isSelected])
+
+  return (
+    <Kb.ClickableBox
+      direction="vertical"
+      fullWidth={true}
+      onClick={showPopup}
+    >
+      <Kb.Box2
+        direction="horizontal"
+        fullWidth={true}
+        ref={popupAnchor}
+        centerChildren={true}
+        className="hover_background_color_blueGreyDark"
+        style={Kb.Styles.collapseStyles([
+          styles.openTeamContainer,
+          {
+            backgroundColor: isSelected ? theme.blue : theme.white,
+            height: rowHeight,
+          },
+        ])}
+      >
+        <TeamAvatar teamname={name} isMuted={false} isSelected={isSelected} />
+        <Kb.Box2 direction="vertical" fullWidth={true} flex={1}>
+          <Kb.Text
+            type="BodySemibold"
+            style={{color: isSelected ? theme.white : theme.black}}
+            title={name}
+            lineClamp={isMobile ? 1 : undefined}
+            ellipsizeMode="tail"
+          >
+            {name}
+          </Kb.Text>
+          <Kb.Text
+            type="BodySmall"
+            style={{color: isSelected ? theme.white : theme.black_50}}
+            title={`#${description}`}
+            lineClamp={1}
+            ellipsizeMode="tail"
+          >
+            {description}
+          </Kb.Text>
+        </Kb.Box2>
+      </Kb.Box2>
+      {popup}
+    </Kb.ClickableBox>
+  )
+})
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.blueGrey,
+          borderRightColor: theme.black_10,
+          borderRightWidth: 1,
+          borderStyle: 'solid',
+          contain: 'strict',
+          maxWidth: inboxWidth,
+          minWidth: inboxWidth,
+        },
+      }),
+      emptyUnreadPlaceholder: Kb.Styles.platformStyles({
+        common: {...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.tiny)},
+        isTablet: {backgroundColor: theme.blueGrey},
+      }),
+      errorText: {color: theme.redDark},
+      openTeamContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xsmall),
+        },
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        },
+      }),
+      percentContainer: Kb.Styles.platformStyles({
+        common: {padding: Kb.Styles.globalMargins.tiny},
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        },
+      }),
+      progressBar: {
+        alignSelf: 'center',
+        flex: 1,
+        width: '100%',
+      },
+      textHeader: {backgroundColor: theme.blueLighter3},
+    }) as const
+)

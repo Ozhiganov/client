@@ -1,0 +1,152 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {SignupScreen, errorBanner} from '../signup/common'
+import {useDefaultPhoneCountry} from '@/util/phone-numbers'
+import * as T from '@/constants/types'
+import type {RPCError} from '@/util/errors'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export const decodeForgotUsernameError = (error: RPCError) => {
+  switch (error.code) {
+    case T.RPCGen.StatusCode.scnotfound:
+      return "We couldn't find an account with that email address. Try again?"
+    case T.RPCGen.StatusCode.scinputerror:
+      return "That doesn't look like a valid email address. Try again?"
+    default:
+      // an empty desc would leave the screen showing neither a success nor an
+      // error banner, so the user would see nothing happen at all
+      return error.desc || 'Something went wrong. Try again?'
+  }
+}
+
+const ForgotUsername = () => {
+  const styles = useStyles()
+  const defaultCountry = useDefaultPhoneCountry()
+  const recoverUsernameWithEmail = C.useRPC(T.RPCGen.accountRecoverUsernameWithEmailRpcPromise)
+  const recoverUsernameWithPhone = C.useRPC(T.RPCGen.accountRecoverUsernameWithPhoneRpcPromise)
+
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyProvisionForgotUsername)
+  const [forgotUsernameResult, setForgotUsernameResult] = React.useState('')
+
+  const [emailSelected, setEmailSelected] = React.useState(true)
+  const [email, setEmail] = React.useState('')
+  // PhoneInput's callback gets passed a (phoneNumber, valid) tuple.
+  // If "valid" is false, phoneNumber gets set to null, therefore phoneNumber is only
+  // truthy when it's valid. This is used in the form validation logic in the code.
+  const [phoneNumber, setPhoneNumber] = React.useState<string | undefined>()
+
+  const onSubmit = () => {
+    if (!emailSelected && phoneNumber) {
+      recoverUsernameWithPhone(
+        [{phone: phoneNumber}, C.waitingKeyProvisionForgotUsername],
+        () => setForgotUsernameResult('success'),
+        error => setForgotUsernameResult(decodeForgotUsernameError(error))
+      )
+    } else if (emailSelected) {
+      recoverUsernameWithEmail(
+        [{email}, C.waitingKeyProvisionForgotUsername],
+        () => setForgotUsernameResult('success'),
+        error => setForgotUsernameResult(decodeForgotUsernameError(error))
+      )
+    }
+  }
+
+  const error = forgotUsernameResult !== 'success' ? forgotUsernameResult : ''
+  const disabled = (!emailSelected && phoneNumber === undefined) || (emailSelected && !email)
+  const inModal = !!Kb.useModalBox()
+
+  return (
+    <SignupScreen
+      banners={
+        <>
+          {errorBanner(error)}
+          {forgotUsernameResult === 'success' ? (
+            <Kb.Banner key="successBanner" color="blue">
+              <Kb.BannerParagraph bannerColor="green" content="We just sent you your username." />
+            </Kb.Banner>
+          ) : null}
+        </>
+      }
+      buttons={[
+        {
+          disabled,
+          label: 'Recover username',
+          onClick: onSubmit,
+          type: 'Default',
+          waiting,
+        },
+      ]}
+    >
+      <Kb.Box2
+        alignSelf="center"
+        direction="vertical"
+        gap="tiny"
+        style={Kb.Styles.collapseStyles([styles.wrapper, inModal && styles.wrapperModal])}
+      >
+        <Kb.RadioButton
+          label="Recover with email"
+          onSelect={() => setEmailSelected(true)}
+          selected={emailSelected}
+        />
+        {emailSelected && (
+          <Kb.Input3
+            textType="BodySemibold"
+            autoFocus={true}
+            placeholder="Email address"
+            testID={TestIDs.FORGOT_USERNAME_EMAIL_INPUT}
+            onEnterKeyDown={onSubmit}
+            onChangeText={setEmail}
+            value={email}
+          />
+        )}
+        <Kb.RadioButton
+          label="Recover with phone number"
+          onSelect={() => setEmailSelected(false)}
+          selected={!emailSelected}
+        />
+        {!emailSelected && (
+          <Kb.PhoneInput
+            autoFocus={true}
+            defaultCountry={defaultCountry}
+            onChangeNumber={(phoneNumber, valid) => {
+              if (!valid) {
+                setPhoneNumber(undefined)
+                return
+              }
+
+              setPhoneNumber(phoneNumber)
+            }}
+            onEnterKeyDown={onSubmit}
+            style={styles.phoneInput}
+          />
+        )}
+      </Kb.Box2>
+    </SignupScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  phoneInput: Kb.Styles.platformStyles({
+    isElectron: {
+      height: 38,
+      width: '100%',
+    },
+    isMobile: {
+      height: 48,
+      width: '100%',
+    },
+  }),
+  wrapper: Kb.Styles.platformStyles({
+    isElectron: {
+      width: 400,
+    },
+    isMobile: {
+      width: '100%',
+    },
+  }),
+  // a fixed width overflows the desktop modal box
+  wrapperModal: Kb.Styles.platformStyles({isElectron: {maxWidth: 400, width: '100%'}}),
+}))
+
+export default ForgotUsername

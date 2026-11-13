@@ -4,8 +4,11 @@
 package engine
 
 import (
-	"github.com/keybase/client/go/libkb"
 	"testing"
+
+	"github.com/keybase/client/go/kbcrypto"
+	"github.com/keybase/client/go/libkb"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSecretKeys(t *testing.T) {
@@ -14,17 +17,16 @@ func TestSecretKeys(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "sk")
 
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 	}
 
 	// Get the secret keys.
 	e := NewSecretKeysEngine(tc.G)
-	err := RunEngine(e, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	err := RunEngine2(m, e)
+	require.NoError(t, err)
 	signing := e.Result().Signing
 
 	// Now we want to check that the keys we got actually belong to the user.
@@ -33,20 +35,17 @@ func TestSecretKeys(t *testing.T) {
 
 	// Build the signing keypair. To do this, we exploit the fact that a NaCl
 	// public signing key is the last 32 bytes of the private signing key.
-	var public libkb.NaclSigningKeyPublic
+	var public kbcrypto.NaclSigningKeyPublic
 	copy(public[:], signing[32:])
 	pair := libkb.NaclSigningKeyPair{
 		Public: public,
 	}
 
 	// Check the signing keypair's KID is in the user's KeyFamily.
-	testUser, err := libkb.LoadUser(libkb.LoadUserArg{
-		Name: u.Username,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testUser, err := libkb.LoadUser(libkb.NewLoadUserArg(tc.G).WithName(u.Username))
+	require.NoError(t, err)
 	if found := testUser.GetKeyFamily().AllKIDs[pair.GetKID()]; !found {
-		t.Fatalf("Failed to find %s in the user's key family.", pair.GetKID().String())
+		require.True(t, found,
+			"Failed to find %s in the user's key family.", pair.GetKID().String())
 	}
 }

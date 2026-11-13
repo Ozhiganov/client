@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Builds and runs cpp/tests/jsi-convert-bench.cpp twice -- once against this
+# branch's bridge, once against KB_BENCH_BASE's (default origin/master) -- on
+# a real Hermes runtime, replaying the corpus built by make-bench-corpus.mjs
+# from a real mobile session's RPC traffic. KB_BENCH_BASE must already have the
+# current bridge API (frame-parser.cpp, epoch-taking onDataFromGo).
+#
+# Hermes comes from the already-installed iOS pod, which ships a macOS slice, so
+# nothing has to be built from source. Development-only; not part of the shipped
+# module.
+#
+# Usage: rnmodules/react-native-kb/scripts/bench-jsi-convert.sh [corpus] [iters]
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CPP_DIR="$ROOT/rnmodules/react-native-kb/cpp"
+PODS="$ROOT/shared/ios/Pods"
+HERMES="$PODS/hermes-engine/destroot"
+CORPUS="${1:-/tmp/kb-bench-corpus.bin}"
+ITERS="${2:-5}"
+BASE="${KB_BENCH_BASE:-origin/master}"
+
+# Sets MSGPACK_INCLUDE, fetching the headers if yarn hasn't unpacked them.
+# shellcheck source=./msgpack-include.sh
+source "$(dirname "${BASH_SOURCE[0]}")/msgpack-include.sh"
+
+for p in "$HERMES/include" \
+         "$PODS/Headers/Public/React-callinvoker" \
+         "$PODS/Headers/Public/React-cxxstableapi"; do
+  test -d "$p" || { echo "missing $p -- run yarn and yarn ios:pod:install first" >&2; exit 1; }
+done
+test -f "$CORPUS" || {
+  echo "missing corpus $CORPUS -- run:" >&2
+  echo "  node $ROOT/rnmodules/react-native-kb/scripts/make-bench-corpus.mjs" >&2
+  exit 1
+}
+
+# Deliberately not `mktemp -d`, which lands in $TMPDIR: binaries run from there
+# measure consistently slower on macOS, enough to swamp the difference being
+# measured.
+WORK="$(mktemp -d /tmp/kb-bench.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+# The baseline is BASE's bridge (origin/master unless overridden), checked out
+# to its own directory so the two builds each see their own headers.
+mkdir -p "$WORK/baseline"
+git -C "$ROOT" archive "$BASE" rnmodules/react-native-kb/cpp |
+  tar -x -C "$WORK/baseline" --strip-components=3 --exclude='*/tests/*'
+
+FRAMEWORKS="$HERMES/Library/Frameworks/macosx"
+COMMON=(
+  -std=c++20 -O2 -DNDEBUG -DMSGPACK_NO_BOOST
+  -I "$MSGPACK_INCLUDE"
+  -I "$HERMES/include"
+  -I "$PODS/Headers/Public/React-callinvoker"
+  -I "$PODS/Headers/Public/React-cxxstableapi"
+  -F "$FRAMEWORKS" -framework hermesvm
+  -Wl,-rpath,"$FRAMEWORKS"
+)
+
+build() { # build <outfile> <src-dir> [extra flags...]
+  local out="$1" dir="$2"; shift 2
+  local srcs=("$dir/react-native-kb.cpp" "$dir/frame-parser.cpp")
+  clang++ "${COMMON[@]}" "$@" -I "$dir" \
+    "${srcs[@]}" "$CPP_DIR/tests/jsi-convert-bench.cpp" -o "$out"
+}
+
+echo "building baseline ($BASE)..."
+build "$WORK/bench-baseline" "$WORK/baseline" -DKB_BASELINE=1
+echo "building branch..."
+build "$WORK/bench-branch" "$CPP_DIR"
+
+echo
+"$WORK/bench-baseline" "$CORPUS" "$ITERS"
+echo
+"$WORK/bench-branch" "$CORPUS" "$ITERS"

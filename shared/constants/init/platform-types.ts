@@ -1,0 +1,54 @@
+// Shared types for the platform-split init helpers (platform.desktop / platform.native).
+import type {KB2} from '@/util/electron'
+import type {ConnectionType} from '@/stores/shell'
+
+export type ExpoLocationObject = {coords: {accuracy: number | null; latitude: number; longitude: number}}
+type ExpoLocationModule = {
+  startLocationUpdatesAsync: (taskName: string, options: object) => Promise<void>
+  stopLocationUpdatesAsync: (taskName: string) => Promise<void>
+}
+export type NetworkModule = {
+  getConnectionType: () => Promise<ConnectionType>
+  // Also delivers the current type once on subscribe
+  addConnectionTypeListener: (cb: (type: ConnectionType) => void) => () => void
+}
+export type ExpoTaskManagerModule = {
+  defineTask: (taskName: string, cb: (params: {data: unknown; error: unknown}) => Promise<void>) => void
+  isTaskRegisteredAsync: (taskName: string) => Promise<boolean>
+  unregisterTaskAsync: (taskName: string) => Promise<void>
+}
+
+export type DesktopModules = {
+  InputMonitor: new () => {notifyActive: (userActive: boolean) => void}
+  KB2: KB2
+  isLinux: boolean
+  isWindows: boolean
+  kbfsNotification: (
+    notification: unknown,
+    np: (title: string, opts?: {body?: string; sound?: boolean}, onClick?: () => void) => void
+  ) => void
+  skipAppFocusActions: boolean
+}
+
+export type NativeModules = {
+  ExpoLocation: ExpoLocationModule
+  ExpoTaskManager: ExpoTaskManagerModule
+  Linking: {getInitialURL: () => Promise<string | null | undefined>}
+  Network: NetworkModule
+  // iOS only
+  addLocationFixListener: (cb: (fix: {accuracy: number; lat: number; lon: number}) => void) => () => void
+  fsCacheDir: string
+  fsDownloadDir: string
+  guiConfig: string
+  requestLocationPermission: (perm?: unknown) => Promise<void>
+  setupAudioMode: (allowRecord: boolean) => Promise<void>
+  // iOS only
+  startLocationWatch: () => void
+  stopLocationWatch: () => void
+}
+
+export type NativeSyncModules = {
+  fsCacheDir: string
+  fsDownloadDir: string
+  guiConfig: string
+}

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+# Run from shared/: python3 ../.claude/skills/update-dependencies/check-outdated.py
+import json, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+with open('package.json') as f:
+    pkg = json.load(f)
+
+deps = {}
+deps.update(pkg.get('dependencies', {}))
+deps.update(pkg.get('devDependencies', {}))
+
+SKIP = {'react-native-kb'}
+# These track whatever react-native resolves to, so they are never checked
+# against npm directly — sync them by hand to react-native's peer deps.
+PINNED = {'react', 'react-dom', 'react-is', 'react-test-renderer'}
+# Project terminology: a version-line change (0.86 -> 0.87) is a MAJOR, the
+# last number (.1, .2) is minor. These must stay on react-native's line, but
+# minor bumps within it are allowed (0.86.0 -> 0.86.2, never 0.87.x while
+# react-native is 0.86.x).
+RN_MAJOR_PINNED = {'@react-native/babel-preset', '@react-native/eslint-config', '@react-native/metro-config'}
+
+import re as _re
+
+def _parse_semver(v):
+    """Return (major, minor, patch, pre) or None. Strips build metadata (+...)."""
+    v = v.split('+')[0]
+    m = _re.match(r'^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$', v)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or ''
+
+def _ident_key(p):
+    # semver §11.4: purely-numeric identifiers sort before alphanumeric ones.
+    # Use a 3-tuple so both branches are always comparable without TypeError.
+    try:
+        return (0, int(p), '')
+    except ValueError:
+        return (1, 0, p)
+
+def semver_key(v):
+    """Sort key implementing semver.org §11 precedence rules."""
+    parsed = _parse_semver(v)
+    if not parsed:
+        return (0, 0, 0, 0, [])
+    major, minor, patch, pre = parsed
+    # semver §11.3: pre-release identifiers are dot-separated (not hyphen-separated).
+    pre_parts = [_ident_key(p) for p in pre.split('.')] if pre else []
+    # semver §11.3: a pre-release version has lower precedence than the normal version.
+    is_stable = 0 if pre else 1
+    return (major, minor, patch, is_stable, pre_parts)
+
+def _is_prerelease(v):
+    """True if v has a pre-release component per semver (no keyword guessing)."""
+    parsed = _parse_semver(v)
+    return bool(parsed and parsed[3])
+
+def _line(v):
+    """The project's notion of a 'major': react-native ships 0.x, so the line is
+    (0, 86) — a 0.86 -> 0.87 move is a major, 0.86.0 -> 0.86.2 is a minor."""
+    p = _parse_semver(v)
+    return (p[0], p[1]) if p else None
+
+# react-native drives the @react-native/* cap, so read it before checking anything.
+RN_CURRENT = deps.get('react-native', '')
+RN_LINE = _line(RN_CURRENT)
+
+UPCOMING = {}
+
+def get_latest(name, current):
+    if name in SKIP or current.startswith(('file:', 'link:', 'github:')):
+        return name, current, current, 'skip', current
+    # npm: alias (e.g. typescript-native -> "npm:typescript@7.0.2"): query the
+    # real package; report under the alias name with the real version.
+    query_name = name
+    if current.startswith('npm:'):
+        query_name, current = current[4:].rsplit('@', 1)
+    is_pre = _is_prerelease(current)
+    try:
+        r = subprocess.run(['yarn', 'info', query_name, '--json'],
+                          capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            raise RuntimeError(f'yarn info exited {r.returncode}: {r.stderr.strip() or r.stdout.strip()}')
+        raw = r.stdout.strip()
+        if not raw:
+            raise RuntimeError('yarn info returned empty output')
+        data = json.loads(raw).get('data', {})
+        all_versions = data.get('versions', [])
+        tags = data.get('dist-tags', {})
+        latest_tag = tags.get('latest')
+        if not (latest_tag and _parse_semver(latest_tag)):
+            latest_tag = None
+        # Never suggest past the `latest` dist-tag: expo-* publish plain
+        # 58.0.x versions under `next` while SDK 58 is still in preview, so
+        # max-semver alone would report an unreleased SDK as stable. Skipped
+        # when `latest` is behind us (a backport published without --tag).
+        if latest_tag and not is_pre and semver_key(latest_tag) >= semver_key(current):
+            all_versions = [v for v in all_versions if semver_key(v) <= semver_key(latest_tag)]
+            # Surface unreleased lines separately so they are visible but never
+            # mistaken for upgrades. canary/nightly/dev builds are per-commit noise.
+            UPCOMING[name] = sorted(
+                ((tag, v) for tag, v in tags.items()
+                 if tag != 'latest' and _parse_semver(v)
+                 and not _re.search(r'canary|nightly|insiders|experimental|dev', f'{tag} {_parse_semver(v)[3]}')
+                 and semver_key(v) > semver_key(latest_tag)),
+                key=lambda tv: semver_key(tv[1]))
+        cur_major = _parse_semver(current)[0]
+        if name in RN_MAJOR_PINNED:
+            # Cap at react-native's own line (0.86) — minor bumps only. Follows
+            # react-native rather than their current line, so bumping RN's line
+            # pulls these along instead of leaving them a line behind.
+            cap = RN_LINE or _line(current)
+            candidates = [v for v in all_versions if not _is_prerelease(v) and _line(v) == cap]
+            latest = max(candidates, key=semver_key) if candidates else current
+            if semver_key(latest) < semver_key(current):
+                latest = current
+            return name, current, latest, 'rn-major-pinned', latest
+        if name == 'react-native':
+            # Always upgradable. Report the in-line bump as the routine one and
+            # flag a line jump (0.86 -> 0.87) as the opt-in major — it drags
+            # react/react-dom/react-is/react-test-renderer and @react-native/*.
+            # react-native publishes a 1000.0.0 sentinel for the unreleased main
+            # branch — never a real upgrade target.
+            candidates = [v for v in all_versions if not _is_prerelease(v)
+                          and _parse_semver(v) and _parse_semver(v)[0] < 1000]
+            latest = max(candidates, key=semver_key) if candidates else current
+            in_line_c = [v for v in candidates if _line(v) == _line(current)]
+            in_major = max(in_line_c, key=semver_key) if in_line_c else current
+            if semver_key(latest) < semver_key(current):
+                latest = current
+            if semver_key(in_major) < semver_key(current):
+                in_major = current
+            return name, current, latest, 'rn', in_major
+        if is_pre:
+            # Consider all versions on the same major — pre or stable.
+            # This handles graduation (e.g. 56.0.0-preview.x → 56.0.5 stable).
+            candidates = [v for v in all_versions if _parse_semver(v) and _parse_semver(v)[0] == cur_major]
+            latest = max(candidates, key=semver_key) if candidates else current
+            # in-major == overall for pre packages (already major-scoped).
+            in_major = latest
+        else:
+            candidates = [v for v in all_versions if not _is_prerelease(v)]
+            latest = max(candidates, key=semver_key) if candidates else current
+            # Highest stable WITHIN the current major — the safe upgrade that
+            # avoids a major-version jump (e.g. babel 7.x newest, not 8.x).
+            in_major_c = [v for v in candidates if _parse_semver(v) and _parse_semver(v)[0] == cur_major]
+            in_major = max(in_major_c, key=semver_key) if in_major_c else current
+        if semver_key(latest) < semver_key(current):
+            latest = current
+        if semver_key(in_major) < semver_key(current):
+            in_major = current
+        return name, current, latest, 'pre' if is_pre else 'stable', in_major
+    except Exception as e:
+        return name, current, f'ERROR: {e}', 'error', current
+
+results = []
+with ThreadPoolExecutor(max_workers=20) as ex:
+    futures = {ex.submit(get_latest, n, v): n for n, v in deps.items()}
+    for fut in futures:
+        results.append(fut.result())
+results.sort()
+
+print('\n=== OUTDATED ===')
+for name, cur, lat, kind, in_major in results:
+    if kind not in ('skip', 'error') and name not in PINNED and cur != lat and lat and 'ERROR' not in lat:
+        pre = ' [PRE]' if kind == 'pre' else ''
+        # If the cross-major latest is also reachable without leaving the
+        # current major, just print the one line. Otherwise show the safe
+        # in-major upgrade first, then flag the major jump separately so we
+        # can take the in-major bump without being forced onto a new major.
+        if in_major != lat and semver_key(in_major) > semver_key(cur):
+            if kind == 'rn':
+                label = lambda v: '.'.join(str(n) for n in _line(v))
+            else:
+                label = lambda v: str(_parse_semver(v)[0])
+            print(f'  {name}: {cur} -> {in_major}  (in-major){pre}')
+            print(f'      ↳ MAJOR jump available: -> {lat} (major {label(cur)} -> {label(lat)})')
+        else:
+            print(f'  {name}: {cur} -> {lat}{pre}')
+
+print('\n=== UPCOMING (unreleased: above the `latest` dist-tag — awareness only, not upgrades) ===')
+for name in sorted(UPCOMING):
+    if name in PINNED or not UPCOMING[name]:
+        continue
+    by_version = {}
+    for tag, v in UPCOMING[name]:
+        by_version.setdefault(v, []).append(tag)
+    print(f'  {name}: ' + ', '.join(f'{v} [{", ".join(t)}]' for v, t in by_version.items()))
+
+print('\n=== UP TO DATE ===')
+for name, cur, lat, kind, in_major in results:
+    if kind not in ('skip', 'error') and name not in PINNED and (cur == lat or not lat):
+        print(f'  {name}: {cur}')
+
+print('\n=== PINNED to react-native (sync by hand when react-native moves) ===')
+for name, cur, lat, kind, in_major in results:
+    if name in PINNED:
+        print(f'  {name}: {cur}')
+
+errors = [(name, lat) for name, cur, lat, kind, in_major in results if kind == 'error']
+if errors:
+    print('\n=== ERRORS (script broken — fix before trusting results) ===', file=sys.stderr)
+    for name, msg in errors:
+        print(f'  {name}: {msg}', file=sys.stderr)
+    sys.exit(1)

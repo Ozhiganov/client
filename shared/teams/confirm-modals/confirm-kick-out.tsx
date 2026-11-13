@@ -1,0 +1,157 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Teams from '@/constants/teams'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import {useNavigation} from '@react-navigation/native'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import setRouteParamsIfPresent from './set-route-params-if-present'
+import {useLoadedTeam} from '../team/use-loaded-team'
+import {useTeamsListMap} from '../use-teams-list'
+import AvatarBadge from './avatar-badge'
+
+type Props = {
+  members: string[]
+  teamID: T.Teams.TeamID
+}
+
+const ConfirmKickOut = (props: Props) => {
+  const styles = useStyles()
+  const {members, teamID} = props
+  const [subteamsToo, setSubteamsToo] = React.useState(false)
+  const [kickedVisible, setKickedVisible] = React.useState(false)
+  const removeMemberRPC = C.useRPC(T.RPCGen.teamsTeamRemoveMemberRpcPromise)
+  const {reload, teamDetails, teamMeta} = useLoadedTeam(teamID)
+  const teamMetaByID = useTeamsListMap()
+  const subteamIDs = React.useMemo(() => Array.from(teamDetails.subteams), [teamDetails.subteams])
+  const subteams = React.useMemo(
+    () => subteamIDs.map(id => teamMetaByID.get(id)?.teamname ?? '').filter(Boolean),
+    [subteamIDs, teamMetaByID]
+  )
+  const teamname = teamMeta.teamname
+  const waitingKeys = [
+    ...members.map(member => C.waitingKeyTeamsRemoveMember(teamID, member)),
+    ...members.flatMap(member =>
+      subteamIDs.map(subteamID => C.waitingKeyTeamsRemoveMember(subteamID, member))
+    ),
+  ]
+  const waiting = C.Waiting.useAnyWaiting(waitingKeys)
+  const waitingError = C.Waiting.useAnyErrors(waitingKeys)
+  const navigation = useNavigation()
+  const nav = useSafeNavigation()
+  const onCancel = () => nav.safeNavigateUp()
+  const removeMember = React.useCallback(
+    async (targetTeamID: T.Teams.TeamID, username: string) =>
+      await new Promise<void>((resolve, reject) => {
+        removeMemberRPC(
+          [
+            {
+              member: {
+                assertion: {assertion: username, removeFromSubtree: false},
+                type: T.RPCGen.TeamMemberToRemoveType.assertion,
+              },
+              teamID: targetTeamID,
+            },
+            [C.waitingKeyTeamsTeam(targetTeamID), C.waitingKeyTeamsRemoveMember(targetTeamID, username)],
+          ],
+          () => resolve(),
+          reject
+        )
+      }),
+    [removeMemberRPC]
+  )
+  const onRemove = React.useCallback(() => {
+    const f = async () => {
+      for (const member of members) {
+        await removeMember(teamID, member)
+      }
+      if (subteamsToo) {
+        for (const subteamID of subteamIDs) {
+          for (const member of members) {
+            await removeMember(subteamID, member)
+          }
+        }
+      }
+      await reload()
+    }
+    C.ignorePromise(f())
+  }, [members, reload, removeMember, subteamIDs, subteamsToo, teamID])
+
+  const wasWaitingRef = React.useRef(waiting)
+  React.useEffect(() => {
+    if (wasWaitingRef.current && !waiting && !waitingError) {
+      setRouteParamsIfPresent(navigation, 'team', {selectedMembers: undefined})
+      setKickedVisible(true)
+      setTimeout(() => {
+        C.Router2.navigateUp()
+      }, 1000)
+    }
+    if (wasWaitingRef.current !== waiting) {
+      wasWaitingRef.current = waiting
+    }
+  }, [navigation, waiting, waitingError])
+
+  const prompt = `Kick ${Teams.stringifyPeople(members)} out of ${teamname}?`
+  const header = (
+    <Kb.Box2 direction="vertical" relative={true}>
+      <Kb.AvatarLine usernames={members} size={64} layout="horizontal" maxShown={5} />
+      <AvatarBadge
+        icon="iconfont-block"
+        style={Kb.Styles.collapseStyles([
+          styles.iconContainer,
+          members.length > 5 && styles.iconContainerMany,
+        ])}
+        iconStyle={styles.headerIcon}
+      />
+    </Kb.Box2>
+  )
+  return (
+    <Kb.ConfirmModal
+      header={header}
+      prompt={prompt}
+      content={
+        <Kb.Box2 direction="vertical" gap="small" fullWidth={true}>
+          <Kb.Text type="Body" center={true}>
+            They will lose access to all the team chats and folders, and they won’t be able to get back unless
+            an admin invites them.
+          </Kb.Text>
+          {subteams.length !== 0 && (
+            <Kb.Checkbox
+              checked={subteamsToo}
+              onCheck={setSubteamsToo}
+              labelComponent={
+                <Kb.Text type="Body" style={Kb.Styles.globalStyles.flexOne}>
+                  Also kick them out of all subteams: <Kb.Text type="BodyBold">{subteams.join(', ')}</Kb.Text>
+                </Kb.Text>
+              }
+              style={Kb.Styles.globalStyles.fullWidth}
+            />
+          )}
+          <Kb.SimpleToast visible={kickedVisible} text="Kicked" iconType="iconfont-check" />
+        </Kb.Box2>
+      }
+      error={waitingError?.message ?? ''}
+      onCancel={onCancel}
+      onConfirm={kickedVisible ? undefined : onRemove}
+      confirmText="Kick out"
+      waitingKey={waitingKeys}
+    />
+  )
+}
+export default ConfirmKickOut
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  headerIcon: Kb.Styles.platformStyles({
+    common: {position: 'relative'},
+    isElectron: {top: 1},
+    isMobile: {right: -0.5, top: 0.5},
+  }),
+  iconContainer: {
+    bottom: -3,
+    position: 'absolute',
+    right: isMobile ? -24 : 0,
+  },
+  iconContainerMany: {
+    right: isMobile ? 0 : 20,
+  },
+}))

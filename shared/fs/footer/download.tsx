@@ -1,0 +1,150 @@
+import * as Kb from '@/common-adapters'
+import * as Kbfs from '../common'
+import * as T from '@/constants/types'
+import DownloadWrapper from './download-wrapper'
+import {formatDurationFromNowTo} from '@/util/timestamp'
+import * as FS from '@/constants/fs'
+import {openLocalPathInSystemFileManagerDesktop} from '@/util/fs-storeless-actions'
+import {useSavedDownload} from '@/util/fs-platform'
+import {openSavedFile} from '@/util/platform-specific'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type Props = {
+  downloadID: string
+  isFirst: boolean
+}
+
+const getProgress = (dlState: T.FS.DownloadState, styles: ReturnType<typeof useStyles>) => (
+  <Kb.Box2 style={styles.progress} direction="horizontal" fullWidth={true} centerChildren={true} gap="xtiny">
+    <Kb.Box2 alignSelf="center" direction="vertical" flex={1} relative={true}>
+      <Kb.Box2 alignSelf="center" direction="vertical" style={styles.tube} />
+      <Kb.Box2 alignSelf="center"
+        direction="vertical"
+        style={Kb.Styles.collapseStyles([
+          styles.tube,
+          styles.tubeStuffing,
+          {width: `${Math.round(100 * dlState.progress)}%`},
+        ])}
+      />
+    </Kb.Box2>
+    <Kb.Text type="BodyTinySemibold" negative={true}>
+      {formatDurationFromNowTo(dlState.endEstimate)}
+    </Kb.Text>
+  </Kb.Box2>
+)
+
+const Download = (props: Props) => {
+  const {downloadID, isFirst} = props
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const dlInfo = Kbfs.useFsDownloadInfo(downloadID)
+  const dlState = Kbfs.useFsDownloadState(downloadID)
+  const saved = useSavedDownload(downloadID)
+  const {redbar} = Kbfs.useFsRedbarActions()
+  const dismissDownload = Kbfs.useFsDismissDownload()
+  const cancelDownload = Kbfs.useFsCancelDownload()
+  const open = isMobile
+    ? isAndroid && saved
+      ? () => {
+          openSavedFile(saved.uri, saved.mime).catch((e: unknown) => {
+            redbar(e instanceof Error ? e.message : `Couldn't open ${dlInfo.filename}`)
+          })
+        }
+      : undefined
+    : dlState.localPath
+      ? () => openLocalPathInSystemFileManagerDesktop(dlState.localPath)
+      : () => {}
+  const dismiss = () => dismissDownload(downloadID)
+  const cancel = () => cancelDownload(downloadID)
+  Kbfs.useFsWatchDownloadForMobile(downloadID, T.FS.DownloadIntent.None)
+  return (
+    <DownloadWrapper dismiss={dismiss} isFirst={isFirst} done={dlState.done}>
+      <Kb.Box2 alignSelf="center"
+        direction="horizontal"
+        centerChildren={true}
+        style={Kb.Styles.collapseStyles([styles.download, !!dlState.error && styles.red])}
+        testID={TestIDs.FILES_DOWNLOAD}
+        gap="tiny"
+        gapStart={true}
+        gapEnd={true}
+      >
+        <Kb.Box2 direction="vertical" centerChildren={true} fullHeight={true}>
+          <Kb.Icon
+            type={dlState.done ? 'iconfont-success' : 'iconfont-download'}
+            color={theme.black_20}
+          />
+        </Kb.Box2>
+        <Kb.Box2 direction="vertical" flex={1} style={styles.nameAndProgress}>
+          <Kb.Text
+            type="BodySmallSemibold"
+            onClick={open}
+            style={styles.filename}
+            lineClamp={isMobile ? 1 : undefined}
+          >
+            {dlInfo.filename}
+          </Kb.Text>
+          {FS.downloadIsOngoing(dlState) && getProgress(dlState, styles)}
+        </Kb.Box2>
+        <Kb.Box2 direction="vertical" centerChildren={true} fullHeight={true}>
+          <Kb.Icon
+            type="iconfont-remove"
+            color={theme.white}
+            onClick={!FS.downloadIsOngoing(dlState) ? dismiss : cancel}
+          />
+        </Kb.Box2>
+      </Kb.Box2>
+    </DownloadWrapper>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      download: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.green,
+          borderRadius: Kb.Styles.borderRadius,
+        },
+        isElectron: {
+          height: 32,
+          width: 140,
+        },
+        isMobile: {
+          height: 40,
+          width: 160,
+        },
+      }),
+      filename: Kb.Styles.platformStyles({
+        common: {
+          color: theme.white,
+        },
+        isElectron: {
+          ...Kb.Styles.textEllipsis,
+        },
+      }),
+      nameAndProgress: {
+        flexShrink: 1,
+        minWidth: 0,
+      },
+      progress: {
+        marginTop: -2,
+      },
+      red: {
+        backgroundColor: theme.red,
+      },
+      tube: {
+        backgroundColor: theme.black_20,
+        borderRadius: 4.5,
+        height: 4,
+        width: '100%',
+      },
+      tubeStuffing: {
+        backgroundColor: theme.white,
+        left: 0,
+        position: 'absolute',
+        top: 0,
+      },
+    }) as const
+)
+
+export default Download

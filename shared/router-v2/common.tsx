@@ -1,0 +1,179 @@
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as Tabs from '@/constants/tabs'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {TabActions, type NavigationContainerRef} from '@react-navigation/core'
+import type {ParamListBase} from '@react-navigation/native'
+import type {HeaderOptions} from '@react-navigation/elements'
+import type {NativeStackHeaderProps} from '@react-navigation/native-stack'
+import {HeaderLeftButton} from '@/common-adapters/header-buttons'
+import type {NavState} from '@/constants/router'
+import Header from './header/index'
+
+// iOS: no opaque backgroundColor/border — screens using native bar items (unstable_header*Items)
+// render through the native appearance path which ignores headerStyle, so styling the others
+// creates two different bar types; pushing between them slides two opaque slabs (visible seam
+// riding the header during the transition) instead of morphing one native bar. The native
+// appearance already draws the theme card color (same palette value as theme.white).
+// Colors go through getters: this object lives at module scope, so a plain read would
+// bake in whatever the theme was at import time (before initDarkMode runs) and Android
+// resolves the palette at read time.
+export const headerDefaultStyle = isAndroid
+  ? {
+      get backgroundColor() {
+        return Kb.Styles.getTheme().white
+      },
+      get borderBottomColor() {
+        return Kb.Styles.getTheme().black_10
+      },
+      borderBottomWidth: Kb.Styles.hairlineWidth,
+      height: 44,
+    }
+  : {}
+
+export const tabBarStyle = {
+  get backgroundColor() {
+    return Kb.Styles.getTheme().blueDarkOrGreyDarkest
+  },
+} as const
+
+export const tabBarBlurEffect = isMobile ? ('systemDefault' as const) : undefined
+export const tabBarMinimizeBehavior = undefined
+
+export const tabToTestID = new Map<Tabs.Tab, string>([
+  [Tabs.peopleTab, TestIDs.NAV_TAB_PEOPLE],
+  [Tabs.chatTab, TestIDs.NAV_TAB_CHAT],
+  [Tabs.fsTab, TestIDs.NAV_TAB_FILES],
+  [Tabs.cryptoTab, TestIDs.NAV_TAB_CRYPTO],
+  [Tabs.teamsTab, TestIDs.NAV_TAB_TEAMS],
+  [Tabs.gitTab, TestIDs.NAV_TAB_GIT],
+  [Tabs.devicesTab, TestIDs.NAV_TAB_DEVICES],
+  [Tabs.settingsTab, TestIDs.NAV_TAB_SETTINGS],
+])
+
+export {useUserSwitchNavKey} from './use-user-switch-nav-key'
+
+const actionWidth = 64
+export const DEBUGCOLORS = __DEV__ && (false as boolean)
+
+type HeaderLeftProps = Parameters<NonNullable<HeaderOptions['headerLeft']>>[0]
+
+export const defaultNavigationOptions = isMobile
+  ? ({
+      // Lock to portrait by default. Only full-screen attachment views (chat/files)
+      // opt back into rotation via orientation: 'all'.
+      orientation: 'portrait',
+      headerBackButtonDisplayMode: 'minimal',
+      headerBackTitle: '',
+      // iOS uses the real system back button: its liquid glass container stays put and
+      // morphs across pushes, while a custom headerLeft view is recreated per screen and
+      // slides in with it. Android keeps the custom button (badge support, no glass).
+      ...(isIOS
+        ? {headerBackVisible: true}
+        : {
+            headerBackVisible: false,
+            headerLeft: ({tintColor}: HeaderLeftProps) => {
+              return <HeaderLeftButton autoDetectCanGoBack={true} tintColor={tintColor} />
+            },
+          }),
+      headerBackgroundContainerStyle: {
+        flexShrink: 0,
+        ...(DEBUGCOLORS ? {backgroundColor: 'pink'} : {}),
+      },
+      headerLeftContainerStyle: {
+        flexGrow: 0,
+        flexShrink: 0,
+        maxWidth: actionWidth,
+        minWidth: actionWidth,
+        paddingLeft: 8,
+        width: actionWidth,
+        ...(DEBUGCOLORS ? {backgroundColor: 'yellow'} : {}),
+      },
+      headerRightContainerStyle: {
+        flexGrow: 0,
+        flexShrink: 0,
+        maxWidth: actionWidth,
+        minWidth: actionWidth,
+        paddingRight: 8,
+        width: actionWidth,
+        ...(DEBUGCOLORS ? {backgroundColor: 'orange'} : {}),
+      },
+      headerStyle: headerDefaultStyle,
+      get headerTintColor() {
+        return Kb.Styles.getTheme().black_50
+      },
+      headerTitle: (hp: {children: React.ReactNode}) => (
+        <Kb.Text type="BodyBig" style={headerTitleStyle(Kb.Styles.getTheme())} lineClamp={1} center={true}>
+          {hp.children}
+        </Kb.Text>
+      ),
+      headerTitleAlign: isAndroid ? 'center' : undefined,
+      headerTitleContainerStyle: {
+        alignItems: 'stretch',
+        flexGrow: 1,
+        flexShrink: 0,
+        maxWidth: Kb.Styles.dimensionWidth - 16 * 2 - actionWidth * 2,
+        minHeight: 44,
+        ...(DEBUGCOLORS ? {backgroundColor: 'cyan'} : {}),
+      },
+    } as const)
+  : {
+      header: (p: NativeStackHeaderProps) => <Header {...(p as any)} />,
+      headerBackTitle: 'temp',
+      headerBackVisible: true,
+      headerLeft: (p: object) => <HeaderLeftButton {...p} />,
+      headerLeftContainerStyle: {
+        paddingLeft: 8,
+        width: actionWidth,
+      },
+      headerRightContainerStyle: {paddingRight: 8},
+      headerStyle: headerDefaultStyle,
+      headerTitle: (hp: {children: React.ReactNode}) => (
+        <Kb.Text type="Header" style={headerTitleStyle(Kb.Styles.getTheme())} lineClamp={1} center={true}>
+          {hp.children}
+        </Kb.Text>
+      ),
+      headerTitleContainerStyle: {
+        alignItems: 'stretch' as const,
+        flexGrow: 1,
+      },
+    }
+
+const headerTitleStyle = Kb.Styles.createThemedValue(theme =>
+  Kb.Styles.platformStyles({
+    common: {color: theme.black},
+    isElectron: {
+      alignSelf: 'center',
+      marginLeft: Kb.Styles.globalMargins.xsmall,
+    },
+    isMobile: {
+      ...(DEBUGCOLORS ? {backgroundColor: 'pink'} : {}),
+    },
+  })
+)
+
+type SubnavNavigation = Pick<NavigationContainerRef<ParamListBase>, 'dispatch' | 'emit'>
+
+export const useSubnavTabAction = (navigation: SubnavNavigation, state: NavState) => {
+  const onSelectTab = (tab: string) => {
+    const routes = state && 'routes' in state ? state.routes : undefined
+    const route = routes?.find((r: {name?: string; key?: string}) => r.name === tab)
+    const key = route?.key
+    const event = key
+      ? navigation.emit({
+          canPreventDefault: true,
+          target: key,
+          // @ts-expect-error tabPress is valid but not in the emit type
+          type: 'tabPress',
+        })
+      : {defaultPrevented: false}
+
+    if (!event.defaultPrevented) {
+      navigation.dispatch({
+        ...TabActions.jumpTo(tab),
+        target: state?.key,
+      })
+    }
+  }
+  return onSelectTab
+}

@@ -1,0 +1,438 @@
+package teams
+
+import (
+	"context"
+	"testing"
+
+	"github.com/keybase/client/go/engine"
+	"github.com/keybase/client/go/teams/hidden"
+
+	"github.com/keybase/clockwork"
+
+	"github.com/keybase/client/go/libkb"
+	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
+)
+
+func makeHiddenRotation(t *testing.T, userContext *libkb.GlobalContext, teamName keybase1.TeamName) {
+	team, err := GetForTestByStringName(context.TODO(), userContext, teamName.String())
+	require.NoError(t, err)
+	err = team.Rotate(context.TODO(), keybase1.RotationType_HIDDEN)
+	require.NoError(t, err)
+}
+
+func loadTeamAndAssertCommittedAndUncommittedSeqnos(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, uncommittedSeqno keybase1.Seqno) {
+	// since polling does not take into account hidden chain updates, manually update the merkle root.
+	_, err := tc.G.GetMerkleClient().FetchRootFromServer(libkb.NewMetaContextForTest(*tc), 0)
+	require.NoError(t, err)
+	_, teamHiddenChain, err := tc.G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uncommittedSeqno, teamHiddenChain.Last, "committed seqno")
+}
+
+func assertHiddenMerkleErrorType(t *testing.T, err error, expType libkb.HiddenMerkleErrorType) {
+	require.Error(t, err)
+	require.ErrorAs(t, err, new(libkb.HiddenMerkleError))
+	require.Equal(t, expType, err.(libkb.HiddenMerkleError).ErrorType())
+}
+
+func loadTeamAndCheckCommittedAndUncommittedSeqnos(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, uncommittedSeqno keybase1.Seqno) bool {
+	_, teamHiddenChain, err := tc.G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	require.NoError(t, err)
+	if uncommittedSeqno != teamHiddenChain.Last {
+		t.Logf("Error: uncommittedSeqno != teamHiddenChain.Last: %v != %v ", uncommittedSeqno, teamHiddenChain.Last)
+		return false
+	}
+	return true
+}
+
+func loadTeamAndAssertUncommittedSeqno(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, uncommittedSeqno keybase1.Seqno) {
+	_, teamHiddenChain, err := tc.G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uncommittedSeqno, teamHiddenChain.Last)
+}
+
+func loadTeamAndAssertNoHiddenChainExists(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID) {
+	teamChain, teamHiddenChain, err := tc.G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, teamChain)
+	require.Nil(t, teamHiddenChain)
+}
+
+func makePaperKey(t *testing.T, uTc *libkb.TestContext) {
+	uis := libkb.UIs{
+		LogUI:    uTc.G.UI.GetLogUI(),
+		LoginUI:  &libkb.TestLoginUI{},
+		SecretUI: &libkb.TestSecretUI{},
+	}
+	eng := engine.NewPaperKey(uTc.G)
+	err := engine.RunEngine2(libkb.NewMetaContextForTest(*uTc).WithUIs(uis), eng)
+	require.NoError(t, err)
+}
+
+func publishNewMainMerkleRoot(t *testing.T, uTc *libkb.TestContext) {
+	// Adding a paper key publishes a new main Merkle tree version.
+	makePaperKey(t, uTc)
+}
+
+func retryTestNTimes(t *testing.T, n int, f func(t *testing.T) bool) {
+	for range n {
+		succeeded := f(t)
+		if succeeded {
+			t.Logf("Succeeded!")
+			return
+		}
+	}
+	require.Failf(t, "", "Test did not succeed any of the %v times", n)
+}
+
+func TestHiddenLoadSucceedsIfServerDoesntCommitLinks(t *testing.T) {
+	retryTestNTimes(t, 5, testHiddenLoadSucceedsIfServerDoesntCommitLinks)
+}
+
+func testHiddenLoadSucceedsIfServerDoesntCommitLinks(t *testing.T) bool {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	clock := clockwork.NewFakeClock()
+	tcs[1].G.SetClock(clock)
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	// There have been no hidden rotations yet.
+	loadTeamAndAssertNoHiddenChainExists(t, tcs[1], teamID)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamAndAssertUncommittedSeqno(t, tcs[1], teamID, 1)
+
+	// Publish a new main Merkle root.
+	publishNewMainMerkleRoot(t, tcs[0])
+
+	loadTeamAndAssertCommittedAndUncommittedSeqnos(t, tcs[1], teamID, 1)
+
+	// make another hidden rotation
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	if !loadTeamAndCheckCommittedAndUncommittedSeqnos(t, tcs[1], teamID, 2) {
+		return false
+	}
+
+	// now, move the clock forward and reload. The hidden loader should complain about seqno 2 not being committed
+	clock.Advance(2 * hidden.MaxDelayInCommittingHiddenLinks)
+	tcs[1].G.SetClock(clock)
+	_, _, err = tcs[1].G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+
+	return err == nil
+}
+
+type CorruptingMockLoaderContext struct {
+	LoaderContext
+
+	merkleCorruptorFunc func(r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) (keybase1.Seqno, keybase1.LinkID, *libkb.MerkleHiddenResponse, *libkb.MerkleRoot, error)
+}
+
+func (c CorruptingMockLoaderContext) merkleLookupWithHidden(ctx context.Context, teamID keybase1.TeamID, public bool) (r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) {
+	return c.merkleCorruptorFunc(c.LoaderContext.merkleLookupWithHidden(ctx, teamID, public))
+}
+
+var _ LoaderContext = CorruptingMockLoaderContext{}
+
+func TestHiddenLoadFailsIfServerRollsbackUncommittedSeqno(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	// There have been no hidden rotations yet.
+	loadTeamAndAssertNoHiddenChainExists(t, tcs[1], teamID)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamAndAssertUncommittedSeqno(t, tcs[1], teamID, 1)
+
+	// now load the team again, but this time we change the response of the server to rollback the number of committed sequence numbers
+	newLoader := tcs[1].G.GetTeamLoader()
+	newLoader.(*TeamLoader).world = CorruptingMockLoaderContext{
+		LoaderContext: newLoader.(*TeamLoader).world,
+		merkleCorruptorFunc: func(r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) (keybase1.Seqno, keybase1.LinkID, *libkb.MerkleHiddenResponse, *libkb.MerkleRoot, error) {
+			if hiddenResp != nil && hiddenResp.UncommittedSeqno >= 1 {
+				hiddenResp.UncommittedSeqno--
+				t.Logf("Simulating malicious server: updating hiddenResp.UncommittedSeqno (new value %v)", hiddenResp.UncommittedSeqno)
+			}
+			return r1, r2, hiddenResp, lastMerkleRoot, err
+		},
+	}
+	tcs[1].G.SetTeamLoader(newLoader)
+
+	_, _, err = tcs[1].G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	assertHiddenMerkleErrorType(t, err, libkb.HiddenMerkleErrorRollbackUncommittedSeqno)
+}
+
+func TestHiddenLoadFailsIfServerDoesNotReturnPromisedLinks(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	// There have been no hidden rotations yet.
+	loadTeamAndAssertNoHiddenChainExists(t, tcs[1], teamID)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamAndAssertUncommittedSeqno(t, tcs[1], teamID, 1)
+
+	// now load the team again, but this time we change the response of the server as if there were more hidden links
+	newLoader := tcs[1].G.GetTeamLoader()
+	newLoader.(*TeamLoader).world = CorruptingMockLoaderContext{
+		LoaderContext: newLoader.(*TeamLoader).world,
+		merkleCorruptorFunc: func(r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) (keybase1.Seqno, keybase1.LinkID, *libkb.MerkleHiddenResponse, *libkb.MerkleRoot, error) {
+			if hiddenResp != nil && hiddenResp.UncommittedSeqno >= 1 {
+				hiddenResp.UncommittedSeqno += 5
+				t.Logf("Simulating malicious server: updating hiddenResp.UncommittedSeqno (new value %v)", hiddenResp.UncommittedSeqno)
+			}
+			return r1, r2, hiddenResp, lastMerkleRoot, err
+		},
+	}
+	tcs[1].G.SetTeamLoader(newLoader)
+
+	_, _, err = tcs[1].G.GetTeamLoader().Load(context.TODO(), keybase1.LoadTeamArg{
+		ID:          teamID,
+		ForceRepoll: true,
+	})
+	assertHiddenMerkleErrorType(t, err, libkb.HiddenMerkleErrorServerWitholdingLinks)
+}
+
+func loadTeamFTLAndAssertName(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, teamName keybase1.TeamName) {
+	res, err := tc.G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tc), keybase1.FastTeamLoadArg{
+		ID:           teamID,
+		ForceRefresh: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, res.Name.String(), teamName.String())
+}
+
+func loadTeamFTLAndAssertGeneration(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, teamName keybase1.TeamName, perTeamKeyGeneration int) {
+	res, err := tc.G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tc), keybase1.FastTeamLoadArg{
+		ID:                   teamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(perTeamKeyGeneration)},
+	})
+	require.NoError(t, err)
+	require.Equal(t, res.Name.String(), teamName.String())
+	require.Len(t, res.ApplicationKeys, 1)
+	require.EqualValues(t, perTeamKeyGeneration, res.ApplicationKeys[0].KeyGeneration)
+}
+
+func loadTeamFTLAndAssertGenerationUnavailable(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, perTeamKeyGeneration int) {
+	_, err := tc.G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tc), keybase1.FastTeamLoadArg{
+		ID:                   teamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(perTeamKeyGeneration)},
+	})
+	require.Error(t, err)
+	require.ErrorAs(t, err, new(FTLMissingSeedError))
+}
+
+func loadTeamFTLAndAssertMaxGeneration(t *testing.T, tc *libkb.TestContext, teamID keybase1.TeamID, teamName keybase1.TeamName, perTeamKeyGeneration int) {
+	_, err := tc.G.GetMerkleClient().FetchRootFromServer(libkb.NewMetaContextForTest(*tc), 0)
+	require.NoError(t, err)
+	loadTeamFTLAndAssertGeneration(t, tc, teamID, teamName, perTeamKeyGeneration)
+	loadTeamFTLAndAssertGenerationUnavailable(t, tc, teamID, perTeamKeyGeneration+1)
+}
+
+func TestFTLSucceedsIfServerDoesntCommitLinks(t *testing.T) {
+	retryTestNTimes(t, 5, testFTLSucceedsIfServerDoesntCommitLinks)
+}
+
+func testFTLSucceedsIfServerDoesntCommitLinks(t *testing.T) bool {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	clock := clockwork.NewFakeClock()
+	tcs[1].G.SetClock(clock)
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	loadTeamFTLAndAssertName(t, tcs[1], teamID, teamName)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 2)
+
+	publishNewMainMerkleRoot(t, tcs[0])
+
+	// make another hidden rotation
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 3)
+
+	// now, move the clock forward and reload. The hidden loader should complain about hidden seqno 2 not being committed
+	clock.Advance(2 * hidden.MaxDelayInCommittingHiddenLinks)
+	tcs[1].G.SetClock(clock)
+	_, err = tcs[1].G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tcs[1]), keybase1.FastTeamLoadArg{
+		ID:                   teamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(3)},
+	})
+
+	return err == nil
+}
+
+func TestFTLFailsIfServerRollsbackUncommittedSeqno(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 1)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 2)
+
+	// now load the team again, but this time we change the response of the server to rollback the number of committed sequence numbers
+	newLoader := tcs[1].G.GetFastTeamLoader()
+	newLoader.(*FastTeamChainLoader).world = CorruptingMockLoaderContext{
+		LoaderContext: newLoader.(*FastTeamChainLoader).world,
+		merkleCorruptorFunc: func(r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) (keybase1.Seqno, keybase1.LinkID, *libkb.MerkleHiddenResponse, *libkb.MerkleRoot, error) {
+			if hiddenResp != nil && hiddenResp.UncommittedSeqno >= 1 {
+				hiddenResp.UncommittedSeqno--
+				t.Logf("Simulating malicious server: updating hiddenResp.UncommittedSeqno (new value %v)", hiddenResp.UncommittedSeqno)
+			}
+			return r1, r2, hiddenResp, lastMerkleRoot, err
+		},
+	}
+	tcs[1].G.SetFastTeamLoader(newLoader)
+
+	_, err = tcs[1].G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tcs[1]), keybase1.FastTeamLoadArg{
+		ID:                   teamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(2)},
+	})
+	assertHiddenMerkleErrorType(t, err, libkb.HiddenMerkleErrorRollbackUncommittedSeqno)
+}
+
+func TestFTLFailsIfServerDoesNotReturnPromisedLinks(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 2)
+	defer cleanup()
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+
+	t.Logf("add B to the team so they can load it")
+	_, err := AddMember(context.TODO(), tcs[0].G, teamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 1)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	loadTeamFTLAndAssertMaxGeneration(t, tcs[1], teamID, teamName, 2)
+
+	makeHiddenRotation(t, tcs[0].G, teamName)
+
+	// now load the team again, but this time we change the response of the server as if there were more hidden links
+	newLoader := tcs[1].G.GetFastTeamLoader()
+	newLoader.(*FastTeamChainLoader).world = CorruptingMockLoaderContext{
+		LoaderContext: newLoader.(*FastTeamChainLoader).world,
+		merkleCorruptorFunc: func(r1 keybase1.Seqno, r2 keybase1.LinkID, hiddenResp *libkb.MerkleHiddenResponse, lastMerkleRoot *libkb.MerkleRoot, err error) (keybase1.Seqno, keybase1.LinkID, *libkb.MerkleHiddenResponse, *libkb.MerkleRoot, error) {
+			if hiddenResp != nil && hiddenResp.UncommittedSeqno >= 1 {
+				hiddenResp.UncommittedSeqno += 5
+				t.Logf("Simulating malicious server: updating hiddenResp.UncommittedSeqno (new value %v)", hiddenResp.UncommittedSeqno)
+			}
+			return r1, r2, hiddenResp, lastMerkleRoot, err
+		},
+	}
+	tcs[1].G.SetFastTeamLoader(newLoader)
+
+	_, err = tcs[1].G.GetFastTeamLoader().Load(libkb.NewMetaContextForTest(*tcs[1]), keybase1.FastTeamLoadArg{
+		ID:                   teamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(3)},
+	})
+	assertHiddenMerkleErrorType(t, err, libkb.HiddenMerkleErrorServerWitholdingLinks)
+}
+
+func TestSubteamReaderFTL(t *testing.T) {
+	fus, tcs, cleanup := setupNTests(t, 3)
+	defer cleanup()
+
+	t.Logf("create team")
+	teamName, teamID := createTeam2(*tcs[0])
+	for range 4 {
+		makeHiddenRotation(t, tcs[0].G, teamName)
+	}
+	createSubteam(tcs[0], teamName, "unused")
+	subteamName, subteamID := createSubteam(tcs[0], teamName, "sub")
+	_, err := AddMember(context.TODO(), tcs[0].G, subteamName.String(), fus[1].Username, keybase1.TeamRole_WRITER, nil)
+	require.NoError(t, err)
+	mctx := libkb.NewMetaContextForTest(*tcs[1])
+	_, err = mctx.G().GetFastTeamLoader().Load(mctx, keybase1.FastTeamLoadArg{
+		ID:                   subteamID,
+		ForceRefresh:         true,
+		Applications:         []keybase1.TeamApplication{keybase1.TeamApplication_CHAT},
+		KeyGenerationsNeeded: []keybase1.PerTeamKeyGeneration{keybase1.PerTeamKeyGeneration(1)},
+	})
+	require.NoError(t, err)
+
+	// Check that U1's hidden team data for the parent team is still stored, and that
+	// the ratchets persist (even though there's no other data there).
+	var htc *keybase1.HiddenTeamChain
+	htc, err = mctx.G().GetHiddenTeamChainManager().Load(mctx, teamID)
+	require.NoError(t, err)
+	require.NotNil(t, htc)
+	ratchet, ok := htc.RatchetSet.Ratchets[keybase1.RatchetType_MAIN]
+	require.True(t, ok)
+	require.Equal(t, ratchet.Triple.Seqno, keybase1.Seqno(4))
+	require.Equal(t, htc.Last, keybase1.Seqno(0))
+	require.Empty(t, htc.Outer)
+}

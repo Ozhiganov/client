@@ -1,0 +1,36 @@
+export type PlatformsExpandedType =
+  | 'btc'
+  | 'dns'
+  | 'dnsOrGenericWebSite'
+  | 'facebook'
+  | 'github'
+  | 'hackernews'
+  | 'http'
+  | 'https'
+  | 'pgp'
+  | 'reddit'
+  | 'twitter'
+  | 'web'
+  | 'zcash'
+  | 'rooter'
+
+const PlatformsExpanded = [
+  'btc',
+  'dns',
+  'dnsOrGenericWebSite',
+  'facebook',
+  'github',
+  'hackernews',
+  'http',
+  'https',
+  'pgp',
+  'reddit',
+  'twitter',
+  'web',
+  'zcash',
+  ...(__DEV__ ? ['rooter' as const] : []),
+]
+
+const isPlatformsExpandedType = (str: string): str is PlatformsExpandedType => PlatformsExpanded.includes(str)
+export const asPlatformsExpandedType = (str: string): PlatformsExpandedType | undefined =>
+  isPlatformsExpandedType(str) ? str : undefined

@@ -1,0 +1,203 @@
+import * as C from '@/constants'
+import {isAssertion} from '@/constants/chat/helpers'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import {useCurrentUserState} from '@/stores/current-user'
+import {navToProfile} from '@/constants/router'
+import type * as T from '@/constants/types'
+import logger from '@/logger'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {RPCError} from '@/util/errors'
+import {useBlockButtonsInfo} from './block-buttons-state'
+import {
+  useConversationThreadID,
+  useConversationThreadSelector,
+  useThreadMeta,
+  useThreadRpc,
+} from '../conversation/thread-context'
+import {useConversationParticipantsSelector} from '../conversation/data-hooks'
+import type {ChatThreadRpc} from '../conversation/chat-rpc'
+import {useConversationSendActions} from '../conversation/send-actions'
+
+const dismissBlockButtons = (rpc: ChatThreadRpc, teamID: T.RPCGen.TeamID) => {
+  const f = async () => {
+    try {
+      await rpc.dismissBlockButtons(teamID)
+    } catch (error) {
+      if (error instanceof RPCError) {
+        logger.error(`Couldn't dismiss block buttons: ${error.message}`)
+      }
+    }
+  }
+  C.ignorePromise(f())
+}
+
+const BlockButtons = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const navigateAppend = C.Router2.navigateAppend
+  const conversationIDKey = useConversationThreadID()
+  const rpc = useThreadRpc()
+  const {sendWave} = useConversationSendActions()
+  const {team, teamID} = useThreadMeta(C.useShallow(m => ({team: m.teamname, teamID: m.teamID})))
+  const participantInfo = useConversationParticipantsSelector(
+    conversationIDKey,
+    C.useShallow(p => ({all: p.all, name: p.name}))
+  )
+  const blockButtonInfo = useBlockButtonsInfo(teamID)
+  const currentUser = useCurrentUserState(s => s.username)
+  // Derive the boolean in the selector so thread churn only re-renders this when the
+  // answer flips; skip the scan entirely for the common no-block-buttons case.
+  const hasOwnMessage = useConversationThreadSelector(
+    s =>
+      !!blockButtonInfo &&
+      !!currentUser &&
+      (s.messageOrdinals ?? []).some(ordinal => s.messageMap.get(ordinal)?.author === currentUser)
+  )
+
+  React.useEffect(() => {
+    if (hasOwnMessage && blockButtonInfo && teamID) {
+      dismissBlockButtons(rpc, teamID)
+    }
+  }, [blockButtonInfo, hasOwnMessage, rpc, teamID])
+
+  if (!blockButtonInfo) {
+    return null
+  }
+  const adder = blockButtonInfo.adder
+  const others = (team ? participantInfo.all : participantInfo.name).filter(
+    person => person !== currentUser && person !== adder && !isAssertion(person)
+  )
+
+  const onViewProfile = () => navToProfile(adder)
+  const onViewTeam = () => navigateAppend({name: 'team', params: {teamID}})
+  const onBlock = () =>
+    navigateAppend({
+      name: 'chatBlockingModal',
+      params: {
+        blockUserByDefault: true,
+        conversationIDKey,
+        others: others,
+        team: team,
+        username: adder,
+      },
+    })
+  const onDismiss = () => dismissBlockButtons(rpc, teamID)
+
+  const buttonRow = (
+    <Kb.ButtonBar
+      fullWidth={isMobile}
+      direction={isMobile ? 'column' : 'row'}
+      style={styles.button}
+    >
+      <Kb.WaveButton
+        small={true}
+        onWave={sendWave}
+        toMany={others.length > 0 || !!team}
+        style={styles.waveButton}
+      />
+      {!team && others.length === 0 ? (
+        <Kb.Button
+          label="View profile"
+          style={styles.button}
+          small={true}
+          mode="Secondary"
+          onClick={onViewProfile}
+        />
+      ) : null}
+      {team ? (
+        <Kb.Button
+          label="View team"
+          style={styles.button}
+          mode="Secondary"
+          small={true}
+          onClick={onViewTeam}
+        />
+      ) : null}
+      <Kb.Button
+        label="Block"
+        type="Danger"
+        mode="Secondary"
+        style={styles.button}
+        small={true}
+        onClick={onBlock}
+      />
+    </Kb.ButtonBar>
+  )
+  return isMobile ? (
+    <Kb.Box2
+      direction="vertical"
+      centerChildren={true}
+      gap="tiny"
+      relative={true}
+      style={styles.dismissContainer}
+      fullWidth={true}
+      testID={TestIDs.CHAT_BLOCK_BUTTONS}
+    >
+      <Kb.Box2 direction="horizontal" gap="tiny" fullWidth={true} centerChildren={true}>
+        <Kb.Text type="BodySmall">
+          {team ? `${adder} added you to this team.` : `You don't follow ${adder}.`}
+        </Kb.Text>
+        <Kb.Icon
+          style={styles.dismissIcon}
+          type="iconfont-close"
+          color={theme.black_20}
+          onClick={onDismiss}
+          testID={TestIDs.CHAT_BLOCK_BUTTONS_DISMISS}
+        />
+      </Kb.Box2>
+      <Kb.Box2 direction="vertical" gap="tiny" fullWidth={true} style={styles.buttonContainer}>
+        {buttonRow}
+      </Kb.Box2>
+    </Kb.Box2>
+  ) : (
+    <Kb.Box2
+      direction="horizontal"
+      gap="xsmall"
+      alignItems="center"
+      style={styles.container}
+      testID={TestIDs.CHAT_BLOCK_BUTTONS}
+    >
+      <Kb.Text type="BodySmall">
+        {team ? `${adder} added you to this team.` : `You don't follow ${adder}.`}
+      </Kb.Text>
+      {buttonRow}
+      <Kb.Icon type="iconfont-remove" onClick={onDismiss} testID={TestIDs.CHAT_BLOCK_BUTTONS_DISMISS} />
+    </Kb.Box2>
+  )
+}
+
+export default BlockButtons
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      button: Kb.Styles.platformStyles({
+        isElectron: {
+          width: '',
+        },
+        isMobile: {
+          ...Kb.Styles.padding(0, Kb.Styles.globalMargins.small),
+        },
+      }),
+      buttonContainer: {maxWidth: 322},
+      container: {
+        alignSelf: 'flex-start',
+        marginLeft: 57,
+      },
+      dismissContainer: {
+        backgroundColor: theme.blueGrey,
+        ...Kb.Styles.paddingV(Kb.Styles.globalMargins.xsmall),
+      },
+      dismissIcon: {
+        position: 'absolute',
+        right: Kb.Styles.globalMargins.small,
+        top: -1,
+      },
+      waveButton: Kb.Styles.platformStyles({
+        isElectron: {
+          width: '',
+        },
+      }),
+    }) as const
+)

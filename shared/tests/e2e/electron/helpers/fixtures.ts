@@ -1,0 +1,250 @@
+import {test as base, type ConsoleMessage, type Page, type WorkerInfo} from '@playwright/test'
+import * as fs from 'fs'
+import {appLogPath} from '../app-log'
+import {checkRendererAfterReload, connectToElectron} from './connect'
+import {closeMainInspector, restoreMainProcessStubs} from './main-process'
+import {closeOrphanTrackerWindows} from './windows'
+import {loadE2EAccounts, mainServiceLog} from '@/tests/e2e/accounts/env'
+import {ensureChatData} from '@/tests/e2e/shared/chat-data'
+import {copyLogWindow} from '@/tests/e2e/shared/gate/log-window'
+import {requireMainIsSmoke} from '@/tests/e2e/shared/peer-service'
+import {mergeRecordings, startRecorder, takeKept, takeRecorder, type Recording} from '@/tests/e2e/shared/recorder'
+
+type WorkerFixtures = {_electronPage: Page; _mainInspector: undefined}
+type TestFixtures = {_mainIsSmoke: undefined; _mainProcess: undefined; _coverage: undefined; _rendererErrors: undefined; _serviceLog: undefined; page: Page}
+
+// Uncaught renderer errors that are known noise, not app failures. Each entry says why; keep the
+// list short and the patterns narrow. A match is still attached to the results, just not failed.
+const benignPageErrors: ReadonlyArray<{pattern: RegExp; why: string}> = []
+
+const isBenign = (message: string) => benignPageErrors.some(b => b.pattern.test(message))
+
+// Chromium's own console error for each Content Security Policy or Trusted Types violation
+const cspViolation = /violates the following Content Security Policy directive|requires 'Trusted(?:HTML|Script|ScriptURL)' assignment/
+
+// The last `lines` lines of a log file, reading only its final 256KB; a missing file is said so
+// rather than failing the test that is already failing.
+function logTail(file: string, lines: number): string {
+  try {
+    const fd = fs.openSync(file, 'r')
+    try {
+      const size = fs.fstatSync(fd).size
+      const len = Math.min(size, 256 * 1024)
+      const buf = Buffer.alloc(len)
+      fs.readSync(fd, buf, 0, len, size - len)
+      const all = buf.toString('utf8').split('\n')
+      // the cut can land mid-line: drop that partial first line
+      if (size > len) all.shift()
+      if (all.at(-1) === '') all.pop()
+      return all.slice(-lines).join('\n')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return `not found: ${file}`
+  }
+}
+
+// Read only for a failed test, which an unreadable env file must not fail a second time: undefined
+// then, and the test keeps no service log.
+const serviceLogPath = () => {
+  try {
+    return mainServiceLog()
+  } catch {
+    return undefined
+  }
+}
+
+// The service logs about 1MB a second under the flows, so a failure keeps at most this much of it
+const serviceLogWindowMs = 120_000
+
+// After a reload the app loads the module that installs the recorder (main2.desktop.tsx) only once
+// its entry has run, so the new page is given until the recorder appears.
+const reloadDeadlineMs = 20_000
+const restartRecorder = async (page: Page) => {
+  try {
+    await page.waitForFunction(() => !!(globalThis as {__kbE2ERecorder?: object}).__kbE2ERecorder, undefined, {timeout: reloadDeadlineMs})
+  } catch (e) {
+    throw new Error(`waiting for the reloaded app's recorder for ${reloadDeadlineMs / 1000}s: ${e instanceof Error ? e.message : String(e)}`, {cause: e})
+  }
+  await startRecorder(page, {includeBoot: true})
+}
+
+export const test = base.extend<TestFixtures, WorkerFixtures>({
+  // Before every test body, not just once per worker: a flow that switched the main service and
+  // failed to switch it back fails the next test, naming the account, instead of driving the app
+  // as that account.
+  _mainIsSmoke: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, setup) => {
+      await requireMainIsSmoke(loadE2EAccounts())
+      await setup(undefined)
+    },
+    {auto: true},
+  ],
+
+  _electronPage: [
+    // Playwright requires object destructuring syntax here — it uses static analysis to
+    // detect fixture dependencies, so a plain identifier like `_fixtures` breaks injection.
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, setup, workerInfo: WorkerInfo) => {
+      // every worker, before it touches the app: the app acts as whoever the main service is signed in as
+      await requireMainIsSmoke(loadE2EAccounts())
+      const isDark = workerInfo.project.name.endsWith('-dark')
+      const {page} = await connectToElectron()
+      // emulateMedia sets prefers-color-scheme via CDP and persists across reloads
+      await page.emulateMedia({colorScheme: isDark ? 'dark' : 'light'})
+      // Reload to clear in-memory state and apply the new color scheme; a renderer that comes back
+      // white fails here at once with the app log's tail
+      await checkRendererAfterReload(page)
+      // a tracker window a failed test left open outlives the reload, and every later open of it fails
+      await closeOrphanTrackerWindows(page.context(), page)
+      try {
+        await setup(page)
+      } finally {
+        await page.emulateMedia({colorScheme: null})
+      }
+      // Do NOT close — that kills the Electron process
+    },
+    // connect (up to 20s) plus a reload and the chat tab coming back (up to 20s each)
+    {scope: 'worker', timeout: 70_000},
+  ],
+
+  page: async ({_electronPage}, setup) => {
+    await setup(_electronPage)
+  },
+
+  // Any stub in the app's main process (main-process.ts) comes out after the test, one an earlier
+  // worker left included, so the next test meets the real dialogs and notifications; a restore that
+  // fails fails the test.
+  _mainProcess: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, setup) => {
+      await setup(undefined)
+      await restoreMainProcessStubs()
+    },
+    {auto: true},
+  ],
+
+  // The main process's inspector runs any code sent to it, so it is closed when the worker is done
+  // with the app (a no-op when nothing opened it).
+  _mainInspector: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, setup) => {
+      await setup(undefined)
+      await closeMainInspector()
+    },
+    {auto: true, scope: 'worker'},
+  ],
+
+  // Records the routes the app showed and the RPC methods it sent during the test, attached as
+  // coverage.json; `startRoutes` is the screen already shown when the test began (see the recorder
+  // in visual/fixtures/runtime.ts). A reload in the test starts a new page whose recorder is restarted once it is
+  // installed: the new page's first calls are lost, and so is what the page before the reload saw
+  // unless the flow reloaded through reloadKeepingCoverage (persisted.ts); `reloads` says how many
+  // there were.
+  _coverage: [
+    async ({page}, setup, testInfo) => {
+      await startRecorder(page)
+      let reloads = 0
+      const errors: Array<string> = []
+      const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+      const restarts: Array<Promise<void>> = []
+      const onLoad = () => {
+        reloads++
+        restarts.push(restartRecorder(page).catch((e: unknown) => void errors.push(`restart after a reload: ${message(e)}`)))
+      }
+      page.on('load', onLoad)
+      await setup(undefined)
+      page.off('load', onLoad)
+      await Promise.all(restarts)
+      let got: Recording = {routes: [], rpcs: [], startRoutes: []}
+      try {
+        got = await takeRecorder(page)
+      } catch (e) {
+        errors.push(message(e))
+      }
+      got = mergeRecordings([...takeKept(page), got])
+      const error = errors.join('; ')
+      const coverage = {...(error ? {error} : {}), reloads, routes: got.routes, rpcs: got.rpcs, startRoutes: got.startRoutes}
+      await testInfo.attach('coverage.json', {body: JSON.stringify(coverage, null, 2), contentType: 'application/json'})
+      // a test that failed already has its reason; a passing one fails for the missing record
+      if (error && testInfo.status === testInfo.expectedStatus) throw new Error(`coverage not recorded: ${error}`)
+    },
+    {auto: true},
+  ],
+
+  // A failed test keeps the service log it ran under (service.log beside its screenshot): the service
+  // rotates its log away within minutes, long before anyone reads the failure.
+  _serviceLog: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, setup, testInfo) => {
+      const started = Date.now()
+      await setup(undefined)
+      if (testInfo.status === testInfo.expectedStatus) return
+      const log = serviceLogPath()
+      if (!log) return
+      const ended = Date.now()
+      const dest = testInfo.outputPath('service.log')
+      const got = await copyLogWindow(log, Math.max(started, ended - serviceLogWindowMs), ended, dest)
+      // named, not attached: the html report would copy the whole file into itself
+      const from = got.files.length ? got.files.join(', ') : `nothing at ${log}`
+      await testInfo.attach('service-log', {body: `${dest}: ${got.lines} lines from ${from}`, contentType: 'text/plain'})
+    },
+    {auto: true},
+  ],
+
+  // Listens from before the test body runs to after it ends: renderer console errors are attached
+  // to the results, and a Content Security Policy violation or any uncaught page error not listed as
+  // benign fails the test.
+  _rendererErrors: [
+    async ({page}, setup, testInfo) => {
+      const consoleErrors: Array<string> = []
+      const pageErrors: Array<string> = []
+      const onConsole = (m: ConsoleMessage) => {
+        if (m.type() === 'error') consoleErrors.push(m.text())
+      }
+      const onPageError = (e: Error) => {
+        pageErrors.push(`${e.name}: ${e.message}\n${e.stack ?? ''}`)
+      }
+      page.on('console', onConsole)
+      page.on('pageerror', onPageError)
+      // resolves once the test body is done, whether it passed or not
+      await setup(undefined)
+      page.off('console', onConsole)
+      page.off('pageerror', onPageError)
+      if (testInfo.status !== testInfo.expectedStatus) {
+        await testInfo.attach('app-log-tail', {body: logTail(appLogPath(), 80), contentType: 'text/plain'})
+        const log = serviceLogPath()
+        if (log) await testInfo.attach('service-log-tail', {body: logTail(log, 80), contentType: 'text/plain'})
+      }
+      if (consoleErrors.length) {
+        await testInfo.attach('renderer-console-errors', {
+          body: consoleErrors.join('\n\n'),
+          contentType: 'text/plain',
+        })
+      }
+      if (pageErrors.length) {
+        await testInfo.attach('renderer-page-errors', {body: pageErrors.join('\n\n'), contentType: 'text/plain'})
+      }
+      const failing = [
+        ...consoleErrors.filter(e => cspViolation.test(e)),
+        ...pageErrors.filter(e => !isBenign(e.replace(/^\w+: /, ''))),
+      ]
+      if (failing.length) {
+        throw new Error(`CSP violation(s) or uncaught renderer error(s) during the test:\n${failing.join('\n\n')}`)
+      }
+    },
+    {auto: true},
+  ],
+})
+
+export {expect} from '@playwright/test'
+
+// ensureChatData for a beforeAll: hooks run before any test's account check, so this checks first.
+export const seedChatData = async () => {
+  await requireMainIsSmoke(loadE2EAccounts())
+  return ensureChatData()
+}
+
+export {e2eMarker, e2eRunId} from '@/tests/e2e/shared/run-marker'

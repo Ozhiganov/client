@@ -1,0 +1,1542 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import type * as T from '@/constants/types'
+import * as InputState from '../input-state'
+import SetExplodingMessagePopup from './set-explode-popup'
+import Typing from './typing'
+import type {Props as InputLowLevelProps, TextInfo, RefType} from './input.shared'
+import {useComposer} from '../composer'
+import type {PlatformInputProps as Props} from './input.shared'
+export type {Selection, RefType, TextInfo, PlatformInputProps} from './input.shared'
+import {formatDurationShort} from '@/util/timestamp'
+import {useSuggestors} from '../suggestors'
+import {composerKeyDown, keyFromHardware, type InputKeyAction, type WindowKeyAction} from '../composer-keys'
+import {ThreadRefsContext} from '@/chat/conversation/normal/context'
+import {getTextStyle} from '@/common-adapters/text.styles'
+import {useConversationThreadID} from '../../thread-context'
+import {TextInput, Keyboard} from 'react-native'
+import {registerPasteImage, removeOnHWKeyPressed, onHWKeyPressed} from 'react-native-kb'
+import {EmojiPickerDesktop} from '@/chat/emoji-picker/container'
+import KB2 from '@/util/electron'
+import {KeyEventHandler} from '@/common-adapters/key-event-handler'
+import AudioRecorder from '@/chat/audio/audio-recorder.native'
+import {usePickerState} from '@/chat/emoji-picker/use-picker'
+import {
+  skipAnimations,
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+  default as Reanimated,
+} from '@/common-adapters/reanimated'
+import FilePickerPopup from '../filepicker-popup'
+import {launchCameraAsync, launchImageLibraryAsync} from '@/util/expo-image-picker'
+import {pickDocumentsAsync} from '@/util/expo-document-picker.native'
+import {filePickerError} from '@/util/storeless-actions'
+import {AudioSendWrapper} from '@/chat/audio/audio-send.native'
+import logger from '@/logger'
+import {ComposerBoxContext, useComposerAnchor} from '@/chat/conversation/composer-viewport-context'
+import {
+  expandedInputMaxHeight,
+  singleLineHeight,
+  threeLineHeight,
+} from '@/chat/conversation/composer-geometry'
+import MoreMenuPopup from './moremenu-popup.native'
+
+// ==================== DESKTOP LOW-LEVEL INPUT ====================
+
+// Stub types to avoid dom lib dependency in native tsconfig
+type HtmlInputRef = {
+  blur: () => void
+  focus: () => void
+  value: string
+  selectionStart: number | null
+  selectionEnd: number | null
+  click: () => void
+  setSelectionRange: (start: number, end: number) => void
+  getBoundingClientRect: () => DOMRect
+  files?: HtmlFileList | null
+}
+type HtmlTextAreaRef = {
+  blur: () => void
+  focus: () => void
+  value: string
+  selectionStart: number | null
+  selectionEnd: number | null
+  click: () => void
+  setSelectionRange: (start: number, end: number) => void
+  getBoundingClientRect: () => DOMRect
+}
+type HtmlFileList = {
+  length: number
+  [index: number]: HtmlFile
+  [Symbol.iterator]: () => Iterator<HtmlFile>
+}
+type HtmlFile = {
+  name: string
+  size: number
+  type: string
+}
+type NativeSyntheticEvent<T> = {nativeEvent: T}
+type TextInputSelectionChangeEventData = {selection: {start: number; end: number}}
+type DesktopKeyboardEvent = {
+  key: string
+  altKey: boolean
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
+  type: string
+  target: unknown
+  preventDefault: () => void
+}
+
+const maybeParseInt = (input: string | number, radix: number): number =>
+  typeof input === 'string' ? parseInt(input, radix) : input
+
+function DesktopInput(p: InputLowLevelProps) {
+  const theme = Kb.Styles.useTheme()
+  const desktopInputLowLevelStyles = useDesktopInputLowLevelStyles()
+  const {style: _style, onChangeText: _onChangeText, multiline, ref} = p
+  const {textType = 'Body', rowsMax, rowsMin, padding, placeholder} = p
+  const {allowKeyboardEvents, className, disabled, autoFocus, onKeyDown: _onKeyDown} = p
+
+  const [value, setValue] = React.useState('')
+  // this isn't a value react can set on the input, so we need to drive it manually
+  const selectionRef = React.useRef({end: 0, start: 0})
+  const inputSingleRef = React.useRef<HtmlInputRef>(null)
+  const inputMultiRef = React.useRef<HtmlTextAreaRef>(null)
+
+  const onChangeTextRef = React.useRef(_onChangeText)
+  // before useImperativeHandle hands the ref the handle, whose writes report through it
+  React.useLayoutEffect(() => {
+    onChangeTextRef.current = _onChangeText
+  }, [_onChangeText])
+  const [onChange] = React.useState(
+    () => (e: {target: {value: string; selectionStart?: number | null; selectionEnd?: number | null}}) => {
+      const s = e.target.value
+      // the browser dispatches selectionchange (our onSelect) asynchronously, so on
+      // paste selectionRef still holds the pre-paste caret when the suggestors read
+      // it. the change event's target already has the settled caret, so take it here
+      const {selectionStart, selectionEnd} = e.target
+      if (typeof selectionStart === 'number') {
+        selectionRef.current = {end: selectionEnd ?? selectionStart, start: selectionStart}
+      }
+      setValue(s)
+      onChangeTextRef.current?.(s)
+    }
+  )
+  const onSelect = (e: {currentTarget: {selectionEnd: number | null; selectionStart: number | null}}) => {
+    selectionRef.current = {
+      end: e.currentTarget.selectionEnd || 0,
+      start: e.currentTarget.selectionStart || 0,
+    }
+  }
+
+  React.useImperativeHandle(ref, () => {
+    const i = multiline ? inputMultiRef.current : inputSingleRef.current
+    return {
+      anchor: i,
+      blur: () => {
+        i?.blur()
+      },
+      clear: () => {
+        if (i) {
+          i.value = ''
+          onChange({target: i})
+        }
+      },
+      focus: () => {
+        i?.focus()
+      },
+      getSelection: () => {
+        return selectionRef.current
+      },
+      insertTyped: (s: string) => {
+        const doc = (
+          globalThis as {
+            document?: {activeElement: unknown; execCommand?: (c: string, ui: boolean, v: string) => boolean}
+          }
+        ).document
+        if (!i || !doc?.execCommand || doc.activeElement !== i) return false
+        // deprecated, but the one insert Chromium puts in the textarea's own undo history; it fires
+        // the input event, so onChange reports the change
+        return doc.execCommand('insertText', false, s)
+      },
+      isFocused: () =>
+        !!i && (globalThis as {document?: {activeElement: unknown}}).document?.activeElement === i,
+      replaceText: (ti: TextInfo, reflectChange: boolean) => {
+        if (!i) return false
+        // Written to the element before React sees it, so the render that follows finds the
+        // value already there and leaves the element (and its caret) alone.
+        i.value = ti.text
+        if (ti.selection) {
+          i.setSelectionRange(ti.selection.start, ti.selection.end ?? ti.selection.start)
+        }
+        if (reflectChange) {
+          onChange({target: i})
+        } else {
+          selectionRef.current = {end: i.selectionEnd ?? 0, start: i.selectionStart ?? 0}
+          setValue(ti.text)
+        }
+        return true
+      },
+    }
+  }, [multiline, onChange])
+
+  const rows = multiline ? rowsMin || Math.min(2, rowsMax || 2) : 0
+  const style = (() => {
+    const textStyle = getTextStyle(textType, theme)
+    if (multiline) {
+      const heightStyles: {minHeight: number; maxHeight?: number} = {
+        minHeight:
+          rows * (textStyle.lineHeight === undefined ? 20 : maybeParseInt(textStyle.lineHeight, 10) || 20) +
+          (padding ? Kb.Styles.globalMargins[padding] * 2 : 0),
+      }
+
+      if (rowsMax) {
+        heightStyles.maxHeight =
+          rowsMax * (textStyle.lineHeight === undefined ? 20 : maybeParseInt(textStyle.lineHeight, 10) || 20)
+      }
+
+      const paddingStyles = padding ? Kb.Styles.padding(Kb.Styles.globalMargins[padding]) : {}
+
+      return Kb.Styles.collapseStyles([
+        desktopInputLowLevelStyles.noChrome, // noChrome comes before because we want lineHeight set in multiline
+        textStyle,
+        desktopInputLowLevelStyles.multiline,
+        heightStyles,
+        paddingStyles,
+        _style,
+      ])
+    } else {
+      return Kb.Styles.collapseStyles([
+        textStyle,
+        desktopInputLowLevelStyles.noChrome, // noChrome comes after to unset lineHeight in singleline
+        _style,
+      ])
+    }
+  })()
+
+  const isComposingIMERef = React.useRef(false)
+
+  const onCompositionStart = () => {
+    isComposingIMERef.current = true
+  }
+
+  const onCompositionEnd = () => {
+    isComposingIMERef.current = false
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (isComposingIMERef.current) {
+      return
+    }
+    _onKeyDown?.(e)
+  }
+
+  const commonProps = {
+    autoFocus,
+    className,
+    'data-testid': TestIDs.CHAT_INPUT,
+    onChange,
+    onCompositionEnd,
+    onCompositionStart,
+    onKeyDown,
+    onSelect,
+    placeholder,
+    value,
+    ...(disabled ? {readOnly: true} : {}),
+    ...((allowKeyboardEvents ?? true) ? {'data-allow-keyboard-shortcuts': 'true'} : {}),
+  }
+
+  // commonProps uses stub types so need to cast for JSX compatibility
+  const desktopCommonProps = commonProps as unknown as React.HTMLAttributes<HTMLElement>
+  return multiline ? (
+    <textarea
+      {...desktopCommonProps}
+      style={Kb.Styles.castStyleDesktop(style)}
+      ref={inputMultiRef as React.RefObject<HTMLTextAreaElement>}
+      rows={rows}
+    />
+  ) : (
+    <input
+      {...desktopCommonProps}
+      ref={inputSingleRef as React.RefObject<HTMLInputElement>}
+      style={Kb.Styles.castStyleDesktop(style)}
+    />
+  )
+}
+
+const useDesktopInputLowLevelStyles = Kb.Styles.createStyleHook(() => ({
+  multiline: Kb.Styles.platformStyles({
+    isElectron: {
+      fieldSizing: 'content',
+      // break anywhere so an unbreakable string (long url) wraps instead of
+      // demanding its full width
+      overflowWrap: 'anywhere',
+      ...Kb.Styles.paddingV(0),
+      resize: 'none',
+      width: '100%',
+    },
+  }),
+  noChrome: Kb.Styles.platformStyles({
+    isElectron: {
+      borderWidth: 0,
+      lineHeight: 'unset',
+      outline: 'none',
+    },
+  }),
+}))
+
+// ==================== NATIVE LOW-LEVEL INPUT ====================
+
+// Low-level TextInput wrapper
+function NativeInput(p: InputLowLevelProps) {
+  const theme = Kb.Styles.useTheme()
+  const nativeInputLowLevelStyles = useNativeInputLowLevelStyles()
+  type RNTextInput = {
+    blur: () => void
+    focus: () => void
+    clear: () => void
+    isFocused: () => boolean
+    setNativeProps: (props: {selection?: {start: number; end?: number}}) => void
+  }
+
+  const {style: _style, onChangeText: _onChangeText, multiline, placeholder, ref} = p
+  const {textType = 'Body', rowsMax, rowsMin, padding, disabled, onPasteImage} = p
+  const {
+    autoFocus: _autoFocus,
+    autoCorrect,
+    autoCapitalize,
+    onBlur,
+    onFocus,
+    onSelectionChange: _onSelectionChange,
+  } = p
+
+  const [autoFocus] = React.useState(_autoFocus)
+  const [value, setValue] = React.useState('')
+  type InputSelection = {start: number; end?: number | undefined} | undefined
+  const [selection, setSelectionState] = React.useState<InputSelection>(undefined)
+  // read by the handle, which is built once: rebuilding it would detach and reattach the input
+  const selectionRef = React.useRef<InputSelection>(undefined)
+  const [setSelection] = React.useState(() => (next: InputSelection) => {
+    selectionRef.current = next
+    setSelectionState(next)
+  })
+  // iOS multiline TextInput doesn't shrink its content height when value is
+  // reset programmatically (only on manual deletion). Rather than remount to
+  // collapse (which drops the keyboard on send), force a one-line height on
+  // clear and release it on the next keystroke so native auto-grow resumes.
+  const [collapse, setCollapse] = React.useState(false)
+  const inputRef = React.useRef<RNTextInput | null>(null)
+
+  const setInputRef = (ti: RNTextInput | null) => {
+    inputRef.current = ti
+  }
+
+  const onChangeTextRef = React.useRef(_onChangeText)
+  React.useLayoutEffect(() => {
+    onChangeTextRef.current = _onChangeText
+  }, [_onChangeText])
+  const [onChangeText] = React.useState(() => (s: string) => {
+    setValue(s)
+    // any real input releases the post-send collapse so auto-grow resumes
+    if (s) setCollapse(false)
+    onChangeTextRef.current?.(s)
+  })
+  const onSelectionChange = (e: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
+    setSelection(e.nativeEvent.selection)
+    _onSelectionChange?.(e as Parameters<NonNullable<typeof _onSelectionChange>>[0])
+  }
+
+  React.useImperativeHandle(ref, () => {
+    return {
+      blur: () => {
+        inputRef.current?.blur()
+      },
+      clear: () => {
+        setValue('')
+        onChangeText('')
+        setSelection(undefined)
+        // force back to one line; released on next keystroke (see onChangeText)
+        if (isIOS) {
+          setCollapse(true)
+        }
+      },
+      focus: () => {
+        inputRef.current?.focus()
+      },
+      getSelection: () => {
+        return selectionRef.current
+      },
+      insertTyped: () => false,
+      isFocused: () => !!inputRef.current?.isFocused(),
+      replaceText: (ti: TextInfo, reflectChange: boolean) => {
+        if (!reflectChange) {
+          return false
+        }
+        onChangeText(ti.text)
+        setSelection(ti.selection)
+        return true
+      },
+    }
+  }, [onChangeText, setSelection])
+
+  const style = (() => {
+    let textStyle = getTextStyle(textType, theme)
+    // RN TextInput plays better without this
+    if (isIOS) {
+      const {lineHeight, ...rest} = textStyle
+      textStyle = rest
+    }
+    const commonStyle = Kb.Styles.collapseStyles([nativeInputLowLevelStyles.common, textStyle])
+
+    const lineHeight = textStyle.lineHeight
+    let lineStyle: Array<Kb.Styles.StylesCrossPlatform>
+    if (multiline) {
+      const defaultRowsToShow = Math.min(2, rowsMax ?? 2)
+      const paddingStyles = padding ? Kb.Styles.padding(Kb.Styles.globalMargins[padding]) : {}
+      lineStyle = [
+        nativeInputLowLevelStyles.multiline,
+        {
+          minHeight: (rowsMin || defaultRowsToShow) * (lineHeight ?? 0),
+        },
+        !!rowsMax && {maxHeight: rowsMax * (lineHeight ?? 0)},
+        // iOS: collapse to one line after send; minHeight floors 0 to one row
+        isIOS && collapse && {height: 0},
+        paddingStyles,
+      ]
+    } else {
+      lineStyle = [nativeInputLowLevelStyles.singleline, {maxHeight: lineHeight, minHeight: lineHeight}]
+    }
+
+    return Kb.Styles.collapseStyles([commonStyle, ...lineStyle, _style])
+  })()
+
+  React.useEffect(() => {
+    if (!onPasteImage) return
+    const dereg = registerPasteImage(uris => {
+      Keyboard.dismiss()
+      onPasteImage(uris)
+    })
+    return () => {
+      dereg()
+    }
+  }, [onPasteImage])
+
+  return (
+    <TextInput
+      autoCapitalize={autoCapitalize}
+      autoCorrect={autoCorrect}
+      autoFocus={autoFocus}
+      multiline={multiline}
+      onBlur={onBlur as ((e: unknown) => void) | undefined}
+      onChangeText={onChangeText}
+      onFocus={onFocus as ((e: unknown) => void) | undefined}
+      onSelectionChange={onSelectionChange}
+      placeholder={placeholder}
+      readOnly={disabled}
+      ref={setInputRef}
+      selection={selection}
+      style={style as object | null | undefined}
+      submitBehavior={multiline ? 'newline' : 'submit'}
+      testID={TestIDs.CHAT_INPUT}
+      value={value}
+    />
+  )
+}
+
+const useNativeInputLowLevelStyles = Kb.Styles.createStyleHook(() => ({
+  common: {borderWidth: 0, flexGrow: 1},
+  multiline: Kb.Styles.platformStyles({
+    isMobile: {
+      height: undefined,
+      textAlignVertical: 'top', // android centers by default
+    },
+  }),
+  singleline: {padding: 0},
+}))
+
+export const Input = isMobile ? NativeInput : DesktopInput
+
+// ==================== DESKTOP PLATFORM INPUT ====================
+
+type HtmlInputRefType = React.RefObject<HtmlInputRef | null>
+
+type ExplodingButtonProps = Pick<Props, 'explodingModeSeconds'> & {
+  focusInput: () => void
+  setExplodingMode: (mode: number) => void
+}
+const ExplodingButton = function ExplodingButton(p: ExplodingButtonProps) {
+  const desktopStyles = useDesktopStyles()
+  const theme = Kb.Styles.useTheme()
+  const {explodingModeSeconds, focusInput, setExplodingMode} = p
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    return (
+      <SetExplodingMessagePopup
+        attachTo={attachTo}
+        onAfterSelect={focusInput}
+        onHidden={hidePopup}
+        visible={true}
+        setExplodingMode={setExplodingMode}
+      />
+    )
+  }
+  const {popup, popupAnchor, showingPopup, showPopup} = Kb.usePopup2(makePopup)
+
+  return (
+    <Kb.ClickableBox
+      direction="vertical"
+      alignItems="center"
+      justifyContent="flex-end"
+      className={Kb.Styles.classNames({expanded: showingPopup}, 'timer-icon-container')}
+      onClick={showPopup}
+      ref={popupAnchor}
+      style={Kb.Styles.collapseStyles([
+        desktopStyles.explodingIconContainer,
+        !!explodingModeSeconds && {
+          backgroundColor: theme.black,
+        },
+      ])}
+    >
+      {popup}
+      <Kb.Box2
+        direction="vertical"
+        alignItems="center"
+        style={desktopStyles.explodingInsideWrapper}
+        tooltip={explodingModeSeconds ? undefined : 'Timer'}
+        justifyContent="center"
+      >
+        {explodingModeSeconds ? (
+          <Kb.Text type="BodyTinyBold" style={desktopStyles.explodingText}>
+            {formatDurationShort(explodingModeSeconds * 1000)}
+          </Kb.Text>
+        ) : (
+          <Kb.Icon
+            className={Kb.Styles.classNames('timer-icon', 'hover_color_black')}
+            onClick={showPopup}
+            padding="xtiny"
+            type="iconfont-timer"
+          />
+        )}
+      </Kb.Box2>
+    </Kb.ClickableBox>
+  )
+}
+
+const EmojiButton = function EmojiButton() {
+  const desktopStyles = useDesktopStyles()
+  const theme = Kb.Styles.useTheme()
+  const composer = useComposer()
+  const conversationIDKey = useConversationThreadID()
+  const insertEmoji = (emojiColons: string) => {
+    composer.insertAtCaret(`${emojiColons} `)
+    composer.focus()
+  }
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    return (
+      <Kb.Popup intent="menu" attachTo={attachTo} onHidden={hidePopup} position="top right">
+        <EmojiPickerDesktop
+          conversationIDKey={conversationIDKey}
+          onPickAction={insertEmoji}
+          onDidPick={hidePopup}
+        />
+      </Kb.Popup>
+    )
+  }
+
+  const {popup, popupAnchor, showingPopup, showPopup} = Kb.usePopup2(makePopup)
+
+  return (
+    <>
+      <Kb.Box2
+        direction="vertical"
+        style={desktopStyles.icon}
+        ref={popupAnchor}
+        tooltip="Emoji"
+        className="tooltip-top-left"
+      >
+        <Kb.Icon
+          color={showingPopup ? theme.black : undefined}
+          onClick={showPopup}
+          type="iconfont-emoji"
+        />
+      </Kb.Box2>
+      {popup}
+    </>
+  )
+}
+
+const GiphyButton = function GiphyButton() {
+  const desktopStyles = useDesktopStyles()
+  const toggleGiphyPrefill = InputState.useConversationInputDispatch(s => s.toggleGiphyPrefill)
+
+  return (
+    <Kb.Box2 direction="vertical" style={desktopStyles.icon} tooltip="GIF" className="tooltip-top-left">
+      <Kb.Icon onClick={toggleGiphyPrefill} type="iconfont-gif" />
+    </Kb.Box2>
+  )
+}
+
+const fileListToPaths = (f: HtmlFileList): Array<string> => {
+  const {getPathForFile} = KB2.functions
+  return Array.from(f).map(f => getPathForFile?.(f as File) ?? '')
+}
+
+const FileButton = function FileButton(p: {setHtmlInputRef: (i: HtmlInputRef | null) => void}) {
+  const desktopStyles = useDesktopStyles()
+  const {setHtmlInputRef} = p
+  const htmlInputRef = React.useRef<HtmlInputRef | null>(null)
+  const conversationIDKey = useConversationThreadID()
+  const pickFile = () => {
+    const paths = htmlInputRef.current?.files ? fileListToPaths(htmlInputRef.current.files) : undefined
+    const pathAndOutboxIDs = paths?.reduce<Array<{path: string}>>((arr, path: string) => {
+      if (path) {
+        arr.push({path})
+      }
+      return arr
+    }, [])
+    if (pathAndOutboxIDs?.length) {
+      C.Router2.navigateAppend({
+        name: 'chatAttachmentGetTitles',
+        params: {conversationIDKey, pathAndOutboxIDs},
+      })
+    }
+
+    if (htmlInputRef.current) {
+      htmlInputRef.current.value = ''
+    }
+  }
+
+  const filePickerOpen = () => {
+    htmlInputRef.current?.click()
+  }
+
+  const setRef = (e: HtmlInputRef | null) => {
+    htmlInputRef.current = e
+    setHtmlInputRef(e)
+  }
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      style={desktopStyles.icon}
+      tooltip="Attachment"
+      className="tooltip-top-left"
+    >
+      <Kb.Icon onClick={filePickerOpen} type="iconfont-attachment" />
+      <input type="file" style={desktopStyles.hidden} ref={setRef} onChange={pickFile} multiple={true} />
+    </Kb.Box2>
+  )
+}
+
+const DesktopFooter = () => {
+  const desktopStyles = useDesktopStyles()
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="flex-start" justifyContent="space-between">
+      <Typing />
+      <Kb.Text lineClamp={1} type="BodyTiny" style={desktopStyles.footer} selectable={true}>
+        {`*bold*, _italics_, \`code\`, >quote, !>spoiler<!, @user, @team, #channel`}
+      </Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+type UseDesktopKeysProps = Pick<
+  Props,
+  'isEditing' | 'onCancelEditing' | 'onSubmit' | 'showReplyPreview'
+> & {
+  focusInput: () => void
+  htmlInputRef: HtmlInputRefType
+  suggestors: Pick<
+    ReturnType<typeof useSuggestors>,
+    'closeSuggestions' | 'getSuggestions' | 'moveSuggestion' | 'recheckSuggestions' | 'selectSuggestion'
+  >
+}
+const useDesktopKeys = (p: UseDesktopKeysProps) => {
+  const {focusInput, htmlInputRef, isEditing, onCancelEditing, onSubmit} = p
+  const {showReplyPreview, suggestors} = p
+  const {closeSuggestions, getSuggestions, moveSuggestion, recheckSuggestions, selectSuggestion} = suggestors
+  const composer = useComposer()
+  const setEditing = InputState.useConversationInputDispatch(s => s.setEditing)
+  const clearReplyTo = InputState.useConversationInputDispatch(s => s.clearReplyTo)
+  const {scrollDown, scrollUp} = React.useContext(ThreadRefsContext)
+
+  const run = (a: InputKeyAction | WindowKeyAction) => {
+    switch (a.type) {
+      case 'editLast':
+        setEditing('last')
+        break
+      case 'cancelEdit':
+        onCancelEditing()
+        break
+      case 'cancelReply':
+        clearReplyTo()
+        break
+      case 'openFilePicker':
+        htmlInputRef.current?.click()
+        break
+      case 'scrollDown':
+        scrollDown()
+        break
+      case 'scrollUp':
+        scrollUp()
+        break
+      case 'focusInput':
+        focusInput()
+        break
+      case 'recheckSuggestions':
+        recheckSuggestions()
+        break
+      case 'closeSuggestions':
+        closeSuggestions()
+        break
+      case 'suggestionMove':
+        moveSuggestion(a.up)
+        break
+      case 'suggestionSelect':
+        if (!selectSuggestion() && a.orSubmit) {
+          onSubmit()
+        }
+        break
+      case 'submit':
+        onSubmit()
+        break
+      case 'newline':
+        composer.typeAtCaret('\n')
+        break
+    }
+  }
+
+  const threadFacts = () => ({
+    editing: isEditing,
+    replying: showReplyPreview,
+    textEmpty: !composer.getText(),
+  })
+
+  const globalKeyDownPressHandler = (ev: DesktopKeyboardEvent) => {
+    const tagName = (ev.target as {tagName?: string} | null)?.tagName?.toUpperCase()
+    const {actions, preventDefault} = composerKeyDown(
+      {
+        ...threadFacts(),
+        keypress: ev.type === 'keypress',
+        source: 'window',
+        targetIsInput: tagName === 'INPUT' || tagName === 'TEXTAREA',
+      },
+      ev
+    )
+    if (preventDefault) ev.preventDefault()
+    actions.forEach(run)
+  }
+
+  const inputKeyDown = (e: React.KeyboardEvent) => {
+    const {actions, preventDefault} = composerKeyDown(
+      {...threadFacts(), source: 'input', suggestions: getSuggestions()},
+      e
+    )
+    if (preventDefault) e.preventDefault()
+    actions.forEach(run)
+  }
+
+  return {globalKeyDownPressHandler, inputKeyDown}
+}
+
+type SideButtonsProps = Pick<Props, 'cannotWrite'> & {
+  setHtmlInputRef: (i: HtmlInputRef | null) => void
+}
+
+const SideButtons = (p: SideButtonsProps) => {
+  const desktopStyles = useDesktopStyles()
+  const {setHtmlInputRef, cannotWrite} = p
+  return (
+    <Kb.Box2 direction="horizontal" style={desktopStyles.sideButtons}>
+      {!cannotWrite && (
+        <>
+          <GiphyButton />
+          <EmojiButton />
+          <FileButton setHtmlInputRef={setHtmlInputRef} />
+        </>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const DesktopPlatformInput = function DesktopPlatformInput(p: Props) {
+  const desktopStyles = useDesktopStyles()
+  const {cannotWrite, explodingModeSeconds, onCancelEditing, setExplodingMode} = p
+  const {showReplyPreview, hintText, setInputRef, isEditing, onSubmit} = p
+  const composer = useComposer()
+  const htmlInputRef = React.useRef<HtmlInputRef | null>(null)
+  const setHtmlInputRef = (i: HtmlInputRef | null) => {
+    htmlInputRef.current = i
+  }
+  // the suggestion list is placed against the textarea
+  const popupAnchorRef = React.useRef<Kb.MeasureRef | null>(null)
+  const setInput = (r: RefType | null) => {
+    popupAnchorRef.current = r?.anchor ?? null
+    setInputRef(r)
+  }
+
+  React.useEffect(() => {
+    composer.focus()
+  }, [composer])
+
+  const {popup, onChangeText, ...suggestors} = useSuggestors({
+    popupAnchorRef,
+    onChangeText: p.onChangeText,
+    suggestionListStyle: undefined,
+    suggestionOverlayStyle: p.suggestionOverlayStyle,
+    suggestionSpinnerStyle: desktopStyles.suggestionSpinnerStyle,
+  })
+
+  const focusInput = () => {
+    composer.focus()
+  }
+
+  const {globalKeyDownPressHandler, inputKeyDown} = useDesktopKeys({
+    focusInput,
+    htmlInputRef,
+    isEditing,
+    onCancelEditing,
+    onSubmit,
+    showReplyPreview,
+    suggestors,
+  })
+
+  return (
+    <>
+      {popup}
+      <KeyEventHandler
+        onKeyDown={globalKeyDownPressHandler as never}
+        onKeyPress={globalKeyDownPressHandler as never}
+      >
+        <Kb.Box2 direction="vertical" fullWidth={true} style={desktopStyles.container}>
+          <Kb.Box2
+            direction="horizontal"
+            alignItems="flex-end"
+            style={Kb.Styles.collapseStyles([
+              desktopStyles.inputWrapper,
+              isEditing && desktopStyles.inputWrapperEditing,
+              explodingModeSeconds && desktopStyles.inputWrapperExplodingMode,
+            ])}
+          >
+            {!isEditing && !cannotWrite && (
+              <ExplodingButton
+                explodingModeSeconds={explodingModeSeconds}
+                focusInput={focusInput}
+                setExplodingMode={setExplodingMode}
+              />
+            )}
+            {isEditing && (
+              <Kb.Button
+                label="Cancel"
+                onClick={onCancelEditing}
+                small={true}
+                style={desktopStyles.cancelEditingBtn}
+                testID={TestIDs.CHAT_EDIT_CANCEL}
+                type="Dim"
+              />
+            )}
+            <Kb.Box2 direction="horizontal" flex={1} overflow="hidden" style={desktopStyles.inputBox}>
+              <DesktopInput
+                allowKeyboardEvents={true}
+                disabled={cannotWrite}
+                autoFocus={false}
+                ref={setInput}
+                placeholder={hintText}
+                style={Kb.Styles.collapseStyles([
+                  desktopStyles.input,
+                  isEditing && desktopStyles.inputEditing,
+                ])}
+                onChangeText={onChangeText}
+                multiline={true}
+                rowsMin={1}
+                rowsMax={10}
+                onKeyDown={inputKeyDown}
+              />
+            </Kb.Box2>
+            <SideButtons cannotWrite={cannotWrite} setHtmlInputRef={setHtmlInputRef} />
+          </Kb.Box2>
+          <DesktopFooter />
+        </Kb.Box2>
+      </KeyEventHandler>
+    </>
+  )
+}
+
+const useDesktopStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      cancelEditingBtn: {margin: Kb.Styles.globalMargins.xtiny},
+      container: {
+        backgroundColor: theme.white,
+      },
+      explodingIconContainer: Kb.Styles.platformStyles({
+        common: {
+          alignSelf: 'stretch',
+          borderBottomLeftRadius: 3,
+          borderTopLeftRadius: 3,
+          textAlign: 'center',
+          width: 32,
+        },
+        isElectron: {
+          borderRight: `1px solid ${theme.black_20}`,
+        },
+      }),
+      explodingInsideWrapper: {height: 32},
+      // bg is theme.black, which inverts in dark mode; desktop negative text is always white
+      explodingText: {color: theme.white},
+      footer: {
+        alignSelf: 'flex-end',
+        color: theme.black_20,
+        marginBottom: Kb.Styles.globalMargins.xtiny,
+        marginRight: Kb.Styles.globalMargins.medium + 2,
+        marginTop: 2,
+        textAlign: 'right',
+      },
+      hidden: {display: 'none'},
+      icon: {
+        alignSelf: 'flex-end',
+        marginBottom: 2,
+        marginRight: Kb.Styles.globalMargins.xtiny,
+        padding: Kb.Styles.globalMargins.xtiny,
+      },
+      input: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.transparent,
+          lineHeight: 22,
+          minHeight: 22,
+        },
+      }),
+      inputBox: Kb.Styles.platformStyles({
+        common: {
+          minWidth: 0,
+          paddingBottom: Kb.Styles.globalMargins.xtiny,
+          paddingLeft: 6,
+          paddingRight: 6,
+          paddingTop: Kb.Styles.globalMargins.tiny - 2,
+          textAlign: 'left',
+        },
+        // field-sizing:content on the textarea makes its intrinsic width follow its text,
+        // so containment is what keeps a long unbreakable url from widening the layout
+        isElectron: {contain: 'inline-size'},
+      }),
+      inputEditing: {color: theme.blackOrBlack},
+      inputWrapper: {
+        alignSelf: 'stretch',
+        backgroundColor: theme.white,
+        ...Kb.Styles.border(theme.black_20, 1, Kb.Styles.borderRadius),
+        ...Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+        paddingRight: Kb.Styles.globalMargins.xtiny,
+      },
+      inputWrapperEditing: {backgroundColor: theme.yellowOrYellowAlt},
+      inputWrapperExplodingMode: {borderColor: theme.black},
+      sideButtons: {alignSelf: 'flex-end'},
+      suggestionSpinnerStyle: {
+        bottom: Kb.Styles.globalMargins.tiny,
+        position: 'absolute',
+        right: Kb.Styles.globalMargins.medium,
+      },
+    }) as const
+)
+
+// ==================== NATIVE PLATFORM INPUT ====================
+
+type MenuType = 'exploding' | 'filepickerpopup' | 'moremenu'
+
+type NativeButtonsProps = Pick<
+  Props,
+  'explodingModeSeconds' | 'isExploding' | 'cannotWrite' | 'onCancelEditing'
+> & {
+  hasText: boolean
+  isEditing: boolean
+  toggleShowingMenu: () => void
+  onSubmit: () => void
+  ourShowMenu: (m: MenuType) => void
+  onSelectionChange?: (p: {start: number | null; end: number | null}) => void
+  showAudioSend: boolean
+  setShowAudioSend: (s: boolean) => void
+}
+
+const NativeButtons = function NativeButtons(p: NativeButtonsProps) {
+  const nativeStyles = useNativeStyles()
+  const {ourShowMenu, onSubmit, onCancelEditing} = p
+  const composer = useComposer()
+  const insertText = composer.insertAtCaret
+  const {hasText, isEditing, isExploding, explodingModeSeconds, cannotWrite, toggleShowingMenu} = p
+  const {showAudioSend, setShowAudioSend} = p
+
+  const openFilePicker = () => {
+    ourShowMenu('filepickerpopup')
+  }
+  const openMoreMenu = () => {
+    ourShowMenu('moremenu')
+  }
+
+  const insertMentionMarker = () => {
+    insertText('@')
+  }
+
+  const pickKey = 'chatInput'
+  const emojiStr = usePickerState(s => s.pickerMap.get(pickKey)?.emojiStr) ?? ''
+  const updatePickerMap = usePickerState(s => s.dispatch.updatePickerMap)
+
+  const lastEmojiRef = React.useRef('')
+  React.useEffect(() => {
+    if (lastEmojiRef.current === emojiStr) {
+      return
+    }
+    lastEmojiRef.current = emojiStr
+    if (emojiStr) {
+      insertText(emojiStr + ' ')
+      updatePickerMap(pickKey, undefined)
+    }
+  }, [emojiStr, insertText, updatePickerMap])
+
+  const conversationIDKey = useConversationThreadID()
+  const openEmojiPicker = () => {
+    C.Router2.navigateAppend({
+      name: 'chatChooseEmoji',
+      params: {conversationIDKey, pickKey},
+    })
+  }
+
+  const explodingIcon = !isEditing && !cannotWrite && (
+    <Kb.ClickableBox direction="vertical" centerChildren={true} style={nativeStyles.explodingWrapper} onClick={toggleShowingMenu} testID={TestIDs.CHAT_EXPLODING_BUTTON}>
+      {isExploding ? (
+        <Kb.Box2 direction="horizontal" style={nativeStyles.exploding} centerChildren={true}>
+          <Kb.Text type="BodyTinyBold" negative={true} style={nativeStyles.explodingText}>
+            {formatDurationShort(explodingModeSeconds * 1000)}
+          </Kb.Text>
+        </Kb.Box2>
+      ) : (
+        <Kb.Icon color={undefined} type="iconfont-timer" />
+      )}
+    </Kb.ClickableBox>
+  )
+
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="center" noShrink={true} style={nativeStyles.actionContainer}>
+      {isEditing && (
+        <Kb.Button
+          style={nativeStyles.editingButton}
+          small={true}
+          onClick={onCancelEditing}
+          label="Cancel"
+          testID={TestIDs.CHAT_EDIT_CANCEL}
+          type="Dim"
+        />
+      )}
+      {explodingIcon}
+      {!cannotWrite && (
+        <>
+          <Kb.Icon padding="tiny" onClick={openEmojiPicker} type="iconfont-emoji" testID={TestIDs.CHAT_EMOJI_BUTTON} />
+          <Kb.Icon padding="tiny" onClick={insertMentionMarker} type="iconfont-mention" testID={TestIDs.CHAT_MENTION_BUTTON} />
+        </>
+      )}
+      <Kb.Box2 direction="vertical" style={Kb.Styles.globalStyles.flexGrow} />
+      {!hasText && !cannotWrite && (
+        <Kb.Box2 direction="horizontal" alignItems="flex-end">
+          <Kb.Icon onClick={openFilePicker} padding="tiny" type="iconfont-camera" testID={TestIDs.CHAT_CAMERA_BUTTON} />
+          <AudioRecorder showAudioSend={showAudioSend} setShowAudioSend={setShowAudioSend} />
+          <Kb.Icon onClick={openMoreMenu} padding="tiny" type="iconfont-add" testID={TestIDs.CHAT_MORE_BUTTON} />
+        </Kb.Box2>
+      )}
+      {hasText && !cannotWrite && (
+        <Kb.Button
+          type="Default"
+          small={true}
+          onClick={onSubmit}
+          disabled={!hasText}
+          label={isEditing ? 'Save' : 'Send'}
+          testID={TestIDs.CHAT_SEND_BUTTON}
+          style={isExploding ? nativeStyles.explodingSendBtn : nativeStyles.sendBtn}
+          labelStyle={isExploding ? nativeStyles.explodingSendBtnLabel : undefined}
+        />
+      )}
+    </Kb.Box2>
+  )
+}
+
+const NativeAnimatedExpand = (() => {
+  const Animated = Reanimated
+  if (skipAnimations) {
+    return function NativeAnimatedExpand() {
+      return null
+    }
+  } else {
+    return function NativeAnimatedExpand(p: {expandInput: () => void; expanded: boolean}) {
+      'use no memo'
+      const nativeStyles = useNativeStyles()
+      const theme = Kb.Styles.useTheme()
+      const {expandInput, expanded} = p
+      const offset = useSharedValue(expanded ? 1 : 0)
+      const topStyle = useAnimatedStyle(() => ({
+        transform: [{rotate: withTiming(`${offset.value ? 45 + 180 : 45}deg`)}, {scale: 0.6}],
+      }))
+      const bottomStyle = useAnimatedStyle(() => ({
+        transform: [
+          {rotate: withTiming(`${offset.value ? 45 + 180 : 45}deg`)},
+          {scaleX: -0.6},
+          {scaleY: -0.6},
+        ],
+      }))
+      const lastExpandedRef = React.useRef(expanded)
+      React.useEffect(() => {
+        if (lastExpandedRef.current !== expanded) {
+          lastExpandedRef.current = expanded
+          offset.set(expanded ? 1 : 0)
+        }
+      }, [expanded, offset])
+
+      return (
+        <Kb.ClickableBox
+          direction="vertical"
+          relative={true}
+          alignSelf="flex-start"
+          onClick={expandInput}
+          style={nativeStyles.iconContainer}
+        >
+          <Animated.View style={[nativeStyles.iconTop, topStyle]} pointerEvents="none">
+            <Kb.Icon type="iconfont-arrow-full-up" fontSize={18} color={theme.black_35} />
+          </Animated.View>
+          <Animated.View style={[nativeStyles.iconBottom, bottomStyle]} pointerEvents="none">
+            <Kb.Icon type="iconfont-arrow-full-up" fontSize={18} color={theme.black_35} />
+          </Animated.View>
+        </Kb.ClickableBox>
+      )
+    }
+  }
+})()
+
+type NativeChatFilePickerProps = {
+  attachTo?: React.RefObject<Kb.MeasureRef | null>
+  showingPopup: boolean
+  hidePopup: () => void
+}
+const launchNativeImagePickerImpl = async (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  mediaType: string,
+  location: string
+) => {
+  const mt = mediaType as 'photo' | 'video' | 'mixed'
+  const handleSelection = (result: {canceled: boolean; assets: Array<{uri: string}> | null}) => {
+    if (result.canceled || !result.assets || result.assets.length === 0) {
+      return
+    }
+    const pathAndOutboxIDs = result.assets.map(a => ({path: a.uri}))
+    C.Router2.navigateAppend({
+      name: 'chatAttachmentGetTitles',
+      params: {conversationIDKey, pathAndOutboxIDs},
+    })
+  }
+
+  switch (location) {
+    case 'camera':
+      try {
+        const res = await launchCameraAsync(mt, true, isIOS)
+        handleSelection(res)
+      } catch (error) {
+        filePickerError(new Error(String(error)))
+      }
+      break
+    case 'library':
+      try {
+        const res = await launchImageLibraryAsync(mt, true, true, isIOS)
+        handleSelection(res)
+      } catch (error) {
+        filePickerError(new Error(String(error)))
+      }
+      break
+    case 'file':
+      try {
+        const res = await pickDocumentsAsync(true)
+        if (!res.canceled && res.assets.length > 0) {
+          const pathAndOutboxIDs = res.assets.map(a => ({path: a.uri}))
+          C.Router2.navigateAppend({
+            name: 'chatAttachmentGetTitles',
+            params: {conversationIDKey, pathAndOutboxIDs, pickedAsFiles: true},
+          })
+        }
+      } catch (error) {
+        filePickerError(new Error(String(error)))
+      }
+      break
+  }
+}
+
+const NativeChatFilePicker = (p: NativeChatFilePickerProps) => {
+  const {attachTo, showingPopup, hidePopup} = p
+  const conversationIDKey = useConversationThreadID()
+  const launchNativeImagePicker = (mediaType: string, location: string) => {
+    C.ignorePromise(launchNativeImagePickerImpl(conversationIDKey, mediaType, location))
+  }
+
+  return (
+    <FilePickerPopup
+      attachTo={attachTo}
+      visible={showingPopup}
+      onHidden={hidePopup}
+      onSelect={launchNativeImagePicker}
+    />
+  )
+}
+
+type NativeAnimatedInputProps = Omit<InputLowLevelProps, 'ref'> & {
+  expanded: boolean
+  inputRef?: React.Ref<RefType>
+  reservedHeight?: number
+}
+const NativeAnimatedInput = (() => {
+  const Animated = Reanimated
+  if (skipAnimations) {
+    return function NativeAnimatedInput(p: NativeAnimatedInputProps) {
+      const nativeStyles = useNativeStyles()
+      const {expanded: _expanded, inputRef, reservedHeight: _reservedHeight, ...rest} = p
+      return (
+        <Animated.View style={[p.style, rest.style]}>
+          <NativeInput multiline={true} {...rest} ref={inputRef} style={nativeStyles.inputInner} />
+        </Animated.View>
+      )
+    }
+  } else {
+    return function NativeAnimatedInput(p: NativeAnimatedInputProps) {
+      'use no memo'
+      const nativeStyles = useNativeStyles()
+      const {visibleHeight} = React.useContext(ComposerBoxContext)
+      const {keyboardHeight} = useComposerAnchor()
+      const {expanded, inputRef, reservedHeight = 0, ...rest} = p
+      const lastExpandedRef = React.useRef(expanded)
+      const offset = useSharedValue(expanded ? 1 : 0)
+      const as = useAnimatedStyle(() => {
+        const maxHeight = expandedInputMaxHeight(visibleHeight, keyboardHeight.value, reservedHeight)
+        return {
+          maxHeight: withTiming(offset.value ? maxHeight : threeLineHeight),
+          minHeight: withTiming(offset.value ? maxHeight : singleLineHeight),
+        }
+      })
+      React.useEffect(() => {
+        if (expanded !== lastExpandedRef.current) {
+          lastExpandedRef.current = expanded
+          offset.set(expanded ? 1 : 0)
+        }
+      }, [expanded, offset])
+      return (
+        <Animated.View style={[p.style, as]}>
+          <NativeInput multiline={true} {...rest} ref={inputRef} style={nativeStyles.inputInner} />
+        </Animated.View>
+      )
+    }
+  }
+})()
+
+const NativePlatformInput = (p: Props) => {
+  const nativeStyles = useNativeStyles()
+  type LayoutEvent = {nativeEvent: {layout: {height: number}}}
+
+  const [showAudioSend, setShowAudioSend] = React.useState(false)
+  const [height, setHeight] = React.useState(0)
+  const [expanded, setExpanded] = React.useState(false) // updates immediately, used for the icon etc
+  const {expandedSuggestionListHeight} = React.useContext(ComposerBoxContext)
+  const suggestionListStyle = Kb.Styles.collapseStyles([
+    nativeStyles.suggestionList,
+    !!height && {marginBottom: height},
+    expanded && {maxHeight: expandedSuggestionListHeight},
+  ])
+  const suggestionSpinnerStyle = Kb.Styles.collapseStyles([
+    nativeStyles.suggestionSpinnerStyle,
+    !!height && {marginBottom: height},
+  ])
+  const {
+    popup: suggestorPopup,
+    onChangeText,
+    onBlur,
+    onSelectionChange,
+    onFocus,
+    getSuggestions,
+    selectSuggestion,
+    suggestionsShowing,
+  } = useSuggestors({
+    onChangeText: p.onChangeText,
+    suggestionListStyle,
+    suggestionOverlayStyle: p.suggestionOverlayStyle,
+    suggestionSpinnerStyle,
+  })
+  const {cannotWrite, isEditing, isExploding, setInputRef, setExplodingMode} = p
+  const {onSubmit, explodingModeSeconds, hintText, onCancelEditing} = p
+  const suggestionListReserveHeight = expanded && suggestionsShowing ? expandedSuggestionListHeight : 0
+
+  const composer = useComposer()
+  const whichMenu = React.useRef<MenuType | undefined>(undefined)
+  const [hasText, setHasText] = React.useState(false)
+
+  const toggleExpandInput = () => {
+    const nextState = !expanded
+    setExpanded(nextState)
+  }
+
+  const expandedRef = React.useRef(expanded)
+  const onSubmitRef = React.useRef(onSubmit)
+  React.useEffect(() => {
+    expandedRef.current = expanded
+    onSubmitRef.current = onSubmit
+  }, [expanded, onSubmit])
+
+  // An iOS autocorrection (or predictive-text pick) of the last word reaches onChangeText only
+  // after the send tap; reading the text sooner would send the uncorrected word.
+  const [onQueueSubmit] = React.useState(() => () => {
+    setTimeout(() => {
+      if (onSubmitRef.current() && expandedRef.current) {
+        setExpanded(false)
+      }
+    }, 60)
+  })
+
+  // Enter and shift-Enter from a hardware keyboard, answered like desktop Enter. The native side
+  // gates it: Android's MainActivity.dispatchKeyEvent sends it only while the configuration reports
+  // a hardware keyboard and consumes the key, so the TextInput never gets its own newline as well;
+  // iOS sends it from AppDelegate.pressesBegan, which only hardware key presses reach.
+  const onHardwareKey = React.useEffectEvent((hwKeyEvent: {pressedKey: string}) => {
+    const {actions} = composerKeyDown(
+      {source: 'hardware', suggestions: getSuggestions()},
+      keyFromHardware(hwKeyEvent.pressedKey)
+    )
+    for (const a of actions) {
+      switch (a.type) {
+        case 'suggestionSelect':
+          if (!selectSuggestion() && a.orSubmit) {
+            onQueueSubmit()
+          }
+          break
+        case 'submit':
+          onQueueSubmit()
+          break
+        case 'newline':
+          composer.insertAtCaret('\n')
+      }
+    }
+  })
+  React.useEffect(() => {
+    onHWKeyPressed(e => onHardwareKey(e))
+    return () => {
+      removeOnHWKeyPressed()
+    }
+  }, [])
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+    switch (whichMenu.current) {
+      case 'filepickerpopup':
+        return <NativeChatFilePicker attachTo={attachTo} showingPopup={true} hidePopup={hidePopup} />
+      case 'moremenu':
+        return <MoreMenuPopup onHidden={hidePopup} visible={true} />
+      default:
+        return (
+          <SetExplodingMessagePopup
+            attachTo={attachTo}
+            onHidden={hidePopup}
+            visible={true}
+            setExplodingMode={setExplodingMode}
+          />
+        )
+    }
+  }
+
+  const {popup: popupMenu, showPopup} = Kb.usePopup2(makePopup)
+
+  const ourShowMenu = (menu: MenuType) => {
+    // Hide the keyboard on mobile when showing the menu.
+    Keyboard.dismiss()
+    whichMenu.current = menu
+    showPopup()
+  }
+
+  const openExplodingMenu = () => {
+    ourShowMenu('exploding')
+  }
+
+  const conversationIDKey = useConversationThreadID()
+  const onPasteImage = (uri: Array<string>) => {
+    try {
+      const pathAndOutboxIDs = uri.map(path => ({path}))
+      C.Router2.navigateAppend({
+        name: 'chatAttachmentGetTitles',
+        params: {conversationIDKey, pathAndOutboxIDs},
+      })
+    } catch (e) {
+      logger.info('onPasteImage error', e)
+    }
+  }
+
+  const onLayout = (p: LayoutEvent) => {
+    const {nativeEvent} = p
+    const {layout} = nativeEvent
+    const {height} = layout
+    setHeight(height)
+  }
+
+  const aiOnChangeText = (text: string) => {
+    setHasText(!!text)
+    onChangeText(text)
+  }
+
+  const _onSelectionChange = (e: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
+    onSelectionChange(e.nativeEvent.selection)
+  }
+
+  return (
+    <>
+      <Kb.Box2 direction="vertical" fullWidth={true} onLayout={onLayout} relative={true}>
+        {suggestorPopup}
+        {popupMenu}
+        {!suggestorPopup && <Typing />}
+        <Kb.Box2
+          direction="vertical"
+          alignItems="center"
+          style={Kb.Styles.collapseStyles([
+            nativeStyles.container,
+            isExploding && nativeStyles.explodingContainer,
+          ])}
+          fullWidth={true}
+        >
+          <Kb.Box2 direction="horizontal" fullWidth={true} style={nativeStyles.inputContainer}>
+            <NativeAnimatedInput
+              onPasteImage={onPasteImage}
+              autoCorrect={true}
+              autoCapitalize="sentences"
+              disabled={cannotWrite}
+              placeholder={hintText}
+              multiline={true}
+              onBlur={onBlur}
+              onFocus={onFocus}
+              onChangeText={aiOnChangeText}
+              onSelectionChange={_onSelectionChange}
+              inputRef={setInputRef}
+              style={nativeStyles.input}
+              textType="Body"
+              rowsMin={1}
+              reservedHeight={suggestionListReserveHeight}
+              expanded={expanded}
+            />
+            <NativeAnimatedExpand expandInput={toggleExpandInput} expanded={expanded} />
+          </Kb.Box2>
+          <NativeButtons
+            ourShowMenu={ourShowMenu}
+            onCancelEditing={onCancelEditing}
+            onSelectionChange={onSelectionChange}
+            onSubmit={onQueueSubmit}
+            hasText={hasText}
+            isEditing={isEditing}
+            isExploding={isExploding}
+            explodingModeSeconds={explodingModeSeconds}
+            cannotWrite={cannotWrite}
+            toggleShowingMenu={openExplodingMenu}
+            showAudioSend={showAudioSend}
+            setShowAudioSend={setShowAudioSend}
+          />
+        </Kb.Box2>
+      </Kb.Box2>
+      {showAudioSend && (
+        <Kb.Box2 fullHeight={true} fullWidth={true} direction="vertical" style={nativeStyles.sendWrapper}>
+          <AudioSendWrapper />
+        </Kb.Box2>
+      )}
+    </>
+  )
+}
+
+const useNativeStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      actionContainer: {
+        minHeight: 32,
+      },
+      container: {
+        borderTopColor: theme.black_10,
+        borderTopWidth: 1,
+        minHeight: 1,
+        overflow: 'hidden',
+        ...Kb.Styles.padding(0, 0, Kb.Styles.globalMargins.xsmall, 0),
+      },
+      editingButton: {
+        ...Kb.Styles.marginH(Kb.Styles.globalMargins.tiny),
+      },
+      exploding: {
+        backgroundColor: theme.black,
+        borderRadius: Kb.Styles.globalMargins.mediumLarge / 2,
+        ...Kb.Styles.size(28),
+        margin: Kb.Styles.globalMargins.xtiny,
+      },
+      explodingContainer: {borderTopColor: theme.black},
+      explodingSendBtn: {
+        backgroundColor: theme.black,
+        marginRight: Kb.Styles.globalMargins.tiny,
+      },
+      // explodingSendBtn bg is theme.black which inverts in dark mode, so the
+      // default whiteOrWhite label would be white-on-white there
+      explodingSendBtnLabel: {color: theme.white},
+      explodingText: {
+        fontSize: 11,
+        lineHeight: 16,
+      },
+      explodingWrapper: {
+        height: 38,
+        width: 36,
+      },
+      iconBottom: {
+        bottom: 0,
+        left: 1,
+        position: 'absolute',
+      },
+      iconContainer: {
+        ...Kb.Styles.size(28),
+        marginRight: -Kb.Styles.globalMargins.xtiny,
+        marginTop: Kb.Styles.globalMargins.tiny,
+      },
+      iconTop: {
+        position: 'absolute',
+        right: 0,
+        top: 0,
+      },
+      input: Kb.Styles.platformStyles({
+        common: {
+          flex: 1,
+          flexShrink: 1,
+          minHeight: 0,
+        },
+      }),
+      inputContainer: {
+        ...Kb.Styles.padding(0, Kb.Styles.globalMargins.tiny),
+        flexGrow: 1,
+        flexShrink: 1,
+        maxHeight: '100%',
+        paddingBottom: Kb.Styles.globalMargins.tiny,
+      },
+      inputInner: {flexGrow: 1},
+      sendBtn: {marginRight: Kb.Styles.globalMargins.tiny},
+      sendWrapper: {backgroundColor: theme.white_90, position: 'absolute'},
+      suggestionList: Kb.Styles.platformStyles({
+        isMobile: {
+          backgroundColor: theme.white,
+          borderColor: theme.black_10,
+          borderStyle: 'solid',
+          borderTopWidth: 3,
+          maxHeight: '50%',
+          overflow: 'hidden',
+        },
+      }),
+      suggestionSpinnerStyle: Kb.Styles.platformStyles({
+        isMobile: {
+          bottom: Kb.Styles.globalMargins.small,
+          position: 'absolute',
+          right: Kb.Styles.globalMargins.small,
+        },
+      }),
+    }) as const
+)
+
+export default isMobile ? NativePlatformInput : DesktopPlatformInput

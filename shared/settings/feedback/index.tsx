@@ -1,0 +1,195 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {
+  // in a modal: more banners over the form's own (the signup screen's sent / error notices)
+  banner?: React.ReactNode
+  feedback?: string
+  loggedOut: boolean
+  onSendFeedback: (feedback: string, sendLogs: boolean, sendMaxBytes: boolean) => void
+  sending: boolean
+  sendError: string
+  showInternalSuccessBanner: boolean // if true, enables the internal success bar
+  onFeedbackDone: (success: boolean) => void
+}
+
+const clickThreshold = 7
+
+const Feedback = (props: Props) => {
+  const styles = useStyles()
+  const {
+    banner,
+    sending,
+    sendError,
+    onFeedbackDone,
+    showInternalSuccessBanner,
+    feedback: _feedback,
+    loggedOut,
+    onSendFeedback,
+  } = props
+  const [clickCount, setClickCount] = React.useState(0)
+  const [email, setEmail] = React.useState<string | undefined>(undefined)
+  const [feedback, setFeedback] = React.useState(_feedback || '')
+  const [sendLogs, setSendLogs] = React.useState(true)
+  const [showSuccessBanner, setShowSuccessBanner] = React.useState(false)
+
+  const _onLabelClick = () => {
+    setClickCount(prevCount => {
+      const newCount = prevCount + 1
+      if (newCount < clickThreshold) {
+        console.log(`clickCount = ${newCount} (${clickThreshold - newCount} away from sending full logs)`)
+      }
+      return newCount
+    })
+  }
+
+  const lastSendingRef = React.useRef(sending)
+  const lastSendErrorRef = React.useRef(sendError)
+
+  React.useEffect(() => {
+    if (lastSendingRef.current !== sending || sendError !== lastSendErrorRef.current) {
+      const success = !sending && !sendError
+      setFeedback(success ? '' : feedback)
+      setShowSuccessBanner(showInternalSuccessBanner && success)
+      onFeedbackDone(success)
+    }
+    lastSendingRef.current = sending
+    lastSendErrorRef.current = sendError
+  }, [sending, sendError, onFeedbackDone, feedback, showInternalSuccessBanner])
+
+  const _sendMaxBytes = () => clickCount >= clickThreshold
+
+  const _onSendFeedback = () => {
+    const sendMaxBytes = _sendMaxBytes()
+    setClickCount(0)
+    setShowSuccessBanner(false)
+    onSendFeedback(email ? `${feedback} (email: ${email || ''} )` : feedback, sendLogs, sendMaxBytes)
+  }
+
+  const inModal = !!Kb.useModalBox()
+  const successBanner = showSuccessBanner ? (
+    <Kb.Banner color="green">
+      <Kb.BannerParagraph bannerColor="green" content="Thanks! Your feedback was sent." />
+    </Kb.Banner>
+  ) : null
+  const sendButton = (
+    <Kb.Button label="Send" onClick={_onSendFeedback} waiting={sending} fullWidth={inModal || !Kb.Styles.isTablet} />
+  )
+  const fields = (
+    <>
+      <Kb.Input3
+        textType="BodySemibold"
+        autoCapitalize="sentences"
+        autoCorrect={true}
+        autoFocus={true}
+        containerStyle={styles.input}
+        inputStyle={styles.inputResize}
+        multiline={true}
+        onChangeText={setFeedback}
+        placeholder="Please tell us what you were doing, your experience, or anything else we should know. Thanks!"
+        rowsMin={4}
+        rowsMax={isMobile ? 4 : 10}
+        value={feedback}
+      />
+      {_sendMaxBytes() && (
+        <Kb.Banner color="green">
+          <Kb.BannerParagraph bannerColor="green" content="next send will include full logs" />
+        </Kb.Banner>
+      )}
+      <Kb.ClickableBox onClick={_onLabelClick} direction="vertical" fullWidth={true}>
+        <Kb.Checkbox
+          label="Include your logs"
+          labelSubtitle="This includes some private metadata info (e.g., file sizes, but not names or contents) but it will help the developers fix bugs more quickly."
+          checked={sendLogs}
+          onCheck={setSendLogs}
+        />
+      </Kb.ClickableBox>
+      {loggedOut && (
+        <Kb.Input3
+          textType="BodySemibold"
+          containerStyle={styles.input}
+          placeholder="Your email address"
+          onChangeText={setEmail}
+        />
+      )}
+    </>
+  )
+  const errorNotice = sendError ? (
+    <Kb.Box2 alignSelf="center" direction="vertical" gap="small">
+      <Kb.Text type="BodySmallError">Could not send log</Kb.Text>
+      <Kb.Text type="BodySmall" selectable={true}>
+        {sendError}
+      </Kb.Text>
+    </Kb.Box2>
+  ) : null
+
+  if (inModal) {
+    return (
+      <Kb.ModalScreen
+        banner={
+          <>
+            {banner}
+            {successBanner}
+          </>
+        }
+        footer={sendButton}
+        testID={TestIDs.SETTINGS_FEEDBACK}
+      >
+        <Kb.Box2 direction="vertical" fullWidth={true} gap="xsmall">
+          {fields}
+          {errorNotice}
+        </Kb.Box2>
+      </Kb.ModalScreen>
+    )
+  }
+
+  return (
+    <Kb.ScrollView alwaysBounceVertical={false} testID={TestIDs.SETTINGS_FEEDBACK}>
+      <Kb.Box2 direction="vertical" fullWidth={true}>
+        {successBanner}
+        <Kb.Box2
+          direction="vertical"
+          padding="small"
+          style={[styles.mainBox, loggedOut && styles.mainBoxCentered]}
+          gap="xsmall"
+        >
+          {fields}
+          <Kb.Box2 alignSelf={loggedOut ? 'center' : 'flex-start'} direction="horizontal" gap="tiny">
+            <Kb.ButtonBar>{sendButton}</Kb.ButtonBar>
+          </Kb.Box2>
+          {errorNotice}
+        </Kb.Box2>
+      </Kb.Box2>
+    </Kb.ScrollView>
+  )
+}
+
+export default Feedback
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      input: Kb.Styles.platformStyles({
+        isElectron: {padding: Kb.Styles.globalMargins.tiny},
+        isMobile: {...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.small)},
+      }),
+      inputResize: Kb.Styles.platformStyles({isElectron: {resize: 'vertical'}}),
+      mainBox: Kb.Styles.platformStyles({
+        isElectron: {
+          alignSelf: 'flex-start',
+          maxWidth: 550,
+          width: '100%',
+        },
+        isTablet: {
+          alignSelf: 'flex-start',
+          width: Kb.Styles.globalStyles.largeWidthPercent,
+        },
+      }),
+      // signed out it is the whole screen, not a settings pane
+      mainBoxCentered: Kb.Styles.platformStyles({
+        isElectron: {alignSelf: 'center'},
+        isTablet: {alignSelf: 'center'},
+      }),
+    }) as const
+)

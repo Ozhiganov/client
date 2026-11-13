@@ -34,6 +34,10 @@
           "name": "username"
         },
         {
+          "type": "string",
+          "name": "fullname"
+        },
+        {
           "type": "SaltpackSenderType",
           "name": "senderType"
         }
@@ -48,11 +52,19 @@
           "type": "int"
         },
         {
+          "name": "signingKID",
+          "type": "KID"
+        },
+        {
           "name": "sender",
           "type": "SaltpackSender"
         },
         {
           "name": "usedDelegateUI",
+          "type": "boolean"
+        },
+        {
+          "name": "signed",
           "type": "boolean"
         }
       ],

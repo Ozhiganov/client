@@ -1,0 +1,147 @@
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import GoButton from './go-button'
+import UserBubble from './user-bubble'
+import type * as T from '@/constants/types'
+import {e164ToDisplay} from '@/util/phone-numbers'
+
+type Props = {
+  allowPhoneEmail: boolean
+  onChangeText: (newText: string) => void
+  onEnterKeyDown: () => void
+  onDownArrowKeyDown: () => void
+  onUpArrowKeyDown: () => void
+  teamSoFar: Array<T.TB.SelectedUser>
+  onRemove: (userId: string) => void
+  onFinishTeamBuilding: () => void
+  searchString: string
+  goButtonLabel?: T.TB.GoButtonLabel
+  waitingKey?: T.Waiting.WaitingKeys
+}
+
+const formatNameForUserBubble = (u: T.TB.SelectedUser) => {
+  let displayName: string
+  switch (u.service) {
+    case 'keybase':
+    case 'email':
+      displayName = u.username
+      break
+    case 'phone':
+      // Username is the assertion username here (E164 without '+'), add '+' to
+      // obtain a valid number for formatting. Do not append prettyName, because
+      // it's likely just the same phone number but not formated.
+      displayName = e164ToDisplay('+' + u.username)
+      break
+    default:
+      displayName = `${u.username} on ${u.service}`
+      break
+  }
+  return `${displayName} ${u.prettyName ? `(${u.prettyName})` : ''}`
+}
+
+const UserBubbleCollection = function UserBubbleCollection(p: {
+  teamSoFar: Props['teamSoFar']
+  onRemove: Props['onRemove']
+}) {
+  const {teamSoFar, onRemove} = p
+  return (
+    <>
+      {teamSoFar.map(u => (
+        <UserBubble
+          key={u.userId}
+          onRemove={() => onRemove(u.userId)}
+          username={u.username}
+          service={u.service}
+          tooltip={formatNameForUserBubble(u)}
+        />
+      ))}
+    </>
+  )
+}
+
+const TeamBox = (props: Props) => {
+  const styles = useStyles()
+  // Scroll to the end when a new user is added so they are visible.
+  const scrollViewRef = React.useRef<Kb.ScrollViewRef>(null)
+  const last = !!props.teamSoFar.length && props.teamSoFar.at(-1)?.userId
+  const prevLastRef = React.useRef(last)
+  React.useEffect(() => {
+    if (prevLastRef.current !== last && scrollViewRef.current) {
+      scrollViewRef.current.scrollToEnd({animated: true})
+    }
+    prevLastRef.current = last
+  }, [prevLastRef, last])
+
+  return isMobile ? (
+    <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.container}>
+      <Kb.ScrollView
+        horizontal={true}
+        alwaysBounceHorizontal={false}
+        ref={scrollViewRef}
+        contentContainerStyle={styles.scrollContent}
+      >
+        <UserBubbleCollection teamSoFar={props.teamSoFar} onRemove={props.onRemove} />
+      </Kb.ScrollView>
+    </Kb.Box2>
+  ) : (
+    <Kb.Box2 direction="horizontal" style={styles.container} fullWidth={true}>
+      <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.bubbles}>
+        <Kb.ScrollView
+          horizontal={true}
+          ref={scrollViewRef}
+          showsHorizontalScrollIndicator={true}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.scrollContent}
+        >
+          <Kb.Box2 direction="horizontal" fullHeight={true}>
+            <UserBubbleCollection teamSoFar={props.teamSoFar} onRemove={props.onRemove} />
+          </Kb.Box2>
+        </Kb.ScrollView>
+      </Kb.Box2>
+      <Kb.Box2 direction="horizontal" fullHeight={true} style={styles.goButtonContainer}>
+        {!!props.teamSoFar.length && (
+          <GoButton
+            label={props.goButtonLabel ?? 'Start'}
+            onClick={props.onFinishTeamBuilding}
+            waitingKey={props.waitingKey}
+          />
+        )}
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      bubbles: Kb.Styles.platformStyles({
+        isElectron: {
+          overflow: 'hidden',
+        },
+      }),
+      goButtonContainer: {marginLeft: 'auto' as const},
+      container: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.blueGrey,
+        },
+        isElectron: {
+          paddingLeft: Kb.Styles.globalMargins.xtiny,
+          paddingRight: Kb.Styles.globalMargins.xsmall,
+        },
+        isMobile: {
+          ...Kb.Styles.bottomDivider(theme),
+          minHeight: 90,
+        },
+      }),
+      scrollContent: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.xsmall),
+        },
+        isMobile: {
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.tiny),
+        },
+      }),
+    }) as const
+)
+
+export default TeamBox

@@ -1,0 +1,273 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import CommandMarkdown from '../../command-markdown'
+import CommandStatus from '../../command-status'
+import Giphy from '../../giphy'
+import * as InputState from '../input-state'
+import PlatformInput from './input'
+import ReplyPreview from '../../reply-preview'
+import UnfurlPreview from '../unfurl-preview'
+import type * as T from '@/constants/types'
+import {indefiniteArticle} from '@/util/string'
+import {infoPanelWidthTablet} from '../../info-panel/common'
+import {assertionToDisplay} from '@/common-adapters/usernames'
+import {ThreadRefsContext} from '@/chat/conversation/normal/context'
+import {useComposerInput} from '../composer'
+import {useConversationCenter, useConversationCenterActions} from '../../center-context'
+import {
+  useConversationThreadActions,
+  useConversationThreadID,
+  useConversationThreadMessage,
+  useConversationThreadSelector,
+  useConversationThreadSetExplodingMode,
+  useThreadMeta,
+} from '../../thread-context'
+import {useConversationThreadCloseSearch} from '../../thread-navigation'
+import {useConversationParticipantsSelector} from '../../data-hooks'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useRoute} from '@react-navigation/native'
+import {unboxRows} from '@/chat/inbox/metadata'
+
+const useHintText = (p: {
+  isExploding: boolean
+  isEditing: boolean
+  cannotWrite: boolean
+  minWriterRole: T.Chat.ConversationMeta['minWriterRole']
+}) => {
+  const {minWriterRole, isExploding, isEditing, cannotWrite} = p
+  const username = useCurrentUserState(s => s.username)
+  const conversationIDKey = useConversationThreadID()
+  const {channelname, teamType, teamname} = useThreadMeta(
+    C.useShallow(m => ({
+      channelname: m.channelname,
+      teamType: m.teamType,
+      teamname: m.teamname,
+    }))
+  )
+  const participantInfoName = useConversationParticipantsSelector(conversationIDKey, p => p.name)
+  if (isMobile && isExploding) {
+    return C.isLargeScreen ? `Write an exploding message` : 'Exploding message'
+  }
+  if (cannotWrite) {
+    return `You must be at least ${indefiniteArticle(minWriterRole)} ${minWriterRole} to post.`
+  }
+  if (isEditing) {
+    return 'Edit your message'
+  }
+  if (isExploding) {
+    return 'Write an exploding message'
+  }
+
+  switch (teamType) {
+    case 'big':
+      if (channelname) {
+        return `Write in ${isMobile ? '' : `@${teamname}`}#${channelname}`
+      }
+      break
+    case 'small':
+      if (teamname) {
+        return `Write in @${teamname}`
+      }
+      break
+    case 'adhoc':
+      if (participantInfoName.length > 2) {
+        return 'Message group'
+      } else if (participantInfoName.length === 2) {
+        const other = participantInfoName.find(n => n !== username)
+        if (other) {
+          const otherText = other.includes('@') ? assertionToDisplay(other) : `@${other}`
+          if (otherText.length < 20) return `Message ${otherText}`
+        }
+      } else if (participantInfoName.length === 1) {
+        return 'Message yourself'
+      }
+      break
+  }
+  return 'Write a message'
+}
+
+const Input = function Input() {
+  const styles = useStyles()
+  const showGiphySearch = InputState.useConversationInput(s => s.giphyWindow)
+  const showCommandMarkdown = InputState.useConversationInput(s => !!s.commandMarkdown)
+  const showCommandStatus = InputState.useConversationInput(s => !!s.commandStatus)
+  const replyTo = InputState.useConversationInput(s => s.replyTo)
+  const showReplyTo = !!useConversationThreadMessage(replyTo)?.id
+  return (
+    <Kb.Box2 style={styles.container} direction="vertical" fullWidth={true}>
+      {showReplyTo && <ReplyPreview />}
+      {/*TODO move this into suggestors*/ showCommandMarkdown && <CommandMarkdown />}
+      {showCommandStatus && <CommandStatus />}
+      {showGiphySearch && <Giphy />}
+      <ConnectedPlatformInput />
+    </Kb.Box2>
+  )
+}
+
+const ConnectedPlatformInput = function ConnectedPlatformInput() {
+  const styles = useStyles()
+  const route = useRoute()
+  // infoPanel only exists on the desktop/tablet split-view chatRoot route
+  const infoPanelShowing =
+    route.name === 'chatRoot' && 'infoPanel' in route.params && !!route.params.infoPanel
+  const {editOrdinal, replyTo} = InputState.useConversationInput(
+    C.useShallow(s => ({editOrdinal: s.editing, replyTo: s.replyTo}))
+  )
+  const replyToMessage = useConversationThreadMessage(replyTo)
+  const conversationIDKey = useConversationThreadID()
+  const explodingMode = useConversationThreadSelector(s => s.explodingMode)
+  const meta = useThreadMeta(
+    C.useShallow(m => ({
+      cannotWrite: m.cannotWrite,
+      conversationIDKey: m.conversationIDKey,
+      draft: m.draft,
+      minWriterRole: m.minWriterRole,
+      retentionPolicy: m.retentionPolicy,
+      teamRetentionPolicy: m.teamRetentionPolicy,
+    }))
+  )
+  const setExplodingModeRaw = useConversationThreadSetExplodingMode()
+  const {rpc} = useConversationThreadActions()
+  const {cannotWrite, minWriterRole} = meta
+  const metaGood = meta.conversationIDKey === conversationIDKey
+  const storeDraft = metaGood ? meta.draft : undefined
+  const convRetention =
+    meta.retentionPolicy.type === 'inherit' ? meta.teamRetentionPolicy : meta.retentionPolicy
+  const explodingModeSecondsRaw =
+    convRetention.type === 'explode' ? Math.min(explodingMode || Infinity, convRetention.seconds) : explodingMode
+  const showReplyPreview = !!replyToMessage?.id
+  const isEditing = !!editOrdinal
+  const setEditing = InputState.useConversationInputDispatch(s => s.setEditing)
+  const sendComposerText = InputState.useConversationInputDispatch(s => s.sendComposerText)
+  const {hasCenter} = useConversationCenter()
+  const {jumpToRecent} = useConversationCenterActions()
+  const closeThreadSearch = useConversationThreadCloseSearch()
+
+  const isExploding = explodingModeSecondsRaw !== 0
+
+  const hintText = useHintText({cannotWrite, isEditing, isExploding, minWriterRole})
+  const {composer, setInput, textChanged} = useComposerInput(storeDraft, cannotWrite)
+  const suggestionOverlayStyle = infoPanelShowing
+    ? styles.suggestionOverlayInfoShowing
+    : styles.suggestionOverlay
+
+  const setExplodingMode = (mode: number) => {
+    setExplodingModeRaw(mode, false)
+  }
+
+  const {scrollToBottom} = React.useContext(ThreadRefsContext)
+  const onSubmit = () => {
+    const sent = composer.submit((text, unfurlSuppress) => {
+      sendComposerText(text, unfurlSuppress)
+      if (hasCenter) {
+        closeThreadSearch()
+        jumpToRecent()
+      }
+    })
+    if (sent && !hasCenter) {
+      scrollToBottom()
+    }
+    return sent
+  }
+
+  const sendTypingRaw = (typing: boolean) => {
+    const f = async () => {
+      await rpc.setTyping(conversationIDKey, typing)
+    }
+    C.ignorePromise(f())
+  }
+  const sendTyping = C.useThrottledCallback(sendTypingRaw, 1000)
+
+  // Low-frequency copy of the composer text for the unfurl preview, so the composer does not
+  // re-render on every keystroke. The preview debounces another 500ms downstream anyway.
+  const [previewText, setPreviewText] = React.useState('')
+  const updatePreview = C.useThrottledCallback(setPreviewText, 200, {trailing: true})
+
+  // the composer's own writes (a draft, an inject) are not the user typing; an empty text always
+  // says they stopped
+  const onChangeText = (text: string) => {
+    const typed = textChanged(text)
+    updatePreview(text)
+    if (!text) {
+      sendTyping.cancel()
+      sendTyping(false)
+    } else if (typed) {
+      sendTyping(true)
+    }
+  }
+
+  const onCancelEditing = () => {
+    setEditing('clear')
+  }
+
+  // on unmount load meta so we have an updated draft
+  const loadIDOnUnloadRef = React.useRef(conversationIDKey)
+  React.useEffect(() => {
+    const rows = [loadIDOnUnloadRef.current]
+    return () => {
+      unboxRows(rows)
+    }
+  }, [loadIDOnUnloadRef])
+
+  const input = (
+    <PlatformInput
+      hintText={hintText}
+      suggestionOverlayStyle={suggestionOverlayStyle}
+      onSubmit={onSubmit}
+      setInputRef={setInput}
+      onChangeText={onChangeText}
+      onCancelEditing={onCancelEditing}
+      cannotWrite={cannotWrite}
+      explodingModeSeconds={explodingModeSecondsRaw}
+      isEditing={isEditing}
+      isExploding={isExploding}
+      minWriterRole={minWriterRole}
+      showReplyPreview={showReplyPreview}
+      setExplodingMode={setExplodingMode}
+    />
+  )
+
+  // nothing while editing: an edit posts as MessageType_EDIT, which the unfurler does not
+  // extract urls from at all, so a card would promise an unfurl the edit cannot produce
+  const preview = isEditing ? null : (
+    <UnfurlPreview conversationIDKey={conversationIDKey} text={previewText} />
+  )
+
+  if (isMobile) {
+    // in flow above the composer; it rides KeyboardStickyView with the input
+    return (
+      <>
+        {preview}
+        {input}
+      </>
+    )
+  }
+
+  // the preview floats out of this box, so it needs a positioned ancestor
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} relative={true}>
+      {preview}
+      {input}
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => {
+  const suggestDesktop = {marginLeft: 15, marginRight: 15, marginTop: 'auto'}
+  return {
+    container: Kb.Styles.platformStyles({
+      isMobile: {justifyContent: 'flex-end'},
+    }),
+    suggestionOverlay: Kb.Styles.platformStyles({
+      isElectron: suggestDesktop,
+      isTablet: {marginLeft: '30%', marginRight: 0},
+    }),
+    suggestionOverlayInfoShowing: Kb.Styles.platformStyles({
+      isElectron: suggestDesktop,
+      isTablet: {marginLeft: '30%', marginRight: infoPanelWidthTablet},
+    }),
+  } as const
+})
+
+export default Input

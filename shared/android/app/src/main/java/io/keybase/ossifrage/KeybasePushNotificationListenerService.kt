@@ -1,0 +1,422 @@
+package io.keybase.ossifrage
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import io.keybase.ossifrage.MainActivity.Companion.setupKBRuntime
+import io.keybase.ossifrage.modules.NativeLogger
+import keybase.ChatNotification
+import keybase.Keybase
+import keybase.PushNotifier
+import org.json.JSONObject
+
+class KeybasePushNotificationListenerService : FirebaseMessagingService() {
+    // This keeps a small ring buffer cache of the last 5 messages per conversation the user
+    // was notified about to give context to future notifications.
+    private val msgCache = HashMap<String?, SmallMsgRingBuffer>()
+
+    // Go's seen cache dedupes what Go displays, but not the fallback below: a
+    // redelivered push that Go fails on again would show the fallback twice,
+    // and each display adds the message to msgCache's history again.
+    private val seenChatNotifications = object : LinkedHashMap<String, Unit>(16, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>?) = size > SEEN_CHAT_NOTIFICATIONS_MAX
+    }
+    private fun chatNotificationKey(convID: String?, messageId: Int, targetUID: String): String {
+        return "$targetUID|$convID|$messageId"
+    }
+
+    override fun onCreate() {
+        setupKBRuntime(this, false)
+        NativeLogger.info("KeybasePushNotificationListenerService created")
+        createNotificationChannel(this)
+    }
+
+    override fun onMessageReceived(message: RemoteMessage) {
+        NativeLogger.info("KeybasePushNotificationListenerService.onMessageReceived START")
+        val bundle = Bundle()
+        for ((key, value) in message.data) {
+            bundle.putString(key, value)
+        }
+        val data = parseJSONObject(bundle.getString("data"))
+        if (data != null) {
+            if (!bundle.containsKey("message")) {
+                bundle.putString("message", data.optString("alert", ""))
+            }
+            if (!bundle.containsKey("title")) {
+                bundle.putString("title", data.optString("title", ""))
+            }
+            if (!bundle.containsKey("sound")) {
+                bundle.putString("soundName", data.optString("sound", ""))
+            }
+            if (!bundle.containsKey("color")) {
+                bundle.putString("color", data.optString("color", ""))
+            }
+            // Do not apply badge here: the data.badge value comes from the server
+            // for an unspecified account and may not match the currently active user.
+            // Badge updates are applied in displayChatNotification2 (after Go validates
+            // the target UID) or via the Gregor badge-state RPC path.
+        }
+        try {
+            val type = bundle.getString("type")
+            NativeLogger.info("KeybasePushNotificationListenerService.onMessageReceived type: $type")
+            val payload = bundle.getString("m")
+            val notifier = KBPushNotifier(applicationContext, bundle.clone() as Bundle)
+            when (type) {
+                "chat.newmessage", "chat.newmessageSilent_2" -> {
+                    NativeLogger.info("KeybasePushNotificationListenerService processing chat notification")
+                    val n = NotificationData(type, bundle)
+
+                    // Silent notifications should never display - we'll get the non-silent version
+                    // (chat.newmessage) with a servermessagebody that we can display later.
+                    val dontNotify = type == "chat.newmessageSilent_2"
+
+                    // Both push types include a target UID so Go can reject the notification
+                    // early when the push is addressed to a different logged-in account:
+                    //   chat.newmessage       → "uid" field
+                    //   chat.newmessageSilent_2 → "i" field (added server-side)
+                    val targetUID = when (type) {
+                        "chat.newmessage" -> bundle.getString("uid", "")
+                        else -> bundle.getString("i", "")
+                    }
+                    val currentUID = try {
+                        Keybase.currentUID()
+                    } catch (e: Exception) {
+                        NativeLogger.info("KeybasePushNotificationListenerService couldn't read current UID: ${e.message}")
+                        ""
+                    }
+                    // Same gate as iOS/Go: do not unbox, ack, or update badges for another account.
+                    // Android data pushes have no system-delivered alert, so loud pushes still fall
+                    // through to the generic local notification below.
+                    val forOtherAccount = targetUID.isNotEmpty() && currentUID.isNotEmpty() && targetUID != currentUID
+                    if (forOtherAccount) {
+                        NativeLogger.info("KeybasePushNotificationListenerService skipping Go for different account push")
+                    }
+
+                    // Only check for duplicates on non-silent notifications that will be displayed
+                    // Silent notifications are processed but not marked as seen, allowing the non-silent one to display.
+                    // Key includes UID so two signed-in accounts in the same chat are not treated as duplicates.
+                    if (!dontNotify) {
+                        val notificationKey = chatNotificationKey(n.convID, n.messageId, targetUID)
+                        if (seenChatNotifications.containsKey(notificationKey)) {
+                            NativeLogger.info("KeybasePushNotificationListenerService skipping duplicate notification: $notificationKey")
+                            return
+                        }
+                        // Mark as seen immediately to prevent duplicate processing
+                        seenChatNotifications[notificationKey] = Unit
+                        NativeLogger.info("KeybasePushNotificationListenerService marked notification as seen: $notificationKey")
+                    }
+
+                    var goProcessingSucceeded = false
+                    if (!forOtherAccount) {
+                        // Blow the cache if we aren't displaying plaintext
+                        if (!msgCache.containsKey(n.convID) || !n.displayPlaintext) {
+                            msgCache[n.convID] = SmallMsgRingBuffer()
+                        }
+                        notifier.setMsgCache(msgCache[n.convID])
+                        try {
+                            handleChatPush(KeybaseLifecycleBind(applicationContext), notifier, dontNotify,
+                                    { NativeLogger.info(it) }) { pusher ->
+                                Keybase.handleBackgroundNotification(n.convID, payload, n.serverMessageBody, n.sender,
+                                        n.membersType.toLong(), n.displayPlaintext, n.messageId.toLong(), n.pushId,
+                                        n.badgeCount.toLong(), n.unixTime, n.soundName, pusher, true, targetUID)
+                            }
+                            goProcessingSucceeded = true
+                            if (!dontNotify) {
+                                seenChatNotifications[chatNotificationKey(n.convID, n.messageId, targetUID)] = Unit
+                            }
+                        } catch (ex: Exception) {
+                            NativeLogger.error("Go couldn't handle background notification: " + ex.message)
+                        }
+                    }
+
+
+                    val isForeground = try {
+                        Keybase.isAppStateForeground()
+                    } catch (e: Exception) {
+                        NativeLogger.info("KeybasePushNotificationListenerService couldn't check if app is foreground: ${e.message}, assuming background")
+                        false
+                    }
+                    NativeLogger.info("KeybasePushNotificationListenerService isForeground: $isForeground")
+
+                    // Don't show notifications if app is foreground - user is already looking at the app
+                    if (isForeground) {
+
+                    } else if (dontNotify) {
+                        // Silent notifications should never display - they're processed by Go but no notification shown
+                    } else if (!goProcessingSucceeded && type == "chat.newmessage") {
+                        // Only show fallback if Go processing failed AND it's a non-silent notification
+                        // If Go succeeded, it already displayed the notification (via notifier parameter)
+                        NativeLogger.info("KeybasePushNotificationListenerService attempting fallback notification display")
+                        try {
+                            val chatNotif = keybase.ChatNotification()
+                            chatNotif.convID = n.convID
+
+                            val message = keybase.Message()
+                            message.serverMessage = n.serverMessageBody
+                            message.at = n.unixTime
+                            message.id = n.messageId.toLong()
+
+                            val person = keybase.Person()
+                            person.keybaseUsername = n.sender ?: ""
+                            message.from = person
+
+                            chatNotif.message = message
+                            chatNotif.isPlaintext = n.displayPlaintext
+                            chatNotif.badgeCount = -1
+                            chatNotif.soundName = n.soundName ?: "default"
+                            chatNotif.conversationName = ""
+                            chatNotif.isGroupConversation = false
+                            chatNotif.tlfName = ""
+                            chatNotif.title = bundle.getString("title", "")
+                            chatNotif.uid = targetUID
+
+                            notifier.displayChatNotification(chatNotif)
+                            seenChatNotifications[chatNotificationKey(n.convID, n.messageId, targetUID)] = Unit
+                            NativeLogger.info("KeybasePushNotificationListenerService fallback notification displayed successfully")
+                        } catch (e: Exception) {
+                            NativeLogger.error("Failed to display notification fallback: " + e.message)
+                        }
+                    }
+                }
+
+                "follow" -> {
+                    val username = bundle.getString("username")
+                    val m = bundle.getString("message")
+                    if (username != null && m != null) {
+                        notifier.followNotification(username, m)
+                    }
+                }
+
+                "device.revoked", "device.new" -> {
+                    notifier.deviceNotification()
+                }
+
+                "chat.readmessage" -> {
+                    val convID = bundle.getString("c")
+                    val targetUID = bundle.getString("i", "")
+                    // Clear the cache of msgs for this conv id
+                    if (msgCache.containsKey(convID)) {
+                        msgCache[convID] = SmallMsgRingBuffer()
+                    }
+                    // Only cancel notifications if this read receipt is for the active
+                    // account. A receipt from another logged-in account must not clear
+                    // the active account's notification tray.
+                    if (targetUID.isEmpty() || targetUID == Keybase.currentUID()) {
+                        val notificationManager = NotificationManagerCompat.from(applicationContext)
+                        notificationManager.cancelAll()
+                    }
+                }
+
+                else -> {
+                    notifier.generalNotification()
+                }
+            }
+        } catch (ex: Exception) {
+            NativeLogger.error("Couldn't handle background notification: " + ex.message)
+        }
+    }
+
+    private fun parseJSONObject(str: String?): JSONObject? {
+        return try {
+            if (str != null) {
+                return JSONObject(str)
+            } else {
+                return null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    companion object {
+        private const val SEEN_CHAT_NOTIFICATIONS_MAX = 100
+        const val CHAT_CHANNEL_ID = "kb_chat_channel"
+        const val FOLLOW_CHANNEL_ID = "kb_follow_channel"
+        const val DEVICE_CHANNEL_ID = "kb_device_channel"
+        const val GENERAL_CHANNEL_ID = "kb_rest_channel"
+        fun createNotificationChannel(context: Context) {
+            // Create the NotificationChannel, but only on API 26+ because
+            // the NotificationChannel class is new and not in the support library
+            // Safe to call this multiple times - no ops afterwards
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val notificationManager = context.getSystemService(NotificationManager::class.java)
+                if (notificationManager.getNotificationChannel("keybase_all") != null) {
+                    notificationManager.deleteNotificationChannel("keybase_all")
+                }
+
+                // Chat Notifications
+                run {
+                    val name: CharSequence = context.getString(R.string.channel_name)
+                    val description = context.getString(R.string.channel_description)
+                    val importance = NotificationManager.IMPORTANCE_HIGH
+                    val chat_channel = NotificationChannel(CHAT_CHANNEL_ID, name, importance)
+                    chat_channel.description = description
+                    // Register the channel with the system; you can't change the importance
+                    // or other notification behaviors after this
+                    notificationManager.createNotificationChannel(chat_channel)
+                }
+
+
+                // Follow Notifications
+                run {
+                    val follow_name: CharSequence = context.getString(R.string.notif_follows_name)
+                    val follow_description = context.getString(R.string.notif_follow_desc)
+                    val follow_importance = NotificationManager.IMPORTANCE_DEFAULT
+                    val follow_channel = NotificationChannel(FOLLOW_CHANNEL_ID, follow_name, follow_importance)
+                    follow_channel.description = follow_description
+                    notificationManager.createNotificationChannel(follow_channel)
+                }
+
+                // Device Notifications
+                run {
+                    val device_name: CharSequence = context.getString(R.string.notif_devices_name)
+                    val device_description = context.getString(R.string.notif_device_description)
+                    val device_importance = NotificationManager.IMPORTANCE_HIGH
+                    val device_channel = NotificationChannel(DEVICE_CHANNEL_ID, device_name, device_importance)
+                    device_channel.description = device_description
+                    notificationManager.createNotificationChannel(device_channel)
+                }
+
+                // The rest of the notifications
+                run {
+                    val general_name: CharSequence = context.getString(R.string.general_channel_name)
+                    val general_description = context.getString(R.string.general_channel_description)
+                    val general_importance = NotificationManager.IMPORTANCE_LOW
+                    val general_channel = NotificationChannel(GENERAL_CHANNEL_ID, general_name, general_importance)
+                    general_channel.description = general_description
+                    notificationManager.createNotificationChannel(general_channel)
+                }
+            }
+        }
+    }
+}
+
+class SmallMsgRingBuffer {
+    private val buffer = ArrayList<NotificationCompat.MessagingStyle.Message>()
+    fun add(m: NotificationCompat.MessagingStyle.Message) {
+        while (buffer.size > 4) {
+            buffer.removeAt(0)
+        }
+        buffer.add(m)
+    }
+
+    fun summary(): List<NotificationCompat.MessagingStyle.Message> {
+        return buffer
+    }
+}
+
+internal class NotificationData(type: String, bundle: Bundle) {
+    val displayPlaintext: Boolean
+    val membersType: Int
+    var convID: String? = null
+    var messageId = 0
+    var pushId: String? = null
+    val badgeCount: Int
+    val unixTime: Long
+    val soundName: String
+    val serverMessageBody: String
+    val sender: String
+
+    // Derived from go/gregord/chatpush/push.go
+    init {
+        displayPlaintext = "true" == bundle.getString("n")
+        membersType = bundle.getString("t")?.toIntOrNull() ?: 0
+        badgeCount = bundle.getString("b", "0").toIntOrNull() ?: 0
+        soundName = bundle.getString("s", "")
+        serverMessageBody = bundle.getString("message", "")
+        sender = bundle.getString("u", "")
+        unixTime = bundle.getString("x", "0").toLongOrNull() ?: 0
+        if (type == "chat.newmessage") {
+            messageId = bundle.getString("msgID", "0").toIntOrNull() ?: 0
+            convID = bundle.getString("convID")
+            pushId = ""
+        } else if (type == "chat.newmessageSilent_2") {
+            messageId = bundle.getString("d", "").toIntOrNull() ?: 0
+            convID = bundle.getString("c")
+            // Deliberately don't extract the companion pushId ("p") here: Android
+            // never displays from the silent push (it waits for the visible
+            // chat.newmessage), and acking the pushId would tell the server to
+            // cancel that visible push, so nothing would ever be shown.
+            pushId = ""
+        } else {
+            throw Error("Tried to parse notification of unhandled type: $type")
+        }
+    }
+}
+
+// A silent push gets no notifier, and Go only acks a push it can display, so in
+// the foreground Go would unbox it for nothing: the loud push that follows is
+// the one Go handles.
+internal fun handleChatPush(
+    bind: LifecycleBind,
+    notifier: PushNotifier,
+    silent: Boolean,
+    log: (String) -> Unit,
+    work: (PushNotifier?) -> Unit,
+) {
+    if (!silent) {
+        withBackgroundActive(bind, notifier, log, work)
+        return
+    }
+    if (bind.isAppStateForeground()) {
+        log("handleChatPush: silent push in the foreground, skipping Go")
+        return
+    }
+    withBackgroundActive(bind, null, log, work)
+}
+
+// Hands Go the work a push or a quick reply started. In the foreground Go
+// handles it as is, so the push is still unboxed and acked, but nothing is
+// displayed. Otherwise Go is held in BACKGROUNDACTIVE while the work runs and
+// then decides whether it must keep running; appDidEnterBackground reports
+// BACKGROUND itself (and flushes) when it returns false, so there is no
+// setAppStateBackground here.
+internal fun withBackgroundActive(
+    bind: LifecycleBind,
+    notifier: PushNotifier?,
+    log: (String) -> Unit,
+    work: (PushNotifier?) -> Unit,
+) {
+    val pusher = notifier?.let { ForegroundSuppressingNotifier(it, bind) }
+    if (bind.isAppStateForeground()) {
+        log("withBackgroundActive: foreground")
+        work(pusher)
+        return
+    }
+    bind.setAppStateBackgroundActive()
+    // Work that throws still hands Go back to the background, or it would stay
+    // in BACKGROUNDACTIVE until the next lifecycle event.
+    try {
+        work(pusher)
+    } finally {
+        if (bind.isAppStateForeground()) {
+            log("withBackgroundActive: foregrounded during the work")
+        } else if (bind.appDidEnterBackground()) {
+            bind.appBeginBackgroundTaskNonblock()
+        }
+    }
+}
+
+// Checked at display time: the app can come to the foreground while Go works.
+private class ForegroundSuppressingNotifier(
+    private val inner: PushNotifier,
+    private val bind: LifecycleBind,
+) : PushNotifier {
+    override fun displayChatNotification(notification: ChatNotification?) {
+        if (bind.isAppStateForeground()) {
+            return
+        }
+        inner.displayChatNotification(notification)
+    }
+
+    override fun localNotification(
+        ident: String?, title: String?, msg: String?, badgeCount: Long, soundName: String?,
+        convID: String?, typ: String?, uid: String?,
+    ) = inner.localNotification(ident, title, msg, badgeCount, soundName, convID, typ, uid)
+}

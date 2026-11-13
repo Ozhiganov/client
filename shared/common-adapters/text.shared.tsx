@@ -1,0 +1,150 @@
+import type * as React from 'react'
+import type * as CSS from '@/styles/css'
+import type colors from '@/styles/colors'
+import type {MeasureRef} from './measure-ref'
+
+/* eslint-disable sort-keys */
+export const allTextTypes = {
+  Body: 'Body',
+  BodyItalic: 'BodyItalic',
+  BodyBig: 'BodyBig',
+  BodyBigExtrabold: 'BodyBigExtrabold',
+  BodyBigLink: 'BodyBigLink',
+  BodyBold: 'BodyBold',
+  BodyExtrabold: 'BodyExtrabold',
+  BodyPrimaryLink: 'BodyPrimaryLink',
+  BodySecondaryLink: 'BodySecondaryLink',
+  BodySemibold: 'BodySemibold',
+  BodySemiboldLink: 'BodySemiboldLink',
+  BodySemiboldItalic: 'BodySemiboldItalic',
+  BodySmall: 'BodySmall',
+  BodySmallBold: 'BodySmallBold',
+  BodySmallExtrabold: 'BodySmallExtrabold',
+  BodySmallExtraboldSecondaryLink: 'BodySmallExtraboldSecondaryLink',
+  BodySmallError: 'BodySmallError',
+  BodySmallItalic: 'BodySmallItalic',
+  BodySmallPrimaryLink: 'BodySmallPrimaryLink',
+  BodySmallSecondaryLink: 'BodySmallSecondaryLink',
+  BodySmallSemibold: 'BodySmallSemibold',
+  BodySmallSemiboldItalic: 'BodySmallSemiboldItalic',
+  BodySmallSemiboldSecondaryLink: 'BodySmallSemiboldSecondaryLink',
+  BodySmallSemiboldPrimaryLink: 'BodySmallSemiboldPrimaryLink',
+  BodySmallSuccess: 'BodySmallSuccess',
+  BodySmallWallet: 'BodySmallWallet',
+  BodyTiny: 'BodyTiny',
+  BodyTinyLink: 'BodyTinyLink',
+  BodyTinySemibold: 'BodyTinySemibold',
+  BodyTinySemiboldItalic: 'BodyTinySemiboldItalic',
+  BodyTinyBold: 'BodyTinyBold',
+  BodyTinyExtrabold: 'BodyTinyExtrabold',
+  Header: 'Header',
+  HeaderItalic: 'HeaderItalic',
+  HeaderExtrabold: 'HeaderExtrabold',
+  HeaderBig: 'HeaderBig',
+  HeaderBigExtrabold: 'HeaderBigExtrabold',
+  HeaderLink: 'HeaderLink',
+  Terminal: 'Terminal',
+  TerminalComment: 'TerminalComment',
+  TerminalEmpty: 'TerminalEmpty',
+  TerminalInline: 'TerminalInline',
+} as const
+type AllTextTypes = typeof allTextTypes
+export type TextType = keyof AllTextTypes
+
+export const linkTypes = new Set<TextType>([
+  'BodyBigLink',
+  'BodyPrimaryLink',
+  'BodySecondaryLink',
+  'BodySemiboldLink',
+  'BodySmallPrimaryLink',
+  'BodySmallSecondaryLink',
+  'BodySmallSemiboldPrimaryLink',
+  'BodySmallSemiboldSecondaryLink',
+  'BodySmallExtraboldSecondaryLink',
+  'BodyTinyLink',
+  'HeaderLink',
+])
+
+export type Background =
+  | 'Announcements'
+  | 'Documentation'
+  | 'HighRisk'
+  | 'Information'
+  | 'Normal'
+  | 'Success'
+  | 'Terminal'
+
+type Colors = typeof colors
+export type TextTypeBold = 'BodyTinyBold' | 'BodySmallBold' | 'BodyBold' | 'BodyBig' | 'Header' | 'HeaderBig'
+
+// Talk to design before adding a color here - these should cover all cases.
+type AllowedColorNames =
+  | 'blueDark'
+  | 'blueLighter' // for terminal background only
+  | 'greenDark'
+  | 'greenLight'
+  | 'redDark'
+  | 'purpleDark'
+  | 'black'
+  | 'black_on_white'
+  | 'black_50'
+  | 'black_50_on_white'
+  | 'black_50OrWhite_40'
+  | 'black_35'
+  | 'black_20'
+  | 'black_20_on_white'
+  | 'white'
+  | 'white_75'
+  | 'white_40'
+  | 'brown_75'
+  | 'orange'
+  | 'transparent'
+
+export type AllowedColors = Colors[AllowedColorNames] | 'inherit'
+
+export type StylesTextCrossPlatform = CSS.CustomStyles<'color', {color?: AllowedColors}>
+
+export type LineClampType = 1 | 2 | 3 | 4 | 5
+
+export type MetaType = {
+  fontSize: 12 | 13 | 14 | 15 | 18 | 24 | 16 | 17 | 20 | 28
+  colorForBackground: {
+    positive: string
+    negative: string
+  }
+  isLink?: true
+  styleOverride?: CSS.StylesCrossPlatform
+  isTerminal?: true
+}
+
+export type TextStyle = CSS._StylesCrossPlatform & {
+  fontSize?: number
+  lineHeight?: number
+  color?: string
+  cursor?: string
+}
+
+export const backgroundModeIsNegative = (bm?: Background): boolean =>
+  !!bm && !['Normal', 'Information'].includes(bm)
+
+export type Props = {
+  type?: TextType
+  children?: React.ReactNode
+  style?: CSS.StylesCrossPlatform
+  allowFontScaling?: boolean
+  onClick?: (e: React.BaseSyntheticEvent) => void
+  onContextMenu?: (e: React.BaseSyntheticEvent) => void
+  onLongPress?: () => void
+  center?: boolean
+  negative?: boolean
+  lineClamp?: number
+  ellipsizeMode?: 'head' | 'middle' | 'tail' | 'clip'
+  selectable?: boolean
+  title?: string
+  tooltip?: string
+  textRef?: React.RefObject<MeasureRef | null>
+  underline?: boolean
+  underlineNever?: boolean
+  virtualText?: boolean
+  className?: string
+}

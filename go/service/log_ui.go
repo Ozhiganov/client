@@ -4,11 +4,11 @@
 package service
 
 import (
+	"context"
 	"fmt"
 
-	"golang.org/x/net/context"
-
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/go-framed-msgpack-rpc/rpc"
 )
 
 type LogUI struct {
@@ -16,11 +16,18 @@ type LogUI struct {
 	cli       *keybase1.LogUiClient
 }
 
-func (l *LogUI) Log(level keybase1.LogLevel, format string, args []interface{}) {
+func NewLogUI(sessionID int, c *rpc.Client) *LogUI {
+	return &LogUI{
+		sessionID: sessionID,
+		cli:       &keybase1.LogUiClient{Cli: c},
+	}
+}
+
+func (l *LogUI) Log(level keybase1.LogLevel, format string, args []any) {
 	msg := fmt.Sprintf(format, args...)
-	l.cli.Log(context.TODO(), keybase1.LogArg{
+	_ = l.cli.Log(context.TODO(), keybase1.LogArg{
 		SessionID: l.sessionID,
-		Level:     keybase1.LogLevel(level),
+		Level:     level,
 		Text: keybase1.Text{
 			Markup: false,
 			Data:   msg,
@@ -28,21 +35,26 @@ func (l *LogUI) Log(level keybase1.LogLevel, format string, args []interface{}) 
 	})
 }
 
-func (l *LogUI) Debug(format string, args ...interface{}) {
+func (l *LogUI) Debug(format string, args ...any) {
 	l.Log(keybase1.LogLevel_DEBUG, format, args)
 }
-func (l *LogUI) Info(format string, args ...interface{}) {
+
+func (l *LogUI) Info(format string, args ...any) {
 	l.Log(keybase1.LogLevel_INFO, format, args)
 }
-func (l *LogUI) Critical(format string, args ...interface{}) {
+
+func (l *LogUI) Critical(format string, args ...any) {
 	l.Log(keybase1.LogLevel_CRITICAL, format, args)
 }
-func (l *LogUI) Warning(format string, args ...interface{}) {
+
+func (l *LogUI) Warning(format string, args ...any) {
 	l.Log(keybase1.LogLevel_WARN, format, args)
 }
-func (l *LogUI) Errorf(format string, args ...interface{}) {
+
+func (l *LogUI) Errorf(format string, args ...any) {
 	l.Log(keybase1.LogLevel_ERROR, format, args)
 }
-func (l *LogUI) Notice(format string, args ...interface{}) {
+
+func (l *LogUI) Notice(format string, args ...any) {
 	l.Log(keybase1.LogLevel_NOTICE, format, args)
 }

@@ -1,0 +1,196 @@
+import logger from '@/logger'
+import * as T from '@/constants/types'
+import {
+  clearModals,
+  navigateAppend,
+  navigateToThread,
+  navToProfile,
+  navUpToScreen,
+  previewConversation,
+  pushInTab,
+  switchTab,
+} from './router'
+import * as Tabs from './tabs'
+import {isTablet} from './platform'
+import {settingsDevicesTab} from './settings'
+import {showTeamByName} from '@/teams/team-page-actions'
+
+// A tablet's tab mounts its stack only once focused, so a push right after switching to a tab never
+// opened reaches no stack; there the screen goes onto that tab's stack in one reset. On a phone the
+// screen sits above the tabs and on desktop every tab is mounted, so switching then pushing lands.
+const showInTab = (tab: Tabs.AppTab, screen: Parameters<typeof pushInTab>[1]) => {
+  if (isTablet) {
+    pushInTab(tab, screen)
+    return
+  }
+  switchTab(tab)
+  navigateAppend(screen as Parameters<typeof navigateAppend>[0])
+}
+
+const prefix = 'keybase://'
+export const linkFromConvAndMessage = (conv: string, messageID: number) =>
+  `${prefix}chat/${conv}/${messageID}`
+
+const isTeamPageAction = (a?: string): a is TeamPageAction => {
+  switch (a) {
+    case 'add_or_invite':
+    case 'manage_settings':
+    case 'join':
+      return true
+    default:
+      return false
+  }
+}
+
+type TeamPageAction = 'add_or_invite' | 'manage_settings' | 'join'
+
+const validTeamnamePart = (s: string): boolean => {
+  if (s.length < 2 || s.length > 16) {
+    return false
+  }
+  return /^([a-zA-Z0-9][a-zA-Z0-9_]?)+$/.test(s)
+}
+
+const validTeamname = (s: string) => s.split('.').every(validTeamnamePart)
+
+const handleTeamPageLink = (teamname: string, action?: TeamPageAction) => {
+  void showTeamByName(teamname, {
+    addMembers: action === 'add_or_invite' ? true : undefined,
+    initialTab: action === 'manage_settings' ? 'settings' : undefined,
+    join: action === 'join' ? true : undefined,
+  })
+}
+
+// Fallback handler for keybase:// URL patterns not yet handled by the linking config.
+// Called by the linking config when customGetStateFromPath returns undefined.
+export const handleAppLink = (link: string) => {
+  if (link.startsWith('keybase://')) {
+    handleKeybaseLink(link.replace('keybase://', ''))
+  }
+}
+
+// Handle keybase:// URL patterns imperatively.
+// Called as fallback for patterns not handled by the linking config's getStateFromPath,
+// and as a safety net before the linking subscription is active.
+const handleKeybaseLink = (link: string) => {
+  if (!link) return
+  const error =
+    "We couldn't read this link. The link might be bad, or your Keybase app might be out of date and needs to be updated."
+  const parts = link.split('/')
+  switch (parts[0]) {
+    case 'convid':
+      if (parts[1]) {
+        navigateToThread(parts[1], 'push')
+        return
+      }
+      break
+    case 'profile':
+      if (parts[1] === 'show' && parts[2]) {
+        if (isMobile) clearModals()
+        showInTab(Tabs.peopleTab, {name: 'profile', params: {username: parts[2]}})
+        return
+      }
+      if (parts[1] === 'new-proof' && (parts.length === 3 || parts.length === 4)) {
+        if (parts.length === 4 && parts[3]) {
+          navToProfile(parts[3])
+        }
+        navigateAppend({name: 'profileProofsList', params: {platform: parts[2]!, reason: 'appLink'}})
+        return
+      }
+      break
+    case 'devices':
+      // Devices live under Settings on phone/tablet and in their own tab on desktop.
+      if (!isMobile) {
+        switchTab(Tabs.devicesTab)
+        navUpToScreen('devicesRoot')
+        return
+      }
+      // not navUpToScreen: on a phone it would pin its popTo to the Settings tab stack, where the
+      // route does not exist
+      showInTab(Tabs.settingsTab, {name: settingsDevicesTab, params: {}})
+      return
+    case 'settingsAddPhone':
+      // Where the invite install link (https://keybase.io/phone-app) lands. The linking config
+      // also handles it; desktop routes every URL here, so this must agree with it.
+      switchTab(Tabs.settingsTab)
+      navigateAppend({name: 'settingsAddPhone', params: {}})
+      return
+    case 'private':
+    case 'public':
+      try {
+        const decoded = decodeURIComponent(link)
+        showInTab(Tabs.fsTab, {name: 'fsBrowse', params: {path: `/keybase/${decoded}`}})
+        return
+      } catch {
+        logger.warn("Couldn't decode KBFS URI")
+        return
+      }
+    case 'team':
+      try {
+        const decoded = decodeURIComponent(link)
+        navigateAppend({name: 'fsBrowse', params: {path: `/keybase/${decoded}`}})
+        return
+      } catch {
+        logger.warn("Couldn't decode KBFS URI")
+        return
+      }
+    case 'chat':
+      if (parts.length === 2 || parts.length === 3) {
+        if (parts[1]!.includes('#')) {
+          const teamChat = parts[1]!.split('#')
+          if (teamChat.length !== 2) {
+            navigateAppend({name: 'keybaseLinkError', params: {error}})
+            return
+          }
+          const [teamname, channelname] = teamChat
+          const _highlightMessageID = parseInt(parts[2]!, 10)
+          if (_highlightMessageID < 0) {
+            logger.warn(`invalid chat message id: ${_highlightMessageID}`)
+            return
+          }
+
+          const highlightMessageID = T.Chat.numberToMessageID(_highlightMessageID)
+          previewConversation({
+            channelname,
+            highlightMessageID,
+            reason: 'appLink',
+            teamname,
+          })
+          return
+        } else {
+          const highlightMessageID = parseInt(parts[2]!, 10)
+          if (highlightMessageID < 0) {
+            logger.warn(`invalid chat message id: ${highlightMessageID}`)
+            return
+          }
+          previewConversation({
+            highlightMessageID: T.Chat.numberToMessageID(highlightMessageID),
+            participants: parts[1]!.split(','),
+            reason: 'appLink',
+          })
+          return
+        }
+      }
+      break
+    case 'team-page':
+      if (parts.length >= 2) {
+        const teamName = parts[1]!
+        if (teamName.length && validTeamname(teamName)) {
+          const actionPart = parts[2]
+          const action = isTeamPageAction(actionPart) ? actionPart : undefined
+          handleTeamPageLink(teamName, action)
+          return
+        }
+      }
+      break
+    case 'team-invite-link':
+      if (!parts[1]) {
+        break
+      }
+      navigateAppend({name: 'teamInviteLinkJoin', params: {inviteID: parts[1], inviteKey: parts[2] || ''}})
+      return
+    default:
+      break
+  }
+  navigateAppend({name: 'keybaseLinkError', params: {error}})
+}

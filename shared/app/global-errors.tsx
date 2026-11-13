@@ -1,0 +1,332 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import logger from '@/logger'
+import {ignoreDisconnectOverlay} from '@/local-debug'
+import {useConfigState} from '@/stores/config'
+import type {RPCError} from '@/util/errors'
+import {settingsFeedbackTab} from '@/constants/settings'
+import {useDaemonState} from '@/stores/daemon'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import {GlobalOverlay} from '@/common-adapters/overlay/global-overlay'
+
+type Size = 'Closed' | 'Small' | 'Big'
+
+const summaryForError = (err?: Error | RPCError) => err?.message ?? ''
+const detailsForError = (err?: Error | RPCError) => err?.stack ?? ''
+
+const maxHeightForSize = (size: Size) => {
+  return {
+    Big: 900,
+    Closed: 0,
+    Small: 35,
+  }[size]
+}
+
+const useData = () => {
+  const loggedIn = useConfigState(s => s.loggedIn)
+  const daemonError = useDaemonState(s => s.error)
+  const error = useConfigState(s => s.globalError)
+  const setGlobalError = useConfigState(s => s.dispatch.setGlobalError)
+  const clearModals = C.Router2.clearModals
+  const navigateAppend = C.Router2.navigateAppend
+  const onFeedback = () => {
+    setGlobalError()
+    if (loggedIn) {
+      clearModals()
+      navigateAppend({name: settingsFeedbackTab, params: {}})
+    } else {
+      navigateAppend({name: 'feedback', params: {}})
+    }
+  }
+  const onDismiss = () => {
+    setGlobalError()
+  }
+
+  const [cachedSummary, setSummary] = React.useState(summaryForError(error))
+  const [cachedDetails, setDetails] = React.useState(detailsForError(error))
+  const [expandedError, setExpandedError] = React.useState<Error | RPCError>()
+  const countdownTimerRef = React.useRef<undefined | ReturnType<typeof setTimeout>>(undefined)
+  if (!error && expandedError) {
+    setExpandedError(undefined)
+  }
+  const size: Size = error ? (expandedError === error ? 'Big' : 'Small') : 'Closed'
+
+  const clearCountdown = () => {
+    if (countdownTimerRef.current) {
+      clearTimeout(countdownTimerRef.current)
+    }
+    countdownTimerRef.current = undefined
+  }
+
+  const onExpandClick = () => {
+    if (error) {
+      setExpandedError(error)
+    }
+    if (!isMobile) {
+      clearCountdown()
+    }
+  }
+
+  C.useOnUnMountOnce(() => {
+    clearCountdown()
+  })
+
+  React.useEffect(() => {
+    const id = setTimeout(
+      () => {
+        setDetails(detailsForError(error))
+        if (!isMobile) {
+          setSummary(summaryForError(error))
+        }
+      },
+      error ? 0 : 7000
+    ) // if it's set, do it immediately, if it's cleared set it in a bit
+    const newError = !!error
+    if (!isMobile) {
+      if (countdownTimerRef.current) clearTimeout(countdownTimerRef.current)
+      countdownTimerRef.current = undefined
+      if (newError) {
+        countdownTimerRef.current = setTimeout(() => {
+          setGlobalError()
+        }, 10000)
+      }
+    }
+    return () => {
+      clearTimeout(id)
+    }
+  }, [error, setGlobalError])
+
+  return {
+    cachedDetails,
+    cachedSummary,
+    daemonError,
+    error,
+    onDismiss,
+    onExpandClick,
+    onFeedback,
+    size,
+  }
+}
+
+const GlobalError = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const d = useData()
+  const {daemonError, error, onDismiss, onFeedback} = d
+  const {cachedDetails, cachedSummary, size, onExpandClick} = d
+
+  // daemonError first: size only tracks globalError, so checking it before this
+  // branch would hide the disconnect overlay
+  if (daemonError) {
+    if (isMobile) {
+      return null
+    }
+    if (ignoreDisconnectOverlay) {
+      logger.warn('Ignoring disconnect overlay')
+      return null
+    }
+
+    const message = daemonError.message || 'Keybase is currently unreachable. Trying to reconnect you…'
+    return (
+      <GlobalOverlay tier="disconnect">
+        <Kb.Box2
+          direction="vertical"
+          fullWidth={true}
+          fullHeight={true}
+          style={styles.containerOverlay}
+          testID={TestIDs.DISCONNECT_OVERLAY}
+        >
+          <Kb.Box2 direction="horizontal" fullWidth={true} centerChildren={true} style={styles.overlayRow}>
+            <Kb.Text center={true} type="BodySmallSemibold" style={styles.message}>
+              {message}
+            </Kb.Text>
+          </Kb.Box2>
+          <Kb.Box2 direction="vertical" fullWidth={true} flex={1} centerChildren={true} style={styles.overlayFill}>
+            <Kb.Animation animationType="disconnected" height={175} width={600} />
+          </Kb.Box2>
+        </Kb.Box2>
+      </GlobalOverlay>
+    )
+  }
+
+  if (size === 'Closed') {
+    return null
+  }
+
+  if (isMobile) {
+    return (
+      <Kb.Box2
+        direction="vertical"
+        style={Kb.Styles.collapseStyles([
+          styles.mobileContainer,
+          size === 'Big' && Kb.Styles.globalStyles.fillAbsolute,
+        ])}
+        testID={TestIDs.GLOBAL_ERROR}
+      >
+        <Kb.SafeAreaViewTop style={styles.mobileSafeAreaView} />
+        <Kb.Box2 direction="vertical">
+          <Kb.Box2
+            direction="horizontal"
+            style={Kb.Styles.collapseStyles([styles.mobileSummaryRow, styles.mobileErrorTextContainer])}
+          >
+            <Kb.Text
+              center={true}
+              type="BodySmallSemibold"
+              style={styles.mobileErrorText}
+              onClick={onExpandClick}
+            >
+              {size !== 'Big' && (
+                <Kb.Icon
+                  type="iconfont-caret-right"
+                  color={theme.white_75}
+                  sizeType="Tiny"
+                />
+              )}
+              {'  '}
+              An error occurred.
+            </Kb.Text>
+            <Kb.Icon
+              type="iconfont-close"
+              onClick={onDismiss}
+              color={theme.white_75}
+              fontSize={21}
+            />
+          </Kb.Box2>
+          <Kb.Box2 direction="horizontal" style={styles.mobileSummaryRow}>
+            <Kb.Button fullWidth={true} label="Please tell us" onClick={onFeedback} small={true} type="Dim" />
+          </Kb.Box2>
+        </Kb.Box2>
+        {size === 'Big' && (
+          <Kb.ScrollView>
+            <Kb.Text type="BodySmall" selectable={true} style={styles.mobileDetails}>
+              {error?.message}
+              {'\n\n'}
+              {cachedDetails}
+            </Kb.Text>
+          </Kb.ScrollView>
+        )}
+      </Kb.Box2>
+    )
+  }
+
+  const summary = cachedSummary
+  const details = cachedDetails
+
+  let stylesContainer: Kb.Styles.StylesCrossPlatform
+  switch (size) {
+    case 'Big':
+      stylesContainer = styles.containerBig
+      break
+    case 'Small':
+      stylesContainer = styles.containerSmall
+      break
+  }
+
+  return (
+    <GlobalOverlay tier="globalError">
+      <Kb.ClickableBox style={stylesContainer} onClick={onExpandClick} direction="vertical" testID={TestIDs.GLOBAL_ERROR}>
+        <Kb.Box2 alignSelf="center" direction="horizontal" flex={1} centerChildren={true} gap="small" style={styles.innerContainer}>
+          <Kb.Text center={true} type="BodyBig" style={styles.summary}>
+            {summary}
+          </Kb.Text>
+          <Kb.Button
+            label="Please tell us"
+            onClick={onFeedback}
+            small={true}
+            type="Dim"
+
+          />
+          {summary && (
+            <Kb.Icon
+              color={theme.white_75}
+              hoverColor={theme.white}
+              onClick={onDismiss}
+              type="iconfont-close"
+            />
+          )}
+        </Kb.Box2>
+        <Kb.ScrollView>
+          <Kb.Text center={true} type="BodyBig" selectable={true} style={styles.details}>
+            {details}
+          </Kb.Text>
+        </Kb.ScrollView>
+      </Kb.ClickableBox>
+    </GlobalOverlay>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => {
+  const containerBase = {
+    left: 0,
+    overflow: 'hidden' as const,
+    position: 'absolute' as const,
+    right: 0,
+    top: 40,
+    ...Kb.Styles.transition('max-height'),
+  }
+
+  return {
+    containerBig: Kb.Styles.platformStyles({
+      isElectron: {...containerBase, maxHeight: maxHeightForSize('Big')},
+    }),
+    containerOverlay: Kb.Styles.globalStyles.fillAbsolute,
+    containerSmall: Kb.Styles.platformStyles({
+      isElectron: {...containerBase, maxHeight: maxHeightForSize('Small')},
+    }),
+    details: {
+      backgroundColor: theme.black,
+      color: theme.white_75,
+      ...Kb.Styles.padding(8, Kb.Styles.globalMargins.xlarge),
+    },
+    innerContainer: {
+      backgroundColor: theme.black,
+      minHeight: maxHeightForSize('Small'),
+      ...Kb.Styles.padding(Kb.Styles.globalMargins.xtiny, Kb.Styles.globalMargins.small),
+    },
+    message: {
+      color: theme.white,
+    },
+    mobileContainer: {
+      backgroundColor: theme.black,
+      position: 'absolute',
+      top: 0,
+    },
+    mobileDetails: {
+      color: theme.white_75,
+      fontSize: 14,
+      lineHeight: 19,
+      ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.xtiny, Kb.Styles.globalMargins.xtiny),
+    },
+    mobileErrorText: {
+      color: theme.white,
+      flex: 1,
+    },
+    mobileErrorTextContainer: {
+      paddingBottom: Kb.Styles.globalMargins.xtiny,
+      position: 'relative',
+    },
+    mobileSafeAreaView: {
+      backgroundColor: theme.transparent,
+      flexGrow: 0,
+    },
+    mobileSummaryRow: {
+      ...Kb.Styles.centered(),
+      flexShrink: 0,
+      ...Kb.Styles.padding(Kb.Styles.globalMargins.tiny, Kb.Styles.globalMargins.xsmall),
+    },
+    overlayFill: {
+      backgroundColor: theme.white,
+    },
+    overlayRow: {
+      backgroundColor: theme.blue,
+      padding: 8,
+    },
+    summary: {
+      color: theme.white,
+      flex: 1,
+    },
+  } as const
+})
+
+export default GlobalError

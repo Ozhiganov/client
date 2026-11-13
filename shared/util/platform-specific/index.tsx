@@ -1,0 +1,200 @@
+import * as T from '@/constants/types'
+import logger from '@/logger'
+import * as MediaLibrary from 'expo-media-library'
+import * as ExpoLocation from 'expo-location'
+import {File} from 'expo-file-system'
+import {isAndroidPreQ, isAndroidQ} from '@/constants/platform'
+import {
+  addNotificationRequest,
+  androidOpenFile,
+  androidSaveToDownloads,
+  androidSaveToGallery,
+  androidShare,
+  androidShareText,
+  iosShareFile,
+} from 'react-native-kb'
+import {ActionSheetIOS, PermissionsAndroid} from 'react-native'
+
+const requestWriteExternalStorage = async () => {
+  const r = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE)
+  if (r !== PermissionsAndroid.RESULTS.GRANTED) {
+    throw new Error('Unable to acquire storage permissions')
+  }
+}
+
+// Saving to Downloads goes through MediaStore from Android 10 and needs no storage permission.
+export const requestPermissionsToWrite = async () => {
+  if (isAndroidPreQ) {
+    await requestWriteExternalStorage()
+  }
+}
+
+export async function saveFileToDownloads(path: string, filename: string, mime: string): Promise<string> {
+  try {
+    await requestPermissionsToWrite()
+    return await androidSaveToDownloads({deleteSource: true, filename, mime, path})
+  } catch (e) {
+    addNotificationRequest({
+      body: `Failed to save ${filename} to Downloads`,
+      id: Math.floor(Math.random() * 2 ** 32).toString(),
+    }).catch(() => {})
+    logger.debug('[saveFileToDownloads] failed to save: ' + String(e))
+    throw e
+  }
+}
+
+export const openSavedFile = async (uri: string, mime: string): Promise<void> => androidOpenFile({mime, uri})
+
+export const requestLocationPermission = async (mode?: T.RPCChat.UIWatchPositionPerm) => {
+  if (!isMobile) {
+    return Promise.resolve()
+  }
+  if (isIOS) {
+    logger.info('[location] Requesting location perms', mode)
+    switch (mode) {
+      case T.RPCChat.UIWatchPositionPerm.base:
+        {
+          const iosFGPerms = await ExpoLocation.requestForegroundPermissionsAsync()
+          if (iosFGPerms.ios?.scope === 'none') {
+            throw new Error('Please allow Keybase to access your location in the phone settings.')
+          }
+        }
+        break
+      case T.RPCChat.UIWatchPositionPerm.always: {
+        const iosBGPerms = await ExpoLocation.requestBackgroundPermissionsAsync()
+        if (iosBGPerms.status !== ExpoLocation.PermissionStatus.GRANTED) {
+          throw new Error(
+            'Please allow Keybase to access your location even if the app is not running for live location.'
+          )
+        }
+        break
+      }
+      default:
+        break
+    }
+  } else if (isAndroid) {
+    const androidBGPerms = await ExpoLocation.requestForegroundPermissionsAsync()
+    if (androidBGPerms.status !== ExpoLocation.PermissionStatus.GRANTED) {
+      throw new Error('Unable to acquire location permissions')
+    }
+  }
+}
+
+export async function saveAttachmentToCameraRoll(filePath: string, mimeType: string): Promise<void> {
+  if (!isMobile) {
+    return Promise.reject(new Error('Save Attachment to camera roll - unsupported on this platform'))
+  }
+  const fileURL = 'file://' + filePath
+  const saveType: 'video' | 'photo' = mimeType.startsWith('video') ? 'video' : 'photo'
+  const logPrefix = '[saveAttachmentToCameraRoll] '
+  try {
+    if (isIOS) {
+      // Asset.create only checks permission and never prompts, so request add-only access first
+      const p = await MediaLibrary.requestPermissionsAsync(true)
+      if (!p.granted) {
+        throw new Error('Please allow Keybase to add to your Photos in the phone settings.')
+      }
+    } else if (isAndroidPreQ) {
+      try {
+        // expo-media-library writes through its legacy path below Android 10, which needs this
+        await requestWriteExternalStorage()
+      } catch (e) {
+        logger.warn(logPrefix + 'write permission denied, attempting save anyway: ' + String(e))
+      }
+    }
+    logger.info(logPrefix + `Attempting to save as ${saveType}`)
+    if (isAndroidQ) {
+      // expo-media-library's legacy path on Android 10 writes with java.io.File, which scoped storage blocks
+      await androidSaveToGallery({mime: mimeType, path: filePath})
+    } else {
+      await MediaLibrary.Asset.create(fileURL)
+    }
+    logger.info(logPrefix + 'Success')
+  } catch (e) {
+    // This can fail if the user backgrounds too quickly, so throw up a local notification
+    // just in case to get their attention.
+    addNotificationRequest({
+      body: `Failed to save ${saveType} to camera roll`,
+      id: Math.floor(Math.random() * 2 ** 32).toString(),
+    }).catch(() => {})
+    logger.debug(logPrefix + 'failed to save: ' + String(e))
+    throw e
+  } finally {
+    try {
+      new File(fileURL).delete()
+    } catch {
+      logger.warn('failed to unlink')
+    }
+  }
+}
+
+// Reminders and the other text targets activate on the share item's
+// attributedContentText, which only a plain string item fills in -- handed just
+// a file they either save the file:// path as the reminder or don't show up at
+// all. iosShareFile sends the contents as their own item next to the file, and
+// keeps the text away from whatever would write it out a second time.
+
+// the text crosses the bridge as a string and is held as one until the sheet
+// closes, and no target that takes text has any use for more than this
+const kMaxInlineShareTextBytes = 256 * 1024
+
+const inlineShareText = async (filePath: string, mimeType: string): Promise<string | undefined> => {
+  if (!mimeType.startsWith('text/')) {
+    return undefined
+  }
+  try {
+    const file = new File(filePath.startsWith('file://') ? filePath : 'file://' + filePath)
+    // a text file past that is not going into a reminder; let it stay a file
+    if (file.size > kMaxInlineShareTextBytes) {
+      return undefined
+    }
+    return await file.text()
+  } catch (e) {
+    logger.info('failed to read share text, sharing the file alone: ' + String(e))
+    return undefined
+  }
+}
+
+export const showShareActionSheet = async (options: {
+  filePath?: string
+  message?: string
+  mimeType: string
+}) => {
+  if (!isMobile) {
+    return Promise.reject(new Error('Show Share Action - unsupported on this platform'))
+  }
+  if (isIOS) {
+    if (options.filePath) {
+      const text = options.message ?? (await inlineShareText(options.filePath, options.mimeType))
+      await iosShareFile(options.filePath, text ?? '')
+      return
+    }
+    return new Promise<void>((resolve, reject) => {
+      ActionSheetIOS.showShareActionSheetWithOptions(
+        {
+          message: options.message,
+          url: options.filePath,
+        },
+        reject,
+        () => resolve()
+      )
+    })
+  } else {
+    if (!options.filePath && options.message) {
+      try {
+        await androidShareText(options.message, options.mimeType)
+        return {completed: true, method: ''}
+      } catch (e) {
+        throw new Error('Failed to share: ' + String(e), {cause: e})
+      }
+    }
+
+    try {
+      await androidShare(options.filePath ?? '', options.mimeType)
+      return {completed: true, method: ''}
+    } catch (e) {
+      throw new Error('Failed to share: ' + String(e), {cause: e})
+    }
+  }
+}
+

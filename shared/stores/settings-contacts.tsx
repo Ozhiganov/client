@@ -1,0 +1,315 @@
+import * as T from '@/constants/types'
+import * as Z from '@/util/zustand'
+import logger from '@/logger'
+import {ignorePromise} from '@/constants/utils'
+import {importContactsWaitingKey} from '@/constants/strings'
+import {RPCError} from '@/util/errors'
+import {getE164} from '@/util/phone-numbers'
+import {pluralize} from '@/util/string'
+import {navigateAppend} from '@/constants/router'
+import {useConfigState} from '@/stores/config'
+import {useCurrentUserState} from '@/stores/current-user'
+import {withWaiting} from '@/stores/waiting'
+type PermissionStatus = 'granted' | 'denied' | 'undetermined' | 'unknown'
+
+type Store = T.Immutable<{
+  importEnabled?: boolean
+  importError: string
+  importPromptDismissed: boolean
+  importedCount?: number
+  permissionStatus: PermissionStatus
+  userCountryCode?: string
+  waitingToShowJoinedModal: boolean
+}>
+
+type State = Store & {
+  dispatch: {
+    importContactsLater: () => void
+    editContactImportEnabled: (enable: boolean, fromSettings?: boolean) => void
+    loadContactPermissions: () => void
+    loadContactImportEnabled: () => void
+    manageContactsCache: () => void
+    requestPermissions: (thenToggleImportOn?: boolean, fromSettings?: boolean) => void
+    resetState: () => void
+  }
+}
+import * as Contacts from 'expo-contacts'
+import {getLocales} from 'expo-localization'
+import {addNotificationRequest} from 'react-native-kb'
+
+const initialStore: Store = {
+  importError: '',
+  importPromptDismissed: false,
+  importedCount: undefined,
+  permissionStatus: 'unknown',
+  userCountryCode: undefined,
+  waitingToShowJoinedModal: false,
+}
+
+export const useSettingsContactsState = Z.createZustand<State>('settings-contacts', (set, get) => {
+  if (!isMobile) {
+    const dispatch: State['dispatch'] = {
+      editContactImportEnabled: () => {},
+      importContactsLater: () => {},
+      loadContactImportEnabled: () => {},
+      loadContactPermissions: () => {},
+      manageContactsCache: () => {},
+      requestPermissions: () => {},
+      resetState: Z.defaultReset,
+    }
+    return {
+      ...initialStore,
+      dispatch,
+    }
+  }
+
+  const importContactsConfigKey = (username: string) => `ui.importContacts.${username}`
+
+  const nativeContactsToContacts = (
+    contacts: Array<{
+      fullName?: string | null
+      phones?: Array<{number?: string; label?: string}>
+      emails?: Array<{address?: string; label?: string}>
+    }>,
+    countryCode: string
+  ) => {
+    return contacts.reduce<Array<T.RPCGen.Contact>>((ret, contact) => {
+      const {fullName, phones = [], emails = []} = contact
+
+      const components = phones.reduce<T.RPCGen.ContactComponent[]>((res, pn) => {
+        const formatted = getE164(pn.number || '', countryCode)
+        if (formatted) {
+          res.push({
+            label: pn.label ?? '',
+            phoneNumber: formatted,
+          })
+        }
+        return res
+      }, [])
+      components.push(...emails.map(e => ({email: e.address ?? '', label: e.label ?? ''})))
+      if (components.length) {
+        ret.push({components, name: fullName ?? ''})
+      }
+
+      return ret
+    }, [])
+  }
+
+  const contactNotifMarker = 'Your contact'
+  const makeContactsResolvedMessage = (cts: T.Immutable<Array<T.RPCGen.ProcessedContact>>) => {
+    if (cts.length === 0) {
+      return ''
+    }
+    switch (cts.length) {
+      case 1:
+        return `${contactNotifMarker} ${cts[0]?.contactName ?? ''} joined Keybase!`
+      case 2:
+        return `${contactNotifMarker}s ${cts[0]?.contactName ?? ''} and ${
+          cts[1]?.contactName ?? ''
+        } joined Keybase!`
+      default: {
+        const lenMinusTwo = cts.length - 2
+        return `${contactNotifMarker}s ${cts[0]?.contactName ?? ''}, ${
+          cts[1]?.contactName ?? ''
+        }, and ${lenMinusTwo} ${pluralize('other', lenMinusTwo)} joined Keybase!`
+      }
+    }
+  }
+
+  const dispatch: State['dispatch'] = {
+    editContactImportEnabled: (enable, fromSettings) => {
+      if (fromSettings) {
+        set(s => {
+          s.waitingToShowJoinedModal = true
+        })
+      }
+      const f = async () => {
+        const username = useCurrentUserState.getState().username
+        if (!username) {
+          logger.warn('no username')
+          return
+        }
+        await T.RPCGen.configGuiSetValueRpcPromise(
+          {path: importContactsConfigKey(username), value: {b: enable, isNull: false}},
+          importContactsWaitingKey
+        )
+        get().dispatch.loadContactImportEnabled()
+      }
+      ignorePromise(f())
+    },
+    importContactsLater: () => {
+      set(s => {
+        s.importPromptDismissed = true
+      })
+    },
+    loadContactImportEnabled: () => {
+      const f = async () => {
+        if (!useConfigState.getState().loggedIn) {
+          return
+        }
+        const username = useCurrentUserState.getState().username
+        if (!username) {
+          logger.warn('no username')
+          return
+        }
+        let enabled = false
+        try {
+          const value = await T.RPCGen.configGuiGetValueRpcPromise(
+            {path: importContactsConfigKey(username)},
+            importContactsWaitingKey
+          )
+          enabled = !!value.b && !value.isNull
+        } catch (error) {
+          if (!(error instanceof RPCError)) {
+            return
+          }
+          if (!error.message.includes('no such key')) {
+            logger.error(`Error reading config: ${error.message}`)
+          }
+        }
+
+        set(s => {
+          s.importEnabled = enabled
+        })
+        get().dispatch.loadContactPermissions()
+        get().dispatch.manageContactsCache()
+      }
+      ignorePromise(f())
+    },
+    loadContactPermissions: () => {
+      const f = async () => {
+        const {status} = await Contacts.getPermissionsAsync()
+        logger.info(`OS status: ${status}`)
+
+        set(s => {
+          s.permissionStatus = status
+        })
+      }
+      ignorePromise(f())
+    },
+    manageContactsCache: () => {
+      const f = async () => {
+        // The import setting read below is this account's. Reading the address book can take
+        // seconds, and the upload goes to whichever account is logged in when it runs, so an
+        // account switch in between must not upload these contacts to the next account.
+        const uidBefore = useCurrentUserState.getState().uid
+        const accountChanged = () => useCurrentUserState.getState().uid !== uidBefore
+        if (get().importEnabled === false) {
+          await T.RPCGen.contactsSaveContactListRpcPromise({contacts: []})
+          set(s => {
+            s.importedCount = undefined
+            s.importError = ''
+          })
+          return
+        }
+
+        let {permissionStatus} = get()
+        if (permissionStatus === 'unknown') {
+          permissionStatus = (await Contacts.getPermissionsAsync()).status
+        }
+        const perm = permissionStatus === 'granted'
+
+        const enabled = get().importEnabled
+        if (!enabled || !perm) {
+          if (enabled && !perm) {
+            logger.info('contact import enabled but no contact permissions')
+          }
+          if (enabled === undefined) {
+            logger.info("haven't loaded contact import enabled")
+          }
+          return
+        }
+
+        let mapped: T.RPCChat.Keybase1.Contact[]
+        let defaultCountryCode = ''
+        try {
+          const _contacts = await Contacts.Contact.getAllDetails([
+            Contacts.ContactField.FULL_NAME,
+            Contacts.ContactField.PHONES,
+            Contacts.ContactField.EMAILS,
+          ] as const)
+
+          defaultCountryCode = (getLocales()[0].regionCode ?? '').toLowerCase()
+          if (__DEV__ && !defaultCountryCode) {
+            defaultCountryCode = 'us'
+          }
+          mapped = nativeContactsToContacts(_contacts, defaultCountryCode)
+        } catch (_error) {
+          const error = _error as {message: string}
+          logger.error(`error loading contacts: ${error.message}`)
+          if (accountChanged()) {
+            return
+          }
+          set(s => {
+            s.importedCount = undefined
+            s.importError = error.message
+          })
+          return
+        }
+        if (accountChanged()) {
+          logger.info('account changed while reading contacts, not importing')
+          return
+        }
+        logger.info(`Importing ${mapped.length} contacts.`)
+        try {
+          const {newlyResolved, resolved} = await T.RPCGen.contactsSaveContactListRpcPromise({
+            contacts: mapped,
+          })
+          logger.info(`Success`)
+          set(s => {
+            s.importedCount = mapped.length
+            s.importError = ''
+          })
+          set(s => {
+            s.userCountryCode = defaultCountryCode
+          })
+          if (newlyResolved?.length) {
+            addNotificationRequest({
+              body: makeContactsResolvedMessage(newlyResolved),
+              id: Math.floor(Math.random() * 2 ** 32).toString(),
+            }).catch(() => {})
+          }
+          if (get().waitingToShowJoinedModal && resolved) {
+            set(s => {
+              s.waitingToShowJoinedModal = false
+            })
+            if (resolved.length) {
+              navigateAppend({name: 'settingsContactsJoined', params: {contacts: resolved}})
+            }
+          }
+        } catch (_error) {
+          const error = _error as {message: string}
+          logger.error('Error saving contacts list: ', error.message)
+          // includes the engine refusing the reply because a switch landed during the upload
+          if (accountChanged()) {
+            return
+          }
+          set(s => {
+            s.importedCount = undefined
+            s.importError = error.message
+          })
+        }
+      }
+      ignorePromise(f())
+    },
+    requestPermissions: (thenToggleImportOn?: boolean, fromSettings?: boolean) => {
+      const f = async () =>
+        withWaiting(importContactsWaitingKey, async () => {
+          const {status} = await Contacts.requestPermissionsAsync()
+
+          if (status === Contacts.PermissionStatus.GRANTED && thenToggleImportOn) {
+            get().dispatch.editContactImportEnabled(true, fromSettings)
+          }
+          set(s => {
+            s.permissionStatus = status
+          })
+        })
+      ignorePromise(f())
+    },
+    resetState: Z.defaultReset,
+  }
+  return {
+    ...initialStore,
+    dispatch,
+  }
+})

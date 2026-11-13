@@ -1,0 +1,288 @@
+import * as React from 'react'
+import * as InputState from '../input-area/input-state'
+import {useOrdinal} from './ids-context'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import {EmojiPickerDesktop} from '@/chat/emoji-picker/container'
+import {useReactionRowTopReacjis} from '@/chat/user-reacjis'
+import {showForwardMessagePicker} from '../fwd-msg'
+import {toggleReaction, useThreadMessageTarget} from '../message-commands'
+import {useConversationThreadMessage} from '../thread-context'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+// A raised hover bar stops this far above the scroller's bottom edge instead of flush against it.
+const edgeClearance = 2
+
+type OwnProps = {
+  className?: string
+  hasUnfurls: boolean
+  // desktop hover overlay only: after mounting, measure how far we stick out past the bottom of
+  // the message list and shift ourselves up by that much, so the lowest on-screen row's emoji
+  // row doesn't end up under the input box
+  keepWithinList?: boolean
+  messageType: T.Chat.MessageType
+  onReact?: (emoji: string) => void
+  onReply?: () => void
+  onShowingEmojiPicker?: (arg0: boolean) => void
+  style?: Kb.Styles.StylesCrossPlatform
+}
+
+function EmojiRowContainer(p: OwnProps) {
+  const styles = useStyles()
+  const {
+    className,
+    hasUnfurls,
+    keepWithinList,
+    messageType,
+    onReact: onReactProp,
+    onReply: onReplyProp,
+    onShowingEmojiPicker,
+    style,
+  } = p
+  const ordinal = useOrdinal()
+  const reply = InputState.useConversationInputDispatch(s => s.reply)
+  const canReply = InputState.useCanReply()
+  const target = useThreadMessageTarget(ordinal)
+  const {conversationIDKey} = target
+  const emojis = useReactionRowTopReacjis()
+  const message = useConversationThreadMessage(ordinal)
+  const hasMessageID = !!message && !!T.Chat.messageIDToNumber(message.id)
+  const _onForward = () => {
+    showForwardMessagePicker(conversationIDKey, message)
+  }
+  const onReact = (emoji: string) => {
+    if (!hasMessageID) {
+      return
+    }
+    if (onReactProp) {
+      onReactProp(emoji)
+      return
+    }
+    toggleReaction(target, emoji)
+  }
+  const _onReply = () => {
+    reply(ordinal)
+  }
+
+  const onForward = hasMessageID && (hasUnfurls || messageType === 'attachment') ? _onForward : undefined
+  const onReply =
+    canReply && (messageType === 'text' || messageType === 'attachment') ? (onReplyProp ?? _onReply) : undefined
+
+  const [showingPicker, setShowingPicker] = React.useState(false)
+  const popupAnchor = React.useRef<Kb.MeasureRef | null>(null)
+
+  // We mount mid-hover and then STAY mounted while the row shows/hides us with CSS alone, so a
+  // single mount-time measurement goes stale as soon as the list scrolls: measure now and again
+  // on every pointer re-entry into the row. Typed structurally since the native tsconfig has no
+  // DOM lib; on desktop Box2's MeasureRef is the backing div.
+  const [raiseBy, setRaiseBy] = React.useState(0)
+  React.useLayoutEffect(() => {
+    if (isMobile || !keepWithinList) {
+      return
+    }
+    type ElLike = {
+      addEventListener: (t: string, cb: () => void) => void
+      removeEventListener: (t: string, cb: () => void) => void
+      getBoundingClientRect: () => {bottom: number; height: number; top: number}
+      parentElement: ElLike | null
+    }
+    const el = popupAnchor.current as null | (ElLike & {closest?: (sel: string) => ElLike | null})
+    const row = el?.closest?.('.WrapperMessage-hoverBox')
+    const outer = el?.closest?.('.chat-message-list')
+    // Measure against the scroller, not the outer box: the gap above the input area is padding on
+    // the outer box, so the scroller ends above it and clips a bar the outer box still had room
+    // for. The scroller is the one ancestor sitting directly inside the outer box — don't look for
+    // "nearest scrollable ancestor", every row container reports as one.
+    let list = outer
+    for (let node = el?.parentElement; node; node = node.parentElement) {
+      if (node.parentElement === outer) {
+        list = node
+        break
+      }
+    }
+    if (!el || !row || !list) {
+      return
+    }
+    // Read back the raise the DOM is actually carrying rather than the one we last asked for: the two
+    // differ for as long as it takes React to paint our state, and measuring twice inside that gap
+    // (which mount + the enter event do) would otherwise stack the raise onto itself.
+    const appliedRaise = () => {
+      const getStyle = (globalThis as unknown as {getComputedStyle?: (e: unknown) => {transform: string}})
+        .getComputedStyle
+      const matrix = /matrix\([^)]*,\s*(-?[\d.]+)\)\s*$/.exec(getStyle?.(el).transform ?? '')
+      return matrix ? -Number(matrix[1]) : 0
+    }
+    // The bar hangs below its row. Where that would pass the list's bottom, it sits wholly above the
+    // row instead: raised into its own row it would cover the row's bottom, where its controls are
+    // (an unfurl prompt's buttons, an attachment's). Only a row too near the top for that too is
+    // raised just clear of the bottom.
+    const measure = () => {
+      const rect = el.getBoundingClientRect()
+      // zero height means we're display:none and the rect is meaningless
+      if (rect.height === 0) {
+        return
+      }
+      // add back the raise in effect so everything is computed from our natural spot
+      const applied = appliedRaise()
+      const naturalTop = rect.top + applied
+      const naturalBottom = rect.bottom + applied
+      const listRect = list.getBoundingClientRect()
+      const overflow = naturalBottom - listRect.bottom
+      if (overflow <= 0) {
+        setRaiseBy(0)
+        return
+      }
+      const rowRect = row.getBoundingClientRect()
+      const flippedTop = rowRect.top - rect.height
+      // clear the edge rather than sitting flush on it, so the bar doesn't read as tight against it
+      setRaiseBy(flippedTop >= listRect.top + edgeClearance ? naturalTop - flippedTop : overflow + edgeClearance)
+    }
+    // the enter event that mounted us already fired, so measure directly too
+    measure()
+    row.addEventListener('mouseenter', measure)
+    return () => {
+      row.removeEventListener('mouseenter', measure)
+    }
+  }, [keepWithinList])
+
+  const _setShowingPicker = (showingPicker: boolean) => {
+    onShowingEmojiPicker?.(showingPicker)
+    setShowingPicker(showingPicker)
+  }
+  const _showPicker = () => _setShowingPicker(true)
+  const _hidePicker = () => _setShowingPicker(false)
+  return (
+    <Kb.Box2 alignSelf="center"
+      direction="horizontal"
+      ref={popupAnchor}
+      style={Kb.Styles.collapseStyles([
+        styles.container,
+        style,
+        raiseBy > 0
+          ? Kb.Styles.platformStyles({isElectron: {transform: `translateY(-${raiseBy}px)`}})
+          : undefined,
+      ])}
+      className={className}
+    >
+      <Kb.Box2 direction="horizontal" gap="tiny">
+        {emojis.map(e => (
+          <HoverEmoji emoji={e} key={e.name} onClick={() => onReact(e.name)} />
+        ))}
+      </Kb.Box2>
+      <Kb.Box2 direction="horizontal">
+        <Kb.Divider style={styles.divider} vertical={true} />
+        <Kb.ClickableBox alignSelf="center"
+          direction="vertical"
+          className="hover_container"
+          onClick={hasMessageID ? _showPicker : undefined}
+          style={Kb.Styles.collapseStyles([styles.iconContainer, !hasMessageID && styles.disabled])}
+          tooltip="React"
+        >
+          <Kb.Icon className="hover_contained_color_blue" style={styles.icon} type="iconfont-reacji" testID={TestIDs.CHAT_MESSAGE_REACT_BUTTON} />
+        </Kb.ClickableBox>
+        {!!onReply && (
+          <Kb.ClickableBox alignSelf="center"
+            direction="vertical"
+            className="hover_container"
+            onClick={onReply}
+            style={styles.iconContainer}
+            tooltip="Reply"
+          >
+            <Kb.Icon className="hover_contained_color_blue" style={styles.icon} type="iconfont-reply" />
+          </Kb.ClickableBox>
+        )}
+        {!!onForward && (
+          <Kb.ClickableBox alignSelf="center"
+            direction="vertical"
+            className="hover_container"
+            onClick={onForward}
+            style={styles.iconContainer}
+            tooltip="Forward"
+          >
+            <Kb.Icon className="hover_contained_color_blue" style={styles.icon} type="iconfont-forward" />
+          </Kb.ClickableBox>
+        )}
+      </Kb.Box2>
+      {showingPicker && message && hasMessageID && (
+        <Kb.Popup
+          intent="menu"
+          attachTo={popupAnchor}
+          containerStyle={styles.pickerContainer}
+          position="top right"
+          onHidden={_hidePicker}
+          propagateOutsideClicks={false}
+        >
+          <EmojiPickerDesktop
+            conversationIDKey={conversationIDKey}
+            onPickAddToMessageID={message.id}
+            onDidPick={_hidePicker}
+          />
+        </Kb.Popup>
+      )}
+    </Kb.Box2>
+  )
+}
+
+const HoverEmoji = (props: {emoji: T.RPCGen.UserReacji; onClick: () => void}) => {
+  const styles = useStyles()
+  const [hovering, setHovering] = React.useState(false)
+  const _setHovering = () => setHovering(true)
+  const _setNotHovering = () => setHovering(false)
+  return (
+    <Kb.ClickableBox alignSelf="center"
+      direction="horizontal"
+      centerChildren={true}
+      onClick={props.onClick}
+      onMouseOver={_setHovering}
+      onMouseLeave={_setNotHovering}
+      style={styles.emojiBox}
+    >
+      <Kb.Emoji
+        userReacji={props.emoji}
+        noAnim={!hovering}
+        showTooltip={false}
+        size={hovering ? 22 : 18}
+        style={styles.hoverEmoji}
+        virtualText={true}
+      />
+    </Kb.ClickableBox>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: Kb.Styles.platformStyles({
+        common: {...Kb.Styles.padding(Kb.Styles.globalMargins.xtiny, Kb.Styles.globalMargins.xsmall)},
+        isElectron: {
+          backgroundColor: theme.blueLighter3,
+          height: Kb.Styles.globalMargins.medium,
+        },
+      }),
+      disabled: {opacity: 0.3},
+      divider: {
+        ...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny),
+        marginLeft: Kb.Styles.globalMargins.xsmall,
+        marginRight: Kb.Styles.globalMargins.xtiny,
+      },
+      emojiBox: {
+        ...Kb.Styles.size(Kb.Styles.globalMargins.small),
+        marginRight: Kb.Styles.globalMargins.xxtiny,
+      },
+      hoverEmoji: {position: 'absolute'},
+      icon: {
+        position: 'relative',
+        top: 1,
+      },
+      iconContainer: {padding: Kb.Styles.globalMargins.tiny},
+      pickerContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.desktopStyles.boxShadow,
+          borderRadius: Kb.Styles.borderRadius,
+          margin: Kb.Styles.globalMargins.tiny,
+        },
+      }),
+    }) as const
+)
+
+export default EmojiRowContainer

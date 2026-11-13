@@ -1,0 +1,95 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const PaperKey = () => {
+  const styles = useStyles()
+  const [paperkey, setPaperkey] = React.useState('')
+  const [wroteItDown, setWroteItDown] = React.useState(false)
+
+  C.useOnMountOnce(() => {
+    T.RPCGen.loginPaperKeyRpcListener({
+      customResponseIncomingCallMap: {
+        'keybase.1.loginUi.promptRevokePaperKeys': (_, response) => {
+          response.result(false)
+          return false
+        },
+      },
+      incomingCallMap: {
+        'keybase.1.loginUi.displayPaperKeyPhrase': ({phrase}) => {
+          setPaperkey(phrase)
+        },
+      },
+      params: undefined,
+      waitingKey: C.waitingKeyDevices,
+    })
+      .then(() => {})
+      .catch(() => {})
+  }, 500)
+
+  const clearModals = C.Router2.clearModals
+
+  return (
+    <Kb.ModalScreen centered={true}>
+      <Kb.Box2 direction="vertical" fullWidth={true} alignItems="center" gap="medium">
+        <Kb.Text type="Body" center={true}>
+          Here is your unique paper key, it will allow you to perform important Keybase tasks in the future.
+          This is the only time you&apos;ll see this so be sure to write it down.
+        </Kb.Text>
+        <Kb.Box2
+          direction="vertical"
+          style={styles.keyBox}
+          centerChildren={true}
+          fullWidth={true}
+          padding="medium"
+          testID={TestIDs.DEVICES_PAPER_KEY_WORDS}
+        >
+          {paperkey ? (
+            <Kb.Text center={true} type="Header" selectable={true} style={styles.text}>
+              {paperkey}
+            </Kb.Text>
+          ) : (
+            <Kb.ProgressIndicator type="Large" />
+          )}
+        </Kb.Box2>
+        <Kb.Checkbox
+          label="Yes, I wrote this down."
+          checked={wroteItDown}
+          disabled={!paperkey}
+          onCheck={setWroteItDown}
+          testID={TestIDs.DEVICES_PAPER_KEY_WROTE_IT_DOWN}
+        />
+        <Kb.WaitingButton
+          label="Done"
+          onClick={clearModals}
+          disabled={!wroteItDown}
+          waitingKey={C.waitingKeyDevices}
+        />
+      </Kb.Box2>
+    </Kb.ModalScreen>
+  )
+}
+
+const borderWidth = 3
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      keyBox: {
+        backgroundColor: theme.white,
+        borderColor: theme.blueDarker,
+        borderRadius: borderWidth,
+        borderStyle: 'solid',
+        borderWidth,
+        minHeight: 100,
+      },
+      text: {
+        ...Kb.Styles.globalStyles.fontTerminal,
+        color: theme.blueDark,
+      },
+    }) as const
+)
+
+export default PaperKey

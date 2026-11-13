@@ -1,58 +1,92 @@
 #!/usr/bin/env bash
 
-set -e -u -o pipefail # Fail on error
+set -eE -u -o pipefail # Fail on error, call ERR trap
 
-gopath=${GOPATH:-}
-client_dir="$gopath/src/github.com/keybase/client"
-shared_dir="$gopath/src/github.com/keybase/client/shared"
-rn_dir="$gopath/src/github.com/keybase/client/shared/react-native"
-ios_dir="$gopath/src/github.com/keybase/client/shared/react-native/ios"
-cache_npm=${CACHE_NPM:-}
+automated_build=${AUTOMATED_BUILD:-}
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+client_dir="$(cd "$dir/../.." && pwd)"
+# shellcheck source=packaging/lib.sh
+source "$dir/../lib.sh"
+shared_dir="$client_dir/shared"
+ios_dir="$shared_dir/ios"
+clean=${CLEAN:-}
 cache_go_lib=${CACHE_GO_LIB:-}
 client_commit=${CLIENT_COMMIT:-}
+check_ci=${CHECK_CI:-1}
 
-"$client_dir/packaging/check_status_and_pull.sh" "$client_dir"
+# Notify Slack on failure
+function notify_slack {
+	if [ -n "$automated_build" ]; then
+		"$client_dir/packaging/slack/send.sh" "<@channel> Automated iOS build failed, please check out the log."
+	fi
+}
+trap notify_slack ERR
 
 # Reset on exit
-client_branch=`cd "$client_dir" && git rev-parse --abbrev-ref HEAD`
-rn_packager_pid=""
+client_branch=$(cd "$client_dir" && git rev-parse --abbrev-ref HEAD)
 function reset {
-  (cd "$client_dir" && git checkout $client_branch)
-  (cd "$client_dir" && git checkout shared/react-native/ios/)
-
-  if [ ! "$rn_packager_pid" = "" ]; then
-    echo "Killing packager $rn_packager_pid"
-    pkill -P $rn_packager_pid || true
-  fi
+	(cd "$client_dir" && git checkout "$client_branch")
+	(cd "$client_dir" && git checkout shared/ios/)
 }
 trap reset EXIT
 
 if [ -n "$client_commit" ]; then
-  cd "$client_dir"
-  echo "Checking out $client_commit on client (will reset to $client_branch)"
-  git checkout "$client_commit"
-  git pull
+	cd "$client_dir"
+	echo "Checking out $client_commit on client (will reset to $client_branch)"
+	git fetch
+	# Builds dirty shared/ios/ (fastlane bumps build numbers, pod install rewrites
+	# Podfile.lock). If a previous run died before its reset trap, that dirt blocks
+	# the checkout below, so drop it first.
+	git checkout -- shared/ios/
+	git checkout "$client_commit"
+	git reset --hard "$client_commit"
+	git pull origin "$client_commit" --ff-only
+else
+	echo "Checking out master on client"
+	cd "$client_dir"
+	git fetch
+	git checkout -- shared/ios/
+	git checkout "master"
+	git reset --hard "origin/master"
+	git pull origin master --ff-only
 fi
+
+cd "$client_dir"
+echo "Recent client commit log"
+git log -n 3
 
 cd "$shared_dir"
 
-if [ ! "$cache_npm" = "1" ]; then
-  yarn install --pure-lockfile
-  yarn global add react-native-cli
-fi
-
+kb_prune_yarn_cache
+kb_yarn_modules "$shared_dir"
+yarn ios:pod:clean
+yarn ios:pod:install
 
 if [ ! "$cache_go_lib" = "1" ]; then
-  echo "Building Go library"
-  yarn run rn-gobuild-ios
+	echo "Building Go library"
+	CHECK_CI="$check_ci" yarn run ios:gobuild
 fi
-
-"$client_dir/packaging/manage_react_native_packager.sh" &
-rn_packager_pid=$!
-echo "Packager running with PID $rn_packager_pid"
 
 # Build and publish the apk
 cd "$ios_dir"
+if [ -n "$clean" ]; then
+	xcodebuild clean -workspace "Keybase.xcworkspace" -scheme "Keybase"
+fi
+
+# Stale cached profiles shadow the fresh ones sigh downloads when Xcode
+# matches profiles by name (e.g. after annual renewal); park them so only
+# freshly-downloaded profiles are visible.
+profile_backup="$HOME/old-provisioning-profiles/$(date +%Y%m%d-%H%M%S)"
+for profile_dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+	if compgen -G "$profile_dir/*.mobileprovision" >/dev/null; then
+		mkdir -p "$profile_backup"
+		mv "$profile_dir"/*.mobileprovision "$profile_backup/"
+	fi
+done
+
+# fastlane wants these set
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
 fastlane ios beta
 
 "$client_dir/packaging/slack/send.sh" "Finished releasing ios"

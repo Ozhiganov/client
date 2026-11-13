@@ -1,0 +1,263 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import * as Teams from '@/constants/teams'
+import {useTeamLinkPopup} from './common'
+import RoleCrown from './common/role-crown'
+import {pluralize} from '@/util/string'
+import capitalize from 'lodash/capitalize'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {navToProfile} from '@/constants/router'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type Props = {teamname: string}
+type TeamInfoResult = {teamname: string; info?: T.RPCGen.UntrustedTeamInfo}
+
+const ExternalTeam = (props: Props) => {
+  const styles = useStyles()
+  const teamname = props.teamname
+
+  const getTeamInfo = C.useRPC(T.RPCGen.teamsGetUntrustedTeamInfoRpcPromise)
+  const [teamInfoResult, setTeamInfoResult] = React.useState<TeamInfoResult | undefined>()
+  const requestIDRef = React.useRef(0)
+
+  React.useEffect(() => {
+    requestIDRef.current += 1
+    const requestID = requestIDRef.current
+    getTeamInfo(
+      [{teamName: {parts: teamname.split('.')}}], // TODO this should just take a string
+      result => {
+        if (requestIDRef.current === requestID) {
+          setTeamInfoResult({info: result, teamname})
+        }
+      },
+      _ => {
+        if (requestIDRef.current === requestID) {
+          setTeamInfoResult({teamname})
+        }
+      }
+    )
+    return () => {
+      if (requestIDRef.current === requestID) {
+        requestIDRef.current += 1
+      }
+    }
+  }, [getTeamInfo, teamname])
+
+  const visibleTeamInfoResult = teamInfoResult?.teamname === teamname ? teamInfoResult : undefined
+  const teamInfo = visibleTeamInfoResult?.info
+  const waiting = !visibleTeamInfoResult
+
+  if (teamInfo) {
+    return (
+      <Kb.Box2 direction="vertical" fullWidth={true} fullHeight={true} testID={TestIDs.TEAMS_EXTERNAL_TEAM}>
+        <ExternalTeamInfo info={teamInfo} />
+      </Kb.Box2>
+    )
+  }
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      gap="small"
+      padding="small"
+      fullWidth={true}
+      testID={waiting ? undefined : TestIDs.TEAMS_EXTERNAL_TEAM}
+    >
+      {waiting ? (
+        <Kb.Box2
+          direction="horizontal"
+          gap={isMobile ? 'small' : 'tiny'}
+          fullWidth={true}
+          alignItems="center"
+        >
+          <Kb.ProgressIndicator />
+          <Kb.Text type="BodySmall">Loading team...</Kb.Text>
+        </Kb.Box2>
+      ) : (
+        <Kb.Text type="Body" style={styles.error}>
+          This team does not exist or it has no public information available.
+        </Kb.Text>
+      )}
+    </Kb.Box2>
+  )
+}
+
+type ExternalTeamProps = {
+  info: T.RPCGen.UntrustedTeamInfo
+}
+
+const orderMembers = (members?: ReadonlyArray<T.RPCGen.TeamMemberRole>) =>
+  [...(members || [])].sort((memberA, memberB) =>
+    memberB.role === memberA.role
+      ? memberA.username.localeCompare(memberB.username)
+      : memberB.role - memberA.role
+  )
+
+type Item = {type: 'header'} | {type: 'empty'} | {type: 'member'; member: T.RPCChat.Keybase1.TeamMemberRole}
+type Section = Kb.SectionType<Item>
+
+const ExternalTeamInfo = ({info}: ExternalTeamProps) => {
+  const styles = useStyles()
+  const members = orderMembers(info.publicMembers ?? undefined)
+  const sections: Array<Section> = [
+    {
+      data: [{type: 'header'}],
+      renderItem: () => <Header info={info} />,
+    },
+    {
+      data: members.length ? members.map(m => ({member: m, type: 'member'})) : [{type: 'empty'}],
+      renderItem: ({item, index}: {item: Item; index: number}) => {
+        return item.type === 'empty' ? (
+          <Kb.Box2
+            direction="vertical"
+            fullWidth={true}
+            gap="large"
+            gapStart={true}
+            gapEnd={true}
+            centerChildren={true}
+          >
+            <Kb.Text type="BodySmall">This team has no public members.</Kb.Text>
+          </Kb.Box2>
+        ) : item.type === 'member' ? (
+          <Member member={item.member} firstItem={index === 0} />
+        ) : null
+      },
+    },
+  ] as const
+  const renderSectionHeader = ({section}: {section: (typeof sections)[number]}) => {
+    if (section.data[0]?.type !== 'header') {
+      return (
+        <Kb.Tabs
+          tabs={[{title: 'Public members'}]}
+          selectedTab="Public members"
+          style={styles.tabs}
+          onSelect={() => {}}
+        />
+      )
+    }
+    return null
+  }
+
+  return (
+    <Kb.SectionList
+      sections={sections}
+      contentContainerStyle={styles.contentContainer}
+      renderSectionHeader={renderSectionHeader}
+    />
+  )
+}
+
+const Header = ({info}: ExternalTeamProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const nav = useSafeNavigation()
+  const teamname = info.name.parts?.join('.')
+  const onJoin = () =>
+    nav.safeNavigateAppend({name: 'teamJoinTeamDialog', params: {initialTeamname: teamname}})
+  const {popupAnchor, showPopup, popup} = useTeamLinkPopup(teamname || '')
+
+  const metaInfo = (
+    <Kb.Box2 direction="vertical" alignSelf="stretch" gap={isMobile ? 'small' : 'tiny'}>
+      <Kb.Box2 direction="vertical" gap={isMobile ? 'xtiny' : 'xxtiny'}>
+        {!!info.description && <Kb.Text type="Body">{info.description}</Kb.Text>}
+        <Kb.Text type="BodySmall">
+          {info.numMembers.toLocaleString()} {pluralize('member', info.numMembers)}
+        </Kb.Text>
+        {/* TODO add activity */}
+      </Kb.Box2>
+      <Kb.Box2 direction="horizontal" gap="tiny" fullWidth={true}>
+        <Kb.Button onClick={onJoin} type="Success" label="Join team" small={true} />
+        <Kb.Button mode="Secondary" label="Share" small={true} ref={popupAnchor} onClick={showPopup} />
+        {popup}
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+  const openMeta = <Kb.Meta style={styles.meta} title="OPEN" backgroundColor={theme.green} />
+  return (
+    <Kb.Box2 direction="vertical" gap="small" fullWidth={true} style={styles.headerContainer}>
+      <Kb.Box2 direction="horizontal" gap="small" alignItems="flex-start">
+        <Kb.Avatar size={96} teamname={teamname} />
+        <Kb.Box2 direction="vertical" gap="xxtiny" alignSelf="flex-start">
+          <Kb.Box2 direction="horizontal" gap="tiny" fullWidth={true}>
+            <Kb.Text type="Header">{teamname}</Kb.Text>
+            {!isMobile && openMeta}
+          </Kb.Box2>
+          {isMobile && openMeta}
+          {!isMobile && metaInfo}
+        </Kb.Box2>
+      </Kb.Box2>
+      {isMobile && metaInfo}
+    </Kb.Box2>
+  )
+}
+
+const Member = ({member, firstItem}: {member: T.RPCGen.TeamMemberRole; firstItem: boolean}) => {
+  const styles = useStyles()
+  const previewConversation = C.Router2.previewConversation
+  const onChat = () => previewConversation({participants: [member.username], reason: 'teamMember'})
+  const roleString = Teams.teamRoleByEnum[member.role]
+  return (
+    <Kb.ListItem
+      firstItem={firstItem}
+      type="Large"
+      icon={<Kb.Avatar size={32} username={member.username} />}
+      onClick={() => navToProfile(member.username)}
+      body={
+        <Kb.Box2 alignSelf="center" direction="vertical" alignItems="flex-start" flex={1} style={styles.memberBody}>
+          <Kb.ConnectedUsernames type="BodyBold" usernames={member.username} colorFollowing={true} />
+          <Kb.Box2 direction="horizontal" alignItems="center" alignSelf="flex-start">
+            {!!member.fullName && (
+              <Kb.Text type="BodySmall" style={{flexShrink: 1}} lineClamp={1}>
+                {member.fullName.trim()}
+              </Kb.Text>
+            )}
+            {!!member.fullName && (
+              <Kb.Text type="BodySmall" style={styles.middot}>
+                •
+              </Kb.Text>
+            )}
+            <RoleCrown role={roleString} sizeType="Small" style={styles.crownIcon} />
+            <Kb.Text type="BodySmall">{capitalize(roleString)}</Kb.Text>
+          </Kb.Box2>
+        </Kb.Box2>
+      }
+      action={<Kb.IconButton type="Dim" mode="Secondary" onClick={onChat} icon="iconfont-chat" small={true} />}
+      onlyShowActionOnHover="fade"
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  contentContainer: Kb.Styles.platformStyles({
+    common: {
+      paddingBottom: Kb.Styles.globalMargins.small,
+    },
+    isElectron: {
+      paddingTop: Kb.Styles.globalMargins.tiny,
+    },
+  }),
+  crownIcon: {marginRight: Kb.Styles.globalMargins.xtiny},
+  error: {color: theme.redDark},
+  headerContainer: {
+    ...Kb.Styles.padding(0, Kb.Styles.globalMargins.small),
+  },
+  memberBody: {
+    paddingRight: Kb.Styles.globalMargins.tiny,
+  },
+  meta: Kb.Styles.platformStyles({
+    isElectron: {
+      alignSelf: 'center',
+    },
+  }),
+  middot: {
+    ...Kb.Styles.marginH(Kb.Styles.globalMargins.xtiny),
+  },
+  tabs: {
+    backgroundColor: theme.white,
+    width: '100%',
+  },
+}))
+
+export default ExternalTeam

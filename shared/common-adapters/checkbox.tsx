@@ -1,0 +1,149 @@
+import {Box2, ClickableBox} from './box'
+import Icon from './icon'
+import Switch from '@/common-adapters/switch'
+import Text from './text'
+import * as Styles from '@/styles'
+import type * as React from 'react'
+import type {TextType} from './text.shared'
+
+type Props = {
+  key?: string
+  label?: string | React.ReactNode
+  checkboxColor?: Styles.Color
+  checkboxStyle?: Styles.StylesCrossPlatform
+  labelComponent?: React.ReactNode
+  labelSubtitle?: string
+  labelType?: TextType
+  onCheck?: (newCheckedValue: boolean) => void
+  checked: boolean
+  style?: Styles.StylesCrossPlatform
+  disabled?: boolean
+  // on the element a tap toggles: on mobile only the switch takes one, not its label
+  testID?: string
+}
+
+const CHECKBOX_SIZE = 13
+
+const Kb = {Box2, ClickableBox, Icon, Switch, Text}
+
+const Checkbox = (props: Props) => {
+  const styles = useStyles()
+  const theme = Styles.useTheme()
+  const {
+    checkboxColor,
+    checkboxStyle,
+    checked,
+    disabled,
+    label,
+    labelComponent,
+    labelSubtitle,
+    labelType,
+    onCheck,
+    style,
+    testID,
+  } = props
+
+  if (!isMobile) {
+    return (
+      <Kb.ClickableBox
+        direction="horizontal"
+        alignItems="flex-start"
+        alignSelf="flex-start"
+        gap="tiny"
+        style={Styles.collapseStyles([
+          styles.container,
+          !disabled && styles.clickable,
+          style,
+        ])}
+        testID={testID}
+        onClick={e =>
+          disabled || e?.defaultPrevented ? undefined : onCheck?.(!checked)
+        }
+      >
+        <div
+          style={Styles.castStyleDesktop(
+            Styles.collapseStyles([
+              styles.checkbox,
+              checked && styles.checkboxChecked,
+              disabled && styles.checkboxInactive,
+              disabled && checked && styles.semiTransparent,
+              checkboxStyle,
+            ])
+          )}
+        >
+          <Kb.Icon
+            type="iconfont-check"
+            style={Styles.collapseStyles([styles.icon, !checked && styles.transparent])}
+            hoverColor={theme.white}
+            color={checkboxColor ?? theme.white}
+            fontSize={9}
+          />
+        </div>
+        <Kb.Box2 direction="vertical">
+          {labelComponent ||
+            (typeof label === 'string' ? <Kb.Text type={labelType ?? 'Body'}>{label}</Kb.Text> : label)}
+          {!!labelSubtitle && <Kb.Text type="BodySmall">{labelSubtitle}</Kb.Text>}
+        </Kb.Box2>
+      </Kb.ClickableBox>
+    )
+  }
+
+  return (
+    <Kb.Switch
+      align="left"
+      color="blue"
+      disabled={disabled}
+      label={labelComponent || label || ''}
+      labelType={labelType}
+      on={checked}
+      onClick={() => {
+        onCheck?.(!checked)
+      }}
+      style={Styles.collapseStyles([styles.mobileContainer, style])}
+      labelSubtitle={labelSubtitle}
+      testID={testID}
+    />
+  )
+}
+
+const useStyles = Styles.createStyleHook(theme => ({
+  checkbox: Styles.platformStyles({
+    isElectron: {
+      ...Styles.globalStyles.flexBoxColumn,
+      ...Styles.transition('background'),
+      backgroundColor: theme.white,
+      ...Styles.border(theme.black_20, 1, 2),
+      flexShrink: 0,
+      ...Styles.size(CHECKBOX_SIZE),
+      justifyContent: 'center',
+      marginTop: 2,
+      position: 'relative',
+    },
+  }),
+  checkboxChecked: {
+    backgroundColor: theme.blue,
+    borderColor: theme.blue,
+  },
+  checkboxInactive: {borderColor: theme.black_10},
+  clickable: Styles.platformStyles({
+    isElectron: {
+      ...Styles.desktopStyles.clickable,
+    },
+  }),
+  container: {
+    ...Styles.paddingV(2),
+  },
+  icon: Styles.platformStyles({
+    isElectron: {
+      ...Styles.transition('opacity'),
+      alignSelf: 'center',
+    },
+  }),
+  mobileContainer: {
+    ...Styles.paddingV(Styles.globalMargins.xtiny),
+  },
+  semiTransparent: {opacity: 0.4},
+  transparent: {opacity: 0},
+}))
+
+export default Checkbox

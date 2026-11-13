@@ -1,0 +1,582 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import type * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as RowSizes from '../sizes'
+import * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+import SwipeConvActions from './swipe-conv-actions'
+import './small-team.css'
+import {Avatars, TeamAvatar} from '@/chat/avatars'
+import {formatTimeForConversationList} from '@/util/timestamp'
+import {useOpenedRowState} from '../opened-row-state'
+import {useInboxRowIsPinned, useInboxRowSmall} from '@/chat/inbox/rows-state'
+import TeamMenu from '@/chat/conversation/info-panel/menu'
+export type Props = {
+  conversationIDKey: string
+  isSelected: boolean
+  onSelectConversation?: () => void
+}
+
+const SmallTeam = (p: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {conversationIDKey, isSelected} = p
+
+  const row = useInboxRowSmall(conversationIDKey)
+  const isPinned = useInboxRowIsPinned(conversationIDKey)
+  const setOpenedRow = useOpenedRowState(s => s.dispatch.setOpenRow)
+
+  const makePopup = (mp: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = mp
+    return (
+      <TeamMenu
+        visible={true}
+        attachTo={attachTo}
+        conversationIDKey={conversationIDKey}
+        onHidden={hidePopup}
+        hasHeader={true}
+        isSmallTeam={true}
+        showPinItems={true}
+      />
+    )
+  }
+  const {showingPopup, showPopup, popup, popupAnchor} = Kb.usePopup2(makePopup)
+
+  const {isMuted, isLocked, draft: rawDraft, teamDisplayName, hasBadge, hasUnread} = row
+  const {hasResetUsers, youNeedToRekey, youAreReset, participantNeedToRekey, participants} = row
+  const {snippet, snippetDecoration, typingSnippet, timestamp, isDecryptingSnippet} = row
+  const displaySnippet = typingSnippet || snippet
+  const displayDecoration = typingSnippet ? T.RPCChat.SnippetDecoration.none : snippetDecoration
+  const draft = (!isSelected && !hasUnread && rawDraft) || ''
+  const onSelectConversation = isSelected
+    ? undefined
+    : (p.onSelectConversation ??
+        (() => {
+          setOpenedRow(Chat.noConversationIDKey)
+          C.Router2.navigateToThread(conversationIDKey, 'inboxSmall')
+        }))
+  const onLongPress = isMobile
+    ? () => {
+        setOpenedRow(Chat.noConversationIDKey)
+        showPopup()
+      }
+    : undefined
+
+  const backgroundColor = isSelected
+    ? theme.blue
+    : Kb.Styles.isPhone && !Kb.Styles.isTablet
+      ? undefined
+      : theme.blueGrey
+
+  const participantOne = teamDisplayName ? '' : participants[0] ?? ''
+  const participantTwo = teamDisplayName ? '' : participants[1] ?? ''
+  const className = Kb.Styles.classNames('small-row', {selected: isSelected})
+  const containerStyle = Kb.Styles.isTablet
+    ? Kb.Styles.collapseStyles([styles.container, {backgroundColor}])
+    : styles.container
+  const rowContents = (
+    <Kb.Box2 direction="horizontal" alignItems="center" fullWidth={true} fullHeight={true} relative={true} style={styles.rowContainer}>
+      {isPinned && (
+        <Kb.Icon
+          type="iconfont-pin-solid"
+          fontSize={isMobile ? 12 : 9}
+          color={isSelected ? theme.white_75 : theme.black_35}
+          style={styles.pinIcon}
+        />
+      )}
+      {teamDisplayName ? (
+        <TeamAvatar teamname={teamDisplayName} isMuted={isMuted} isSelected={isSelected} />
+      ) : (
+        <Avatars
+          backgroundColor={backgroundColor}
+          isMuted={isMuted}
+          isLocked={isLocked}
+          isSelected={isSelected}
+          participantOne={participantOne}
+          participantTwo={participantTwo}
+        />
+      )}
+      <Kb.Box2 direction="vertical" fullHeight={true} justifyContent="center" style={styles.conversationRow}>
+        <Kb.Box2 direction="vertical" justifyContent="flex-end" style={styles.withBottomLine} fullWidth={true}>
+          <TopLine
+            participants={participants}
+            teamDisplayName={teamDisplayName}
+            timestamp={timestamp}
+            hasBadge={hasBadge}
+            hasUnread={hasUnread}
+            isSelected={isSelected}
+            backgroundColor={backgroundColor}
+            showPopup={showPopup}
+            popupAnchor={popupAnchor}
+          />
+        </Kb.Box2>
+        <BottomLineDisplay
+          snippet={displaySnippet}
+          snippetDecoration={displayDecoration}
+          backgroundColor={backgroundColor}
+          isSelected={isSelected}
+          hasUnread={hasUnread}
+          draft={draft}
+          hasResetUsers={hasResetUsers}
+          youNeedToRekey={youNeedToRekey}
+          youAreReset={youAreReset}
+          participantNeedToRekey={participantNeedToRekey}
+          isDecryptingSnippet={isDecryptingSnippet}
+        />
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+
+  return (
+    <>
+      {showingPopup && popup}
+      <SwipeConvActions conversationIDKey={conversationIDKey} onPress={onSelectConversation} onLongPress={onLongPress}>
+        {isMobile ? (
+          <Kb.Box2 direction="vertical" style={containerStyle}>
+            {rowContents}
+          </Kb.Box2>
+        ) : (
+          <Kb.ClickableBox direction="vertical" fullWidth={true} onClick={onSelectConversation} className={className} testID={TestIDs.CHAT_INBOX_ROW} style={containerStyle}>
+            {rowContents}
+          </Kb.ClickableBox>
+        )}
+      </SwipeConvActions>
+    </>
+  )
+}
+
+type TopLineProps = {
+  participants: ReadonlyArray<string>
+  teamDisplayName: string
+  timestamp: number
+  hasBadge: boolean
+  hasUnread: boolean
+  isSelected: boolean
+  backgroundColor?: string
+  showPopup: () => void
+  popupAnchor: React.RefObject<Kb.MeasureRef | null>
+}
+
+const TopLine = (p: TopLineProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {isSelected, backgroundColor, participants, teamDisplayName, timestamp} = p
+  const {hasBadge, hasUnread, showPopup, popupAnchor} = p
+  const showBold = !isSelected && hasUnread
+  const subColor = isSelected
+    ? theme.white
+    : hasUnread
+      ? theme.black
+      : theme.black_50
+
+  const tssubColor = (!hasBadge || isSelected) && subColor
+  const timestampStyle = Kb.Styles.collapseStyles([
+    showBold && styles.bold,
+    styles.timestamp,
+    tssubColor !== false && ({color: tssubColor} as Kb.Styles.StylesCrossPlatform),
+  ])
+  const timestampText = timestamp ? formatTimeForConversationList(timestamp) : ''
+
+  const usernameColor = isSelected ? theme.white : theme.black
+  const nameContainerStyle = Kb.Styles.collapseStyles([
+    styles.name,
+    showBold && styles.bold,
+    {color: usernameColor},
+    isMobile && {backgroundColor},
+  ])
+  const teamContainerStyle = Kb.Styles.collapseStyles([
+    styles.teamTextStyle,
+    showBold && styles.bold,
+    {color: usernameColor},
+  ])
+
+  return (
+    <Kb.Box2 direction="horizontal" alignItems="center" fullWidth={true}>
+      <Kb.Box2 direction="horizontal" style={styles.insideContainer} relative={true}>
+        <Kb.Box2 alignSelf="center" direction="horizontal" alignItems="center" style={styles.nameContainer}>
+          {teamDisplayName ? (
+            <Kb.Text type="BodySemibold" style={teamContainerStyle} lineClamp={1}>
+              {teamDisplayName}
+            </Kb.Text>
+          ) : (
+            <Kb.ConnectedUsernames
+              backgroundMode={isSelected ? 'Terminal' : 'Normal'}
+              type={showBold ? 'BodyBold' : 'BodySemibold'}
+              inline={true}
+              withProfileCardPopup={false}
+              underline={false}
+              colorBroken={false}
+              colorFollowing={false}
+              colorYou={false}
+              commaColor={usernameColor}
+              containerStyle={nameContainerStyle}
+              usernames={participants}
+              title={participants.join(', ')}
+            />
+          )}
+        </Kb.Box2>
+      </Kb.Box2>
+      <Kb.Text key="timestamp" type="BodyTiny" className="conversation-timestamp" style={timestampStyle}>
+        {timestampText}
+      </Kb.Text>
+      {!isMobile && (
+        <TopLineGear subColor={subColor} isSelected={isSelected} showPopup={showPopup} popupAnchor={popupAnchor} />
+      )}
+      {hasBadge ? <Kb.Box2 direction="horizontal" key="unreadDot" style={styles.unreadDotStyle} /> : null}
+    </Kb.Box2>
+  )
+}
+
+type TopLineGearProps = {
+  subColor: string
+  isSelected: boolean
+  showPopup: () => void
+  popupAnchor: React.RefObject<Kb.MeasureRef | null>
+}
+
+const TopLineGear = (p: TopLineGearProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {subColor, isSelected, showPopup, popupAnchor} = p
+  const iconHoverColor = isSelected ? theme.white_75 : theme.black
+  return (
+    <Kb.Box2 alignSelf="center" direction="vertical" ref={popupAnchor} style={styles.icon}>
+      <Kb.Icon
+        type="iconfont-gear"
+        className="conversation-gear"
+        onClick={showPopup}
+        color={subColor}
+        hoverColor={iconHoverColor}
+      />
+    </Kb.Box2>
+  )
+}
+
+type BottomLineDisplayProps = {
+  snippet: string
+  snippetDecoration: T.RPCChat.SnippetDecoration
+  backgroundColor?: string
+  isSelected?: boolean
+  allowBold?: boolean
+  hasUnread: boolean
+  draft: string
+  hasResetUsers: boolean
+  youNeedToRekey: boolean
+  youAreReset: boolean
+  participantNeedToRekey: boolean
+  isDecryptingSnippet: boolean
+}
+
+const BottomLineDisplay = (p: BottomLineDisplayProps) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {allowBold = true, isSelected, backgroundColor} = p
+  const {snippet, snippetDecoration, hasUnread, draft} = p
+  const {hasResetUsers, youNeedToRekey, youAreReset, participantNeedToRekey, isDecryptingSnippet} = p
+
+  const subColor = isSelected
+    ? theme.white
+    : hasUnread
+      ? theme.black
+      : theme.black_50
+  const showBold = allowBold && !isSelected && hasUnread
+  const style = Kb.Styles.collapseStyles([
+    styles.bottomLine,
+    {color: subColor, ...(showBold ? Kb.Styles.globalStyles.fontBold : {})},
+  ])
+
+  let content: React.ReactNode
+  if (youNeedToRekey) {
+    content = null
+  } else if (youAreReset) {
+    content = (
+      <Kb.Text
+        type="BodySmallSemibold"
+        negative={true}
+        style={Kb.Styles.collapseStyles([
+          styles.youAreResetText,
+          {color: isSelected ? theme.white : theme.red},
+        ])}
+      >
+        You are locked out.
+      </Kb.Text>
+    )
+  } else if (participantNeedToRekey) {
+    content = (
+      <Kb.Meta title="rekey needed" style={styles.alertMeta} backgroundColor={theme.red} />
+    )
+  } else if (draft) {
+    content = (
+      <Kb.Box2 alignSelf="center" direction="horizontal" gap="xtiny" style={styles.contentBox}>
+        <Kb.Text
+          type="BodySmall"
+          style={Kb.Styles.collapseStyles([
+            styles.draftLabel,
+            isSelected ? {color: theme.white} : null,
+          ])}
+        >
+          Draft:
+        </Kb.Text>
+        <Kb.Markdown preview={true} style={style}>
+          {draft}
+        </Kb.Markdown>
+      </Kb.Box2>
+    )
+  } else if (isDecryptingSnippet) {
+    content = (
+      <Kb.Meta title="decrypting..." style={styles.alertMeta} backgroundColor={theme.blue} />
+    )
+  } else {
+    content = (
+      <Kb.Box2 direction="horizontal" gap="xtiny" style={styles.contentBox}>
+        <SnippetContent snippet={snippet} snippetDecoration={snippetDecoration} isSelected={isSelected} style={style} />
+      </Kb.Box2>
+    )
+  }
+
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} style={isMobile ? {backgroundColor} : undefined}>
+      {hasResetUsers && (
+        <Kb.Meta variant="reset" style={styles.alertMeta} />
+      )}
+      {youNeedToRekey && (
+        <Kb.Meta
+          title="rekey needed"
+          style={styles.alertMeta}
+          backgroundColor={theme.red}
+        />
+      )}
+      <Kb.Box2 direction="horizontal" alignItems="center" style={styles.innerBox}>{content}</Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+// Connected BottomLine that uses ChatContext (for external consumers like selectable-small-team)
+type BottomLineProps = {
+  conversationIDKey: T.Chat.ConversationIDKey
+  snippet?: string
+  snippetDecoration?: T.RPCChat.SnippetDecoration
+  backgroundColor?: string
+  isSelected?: boolean
+  allowBold?: boolean
+}
+
+const BottomLine = (p: BottomLineProps) => {
+  const {allowBold = true, conversationIDKey, isSelected, backgroundColor} = p
+  const snippet = p.snippet ?? ''
+  const snippetDecoration = p.snippetDecoration ?? T.RPCChat.SnippetDecoration.none
+
+  const row = useInboxRowSmall(conversationIDKey)
+  const {hasUnread, draft: rawDraft, hasResetUsers, participantNeedToRekey, youAreReset, youNeedToRekey} = row
+  const isDecryptingSnippet = !snippet && row.isDecryptingSnippet
+  const draft = (!isSelected && !hasUnread && rawDraft) || ''
+
+  return (
+    <BottomLineDisplay
+      snippet={snippet}
+      snippetDecoration={snippetDecoration}
+      backgroundColor={backgroundColor}
+      isSelected={isSelected}
+      allowBold={allowBold}
+      hasUnread={hasUnread}
+      draft={draft}
+      hasResetUsers={hasResetUsers}
+      youNeedToRekey={youNeedToRekey}
+      youAreReset={youAreReset}
+      participantNeedToRekey={participantNeedToRekey}
+      isDecryptingSnippet={isDecryptingSnippet}
+    />
+  )
+}
+
+const SnippetContent = (p: {
+  snippet: string
+  snippetDecoration: T.RPCChat.SnippetDecoration
+  isSelected?: boolean
+  style: Kb.Styles.StylesCrossPlatform
+}) => {
+  const theme = Kb.Styles.useTheme()
+  const {snippet, snippetDecoration: decoration, isSelected, style} = p
+  const defaultIconColor = isSelected ? theme.white : theme.black_20
+
+  let decorationNode: React.ReactNode
+  let exploded = false
+  let tooltip: string | undefined
+
+  switch (decoration) {
+    case T.RPCChat.SnippetDecoration.pendingMessage:
+      tooltip = 'Sending\u2026'
+      decorationNode = <SnippetDecorationIcon type="iconfont-hourglass" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.failedPendingMessage:
+      tooltip = 'Failed to send'
+      decorationNode = (
+        <SnippetDecorationIcon
+          type="iconfont-exclamation"
+          color={isSelected ? theme.white : theme.red}
+        />
+      )
+      break
+    case T.RPCChat.SnippetDecoration.explodingMessage:
+      decorationNode = <SnippetDecorationIcon type="iconfont-timer-solid" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.explodedMessage:
+      decorationNode = (
+        <Kb.Text
+          type="BodySmall"
+          style={{color: isSelected ? theme.white : theme.black_50}}
+        >
+          Message exploded.
+        </Kb.Text>
+      )
+      exploded = true
+      break
+    case T.RPCChat.SnippetDecoration.audioAttachment:
+      decorationNode = <SnippetDecorationIcon type="iconfont-mic-solid" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.videoAttachment:
+      decorationNode = <SnippetDecorationIcon type="iconfont-film-solid" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.photoAttachment:
+      decorationNode = <SnippetDecorationIcon type="iconfont-camera-solid" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.fileAttachment:
+      decorationNode = <SnippetDecorationIcon type="iconfont-file-solid" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.stellarReceived:
+      decorationNode = <SnippetDecorationIcon type="iconfont-stellar-request" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.stellarSent:
+      decorationNode = <SnippetDecorationIcon type="iconfont-stellar-send" color={defaultIconColor} />
+      break
+    case T.RPCChat.SnippetDecoration.pinnedMessage:
+      decorationNode = <SnippetDecorationIcon type="iconfont-pin-solid" color={defaultIconColor} />
+      break
+    default:
+      decorationNode = null
+  }
+
+  return (
+    <>
+      {!!decorationNode && (
+        <Kb.Box2 alignSelf="center" direction="vertical" centerChildren={true} tooltip={tooltip}>
+          {decorationNode}
+        </Kb.Box2>
+      )}
+      {!exploded && !!snippet && (
+        <Kb.Markdown preview={true} style={style}>
+          {snippet}
+        </Kb.Markdown>
+      )}
+    </>
+  )
+}
+
+const SnippetDecorationIcon = (p: {type: Kb.IconType; color: string}) => {
+  const styles = useStyles()
+  return (
+    <Kb.Icon
+      color={p.color}
+      type={p.type}
+      fontSize={isMobile ? 16 : 12}
+      style={styles.snippetDecoration}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      alertMeta: Kb.Styles.platformStyles({
+        common: {marginRight: 6},
+        isMobile: {marginTop: 2},
+      }),
+      bold: {...Kb.Styles.globalStyles.fontBold},
+      bottomLine: Kb.Styles.platformStyles({
+        isElectron: {
+          color: theme.black_50,
+          display: 'block',
+          minHeight: 16,
+          paddingRight: 10,
+          width: '100%',
+          ...Kb.Styles.textEllipsis,
+        },
+        isMobile: {
+          color: theme.black_50,
+          flex: 1,
+          lineHeight: 19,
+          paddingRight: 40,
+        },
+      }),
+      container: {
+        flexShrink: 0,
+        height: RowSizes.smallRowHeight,
+      },
+      contentBox: {
+        ...Kb.Styles.globalStyles.fillAbsolute,
+        alignItems: 'center',
+      },
+      conversationRow: {
+        flexGrow: 1,
+        paddingLeft: Kb.Styles.globalMargins.tiny,
+      },
+      draftLabel: {color: theme.orange},
+      icon: {position: 'relative'} as const,
+      innerBox: Kb.Styles.platformStyles({
+        common: {
+          flexGrow: 1,
+          height: 17,
+          position: 'relative',
+        },
+        isMobile: {height: 21},
+      }),
+      insideContainer: {
+        flexGrow: 1,
+        height: isMobile ? 21 : 17,
+      },
+      name: {paddingRight: Kb.Styles.globalMargins.tiny},
+      nameContainer: {
+        ...Kb.Styles.globalStyles.fillAbsolute,
+      },
+      pinIcon: {
+        left: Kb.Styles.globalMargins.xxtiny,
+        position: 'absolute',
+        top: Kb.Styles.globalMargins.xtiny,
+      },
+      rowContainer: Kb.Styles.platformStyles({
+        common: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.xsmall),
+        },
+        isElectron: Kb.Styles.desktopStyles.clickable,
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.small),
+        },
+      }),
+      snippetDecoration: {alignSelf: 'flex-start'} as const,
+      teamTextStyle: Kb.Styles.platformStyles({
+        isElectron: {
+          ...Kb.Styles.textEllipsis,
+        },
+      }),
+      timestamp: {
+        color: theme.blueDark,
+      },
+      unreadDotStyle: {
+        backgroundColor: theme.orange,
+        borderRadius: 6,
+        height: 8,
+        marginLeft: 4,
+        width: 8,
+      },
+      withBottomLine: {
+        paddingBottom: Kb.Styles.globalMargins.xxtiny,
+      },
+      youAreResetText: Kb.Styles.platformStyles({
+        isElectron: {fontSize: 12, lineHeight: 13},
+        isMobile: {fontSize: 14, lineHeight: 19},
+      }),
+    }) as const
+)
+
+export {SmallTeam, BottomLine}

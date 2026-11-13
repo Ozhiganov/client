@@ -1,0 +1,76 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {useConversationThreadID} from '../../thread-context'
+
+const MakeTeam = () => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const conversationIDKey = useConversationThreadID()
+  const onShowNewTeamDialog = () =>
+    C.Router2.navigateAppend({name: 'chatShowNewTeamDialog', params: {conversationIDKey}})
+  return (
+    <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.container} alignItems="flex-start">
+      <Kb.Box2 direction="vertical" gap="xtiny" fullHeight={true} padding="medium">
+        <Kb.Text type="BodySmallSemibold" style={styles.header} negative={true}>
+          {"Make it a team? You'll be able to add and delete members as you wish."}
+        </Kb.Text>
+        <Kb.ClickableBox onClick={onShowNewTeamDialog} direction="horizontal" alignItems="center" fullWidth={true} className="hover_container" gap="xtiny">
+          <Kb.Text
+            type="BodySmallSemiboldPrimaryLink"
+            style={styles.link}
+            className="color_greenLightOrWhite hover_contained_color_white"
+          >
+            Enter a team name
+          </Kb.Text>
+          <Kb.Icon
+            color={theme.greenLight}
+            sizeType="Tiny"
+            type="iconfont-arrow-right"
+            className="hover_contained_color_white"
+            style={styles.icon}
+          />
+        </Kb.ClickableBox>
+      </Kb.Box2>
+      <Kb.ImageIcon type="icon-illustration-teams-80" style={styles.image} />
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.green,
+          borderRadius: Kb.Styles.borderRadius,
+        },
+        isElectron: {
+          height: 100,
+          marginTop: Kb.Styles.globalMargins.xsmall,
+          maxWidth: 400,
+        },
+        isMobile: {
+          marginLeft: Kb.Styles.globalMargins.small,
+          marginRight: Kb.Styles.globalMargins.small,
+          marginTop: Kb.Styles.globalMargins.small,
+          width: 288,
+        },
+      }),
+      header: {
+        maxWidth: isMobile ? 126 : undefined,
+      },
+      icon: Kb.Styles.platformStyles({
+        isElectron: {
+          display: 'block',
+          marginTop: 4,
+        },
+      }),
+      image: {
+        alignSelf: 'center',
+        paddingRight: Kb.Styles.globalMargins.small,
+      },
+      link: {color: isMobile ? theme.greenLight : undefined},
+    }) as const
+)
+
+export default MakeTeam

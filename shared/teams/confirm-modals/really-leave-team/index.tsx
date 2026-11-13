@@ -1,0 +1,132 @@
+import * as React from 'react'
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {useSafeSubmit} from '@/util/safe-submit'
+import * as T from '@/constants/types'
+import LastOwnerDialog from './last-owner'
+import AvatarBadge from '../avatar-badge'
+import {useLoadedTeam} from '@/teams/team/use-loaded-team'
+import {exitTeamTo, type TeamExitContext} from '@/teams/actions'
+
+type Props = {
+  error: string
+  onBack: () => void
+  onLeave: (perm: boolean) => void
+  name: string
+  open?: boolean
+}
+
+const Header = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <>
+      <Kb.Avatar teamname={props.name} size={64} />
+      <AvatarBadge icon="iconfont-leave" style={styles.iconContainer} iconStyle={styles.headerIcon} />
+    </>
+  )
+}
+
+const ReallyLeaveTeam = (props: Props) => {
+  const styles = useStyles()
+  const {name, onLeave: propOnLeave} = props
+  const dispatchClearWaiting = C.Waiting.useDispatchClearWaiting()
+  React.useEffect(
+    () => () => {
+      dispatchClearWaiting(C.waitingKeyTeamsLeaveTeam(name))
+    },
+    [dispatchClearWaiting, name]
+  )
+  const [leavePermanently, setLeavePermanently] = React.useState(false)
+  const onLeave = () => propOnLeave(leavePermanently)
+  return (
+    <Kb.ConfirmModal
+      error={props.error}
+      confirmText="Leave team"
+      content={
+        <Kb.Checkbox
+          label="Block this team"
+          labelSubtitle="Future attempts by admins to add you to the team will be ignored."
+          onCheck={setLeavePermanently}
+          checked={leavePermanently}
+          style={styles.checkBox}
+        />
+      }
+      description={`You will lose access to all the team chats and folders${
+        !props.open ? ', and you won’t be able to get back unless an admin invites you' : ''
+      }.`}
+      header={<Header {...props} />}
+      onCancel={props.onBack}
+      onConfirm={onLeave}
+      prompt={`Leave ${props.name}?`}
+      waitingKey={C.waitingKeyTeamsLeaveTeam(props.name)}
+    />
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      checkBox: {marginTop: Kb.Styles.globalMargins.tiny},
+      headerIcon: {
+        position: 'relative',
+        top: 1,
+      },
+      iconContainer: {
+        marginRight: -46,
+        marginTop: -20,
+        zIndex: 1,
+      },
+    }) as const
+)
+
+type OwnProps = {teamID: T.Teams.TeamID; context: TeamExitContext}
+
+const ReallyLeaveTeamContainer = (op: OwnProps) => {
+  const {teamID, context} = op
+  const {loading, teamDetails, teamMeta} = useLoadedTeam(teamID)
+  const teamname = teamMeta.teamname
+  const open = teamDetails.settings.open
+  const lastOwner =
+    teamMeta.role === 'owner' &&
+    [...teamDetails.members.values()].filter(member => member.type === 'owner').length < 2
+  const leaveTeamRPC = C.useRPC(T.RPCGen.teamsTeamLeaveRpcPromise)
+  const stillLoadingTeam = loading
+  const waitingKey = C.waitingKeyTeamsLeaveTeam(teamname)
+  const leaving = C.Waiting.useAnyWaiting(waitingKey)
+  const error = C.Waiting.useAnyErrors(waitingKey)
+  const onDeleteTeam = () => {
+    C.Router2.navigateUp()
+    C.Router2.navigateAppend({name: 'teamDeleteTeam', params: {context, teamID}})
+  }
+  const _onLeave = (permanent: boolean) => {
+    if (!teamname) {
+      return
+    }
+    leaveTeamRPC(
+      [{name: teamname, permanent}, waitingKey],
+      () => exitTeamTo(context),
+      () => {}
+    )
+  }
+  const onBack = leaving ? () => {} : C.Router2.navigateUp
+  const onLeave = useSafeSubmit(_onLeave, !leaving && !loading && !!teamname)
+
+  return lastOwner ? (
+    <LastOwnerDialog
+      onBack={onBack}
+      onDeleteTeam={onDeleteTeam}
+      name={teamname}
+      stillLoadingTeam={stillLoadingTeam}
+    />
+  ) : (
+    <ReallyLeaveTeam
+      error={error?.message ?? ''}
+      onBack={onBack}
+      onLeave={onLeave}
+      open={open}
+      name={teamname}
+    />
+  )
+}
+
+export default ReallyLeaveTeamContainer

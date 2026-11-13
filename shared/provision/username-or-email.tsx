@@ -1,0 +1,183 @@
+import * as C from '@/constants'
+import useRequestAutoInvite from '@/signup/use-request-auto-invite'
+import * as T from '@/constants/types'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import UserCard from '@/login/user-card'
+import {SignupScreen, errorBanner} from '@/signup/common'
+import {submitProvisionUsername} from './flow'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type OwnProps = {
+  autoSubmit?: boolean
+  fromReset?: boolean
+  inlineErrorCode?: number
+  username?: string
+}
+
+export const decodeInlineError = (inlineErrorCode?: number) => {
+  let inlineError = ''
+  let inlineSignUpLink = false
+  switch (inlineErrorCode) {
+    case T.RPCGen.StatusCode.scnotfound:
+      // If it's a "not found" error, we will show "go to signup" link,
+      // otherwise just the error.
+      inlineError = ''
+      inlineSignUpLink = true
+      break
+    case T.RPCGen.StatusCode.scbadusername:
+      inlineError = C.usernameHint
+      inlineSignUpLink = false
+      break
+    default:
+  }
+  return {inlineError, inlineSignUpLink}
+}
+
+const UsernameOrEmailContainer = (op: OwnProps) => {
+  const styles = useStyles()
+  const {inlineError, inlineSignUpLink} = decodeInlineError(op.inlineErrorCode)
+  const error = inlineError && !inlineSignUpLink ? inlineError : ''
+  const resetBannerUser = op.fromReset ? op.username : undefined
+  const waiting = C.Waiting.useAnyWaiting(C.waitingKeyProvision)
+
+  const onForgotUsername = () => C.Router2.navigateAppend({name: 'forgotUsername', params: {}})
+  const requestAutoInvite = useRequestAutoInvite()
+  const [username, setUsername] = React.useState(op.username ?? '')
+  C.useOnMountOnce(() => {
+    if (op.autoSubmit && op.username) {
+      submitProvisionUsername(op.username)
+    }
+  })
+  const onSubmit = () => {
+    if (!waiting) submitProvisionUsername(username)
+  }
+  const onGoToSignup = () => {
+    requestAutoInvite(username)
+  }
+  // in a modal the box already scrolls
+  const inModal = !!Kb.useModalBox()
+
+  const card = (
+    <UserCard
+      style={styles.card}
+      avatarBackgroundStyle={styles.outerCardAvatar}
+      outerStyle={Kb.Styles.collapseStyles([styles.outerCard, inModal && styles.outerCardModal])}
+      avatarSize={96}
+    >
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        style={Kb.Styles.collapseStyles([styles.wrapper, inModal && styles.wrapperModal])}
+        gap="xsmall"
+      >
+        <Kb.Input3
+          autoFocus={true}
+          placeholder="Username"
+          testID={TestIDs.PROVISION_USERNAME_INPUT}
+          maxLength={C.maxUsernameLength}
+          onEnterKeyDown={onSubmit}
+          onChangeText={setUsername}
+          value={username}
+          textType="BodySemibold"
+        />
+        <Kb.Text style={styles.forgotUsername} type="BodySmallSecondaryLink" onClick={onForgotUsername}>
+          Forgot username?
+        </Kb.Text>
+      </Kb.Box2>
+    </UserCard>
+  )
+
+  return (
+    <SignupScreen
+      waitingOverlay={true}
+      banners={
+        <>
+          {resetBannerUser ? (
+            <Kb.Banner color="green" key="resetBanner">
+              <Kb.BannerParagraph
+                bannerColor="green"
+                content={`You have successfully reset your account, ${resetBannerUser}. You can now log in as usual.`}
+              />
+            </Kb.Banner>
+          ) : null}
+          {errorBanner(error)}
+          {inlineSignUpLink ? (
+            <Kb.Banner key="usernameTaken" color="blue">
+              <Kb.BannerParagraph
+                bannerColor="blue"
+                content={[
+                  "This username doesn't exist. Did you mean to ",
+                  {
+                    onClick: onGoToSignup,
+                    text: 'create a new account',
+                  },
+                  '?',
+                ]}
+              />
+            </Kb.Banner>
+          ) : null}
+        </>
+      }
+      buttons={[
+        {
+          disabled: !username,
+          label: 'Log in',
+          onClick: onSubmit,
+          type: 'Default',
+          waiting: waiting,
+        },
+      ]}
+      contentContainerStyle={styles.contentContainer}
+    >
+      {inModal ? (
+        card
+      ) : (
+        <Kb.ScrollView
+          alwaysBounceVertical={false}
+          style={styles.fill}
+          contentContainerStyle={styles.scrollContentContainer}
+        >
+          {card}
+        </Kb.ScrollView>
+      )}
+    </SignupScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      card: Kb.Styles.platformStyles({
+        common: {
+          alignItems: 'stretch',
+          backgroundColor: theme.transparent,
+        },
+        isMobile: {
+          ...Kb.Styles.paddingH(0),
+        },
+        isTablet: {alignItems: 'center'},
+      }),
+      contentContainer: Kb.Styles.platformStyles({isMobile: {...Kb.Styles.padding(0)}}),
+      fill: Kb.Styles.platformStyles({
+        isMobile: {...Kb.Styles.size('100%')},
+        isTablet: {width: 410},
+      }),
+      forgotUsername: {alignSelf: 'flex-end'},
+      outerCard: Kb.Styles.platformStyles({
+        common: {flex: 1},
+        isElectron: {height: 'unset'},
+      }),
+      outerCardAvatar: {backgroundColor: theme.transparent},
+      // UserCard is a fixed 410 wide on desktop, wider than a small modal box
+      outerCardModal: Kb.Styles.platformStyles({isElectron: {maxWidth: 410, width: '100%'}}),
+      scrollContentContainer: Kb.Styles.platformStyles({
+        isElectron: {margin: 'auto'},
+        isMobile: {...Kb.Styles.padding(Kb.Styles.globalMargins.small)},
+      }),
+      wrapper: {width: Kb.Styles.globalStyles.mediumWidth},
+      wrapperModal: Kb.Styles.platformStyles({isElectron: {width: '100%'}}),
+    }) as const
+)
+
+export default UsernameOrEmailContainer

@@ -1,0 +1,124 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import {formatTimeForPeopleItem} from '@/util/timestamp'
+import type {ButtonProps} from '@/common-adapters/button'
+
+type NonReactTaskButton = {
+  label: string
+  onClick: () => void
+  type?: ButtonProps['type']
+  mode?: ButtonProps['mode']
+  waiting?: ButtonProps['waiting']
+}
+
+export type TaskButton = NonReactTaskButton | React.ReactElement
+
+export type Props = {
+  badged: boolean
+  icon?: React.ReactNode
+  children: React.ReactNode
+  when?: Date
+  contentStyle?: Kb.Styles.StylesCrossPlatform
+  format?: 'single' | 'multi'
+  iconContainerStyle?: Kb.Styles.StylesCrossPlatform
+  buttons?: Array<TaskButton>
+}
+
+const PeopleItem = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} style={Kb.Styles.collapseStyles([styles.container, props.badged && styles.containerBadged])}>
+      {!!props.icon && (
+        <Kb.Box2 direction="vertical" style={Kb.Styles.collapseStyles([styles.iconContainer, props.iconContainerStyle])}>
+          {props.icon}
+        </Kb.Box2>
+      )}
+
+      <Kb.Box2
+        direction="vertical"
+        flex={1}
+        gap="xtiny"
+        overflow="hidden"
+        style={Kb.Styles.collapseStyles([styles.childrenContainer, props.contentStyle])}
+      >
+        {props.children}
+        <Kb.Box2 direction="horizontal" style={styles.actionContainer} alignItems="center" fullWidth={true} justifyContent="flex-start">
+          {props.buttons &&
+            props.buttons.length > 0 &&
+            props.buttons.map((b, idx) =>
+              React.isValidElement(b) ? (
+                <Kb.Box2 alignSelf="center" key={idx} direction="vertical" style={styles.button}>
+                  {b}
+                </Kb.Box2>
+              ) : (
+                <Kb.Button key={b.label} small={true} style={styles.button} {...b} />
+              )
+            )}
+        </Kb.Box2>
+      </Kb.Box2>
+      <Kb.Box2
+        direction="horizontal"
+        alignItems="center"
+        style={Kb.Styles.collapseStyles([
+          styles.timestampContainer,
+          props.format === 'multi' && styles.timestampContainerMulti,
+        ])}
+      >
+        {!!props.when && <Kb.Text type="BodyTiny">{formatTimeForPeopleItem(props.when.getTime())}</Kb.Text>}
+        {props.badged && (
+          <Kb.Badge badgeStyle={styles.badge} height={Kb.Styles.globalMargins.tiny} leftRightPadding={0} />
+        )}
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+export default PeopleItem
+
+const useStyles = Kb.Styles.createStyleHook(theme => ({
+  actionContainer: {
+    flexWrap: 'wrap',
+  },
+  badge: {
+    marginLeft: Kb.Styles.globalMargins.xtiny,
+  },
+  button: {marginBottom: Kb.Styles.globalMargins.xtiny, marginRight: Kb.Styles.globalMargins.tiny},
+  childrenContainer: {
+    position: 'relative',
+    width: 'auto',
+  },
+  container: Kb.Styles.platformStyles({
+    common: {
+      backgroundColor: theme.white,
+      ...Kb.Styles.bottomDivider(theme),
+      ...Kb.Styles.paddingV(Kb.Styles.globalMargins.xsmall),
+      position: 'relative',
+    },
+  }),
+  containerBadged: {
+    backgroundColor: theme.blueLighter2,
+    borderBottomColor: theme.white,
+  },
+  iconContainer: {
+    marginLeft: Kb.Styles.globalMargins.small,
+    marginRight: Kb.Styles.globalMargins.xsmall,
+    width: 48,
+  },
+  timestampContainer: Kb.Styles.platformStyles({
+    common: {
+      alignSelf: 'center',
+      marginLeft: 'auto',
+      marginRight: Kb.Styles.globalMargins.small,
+      marginTop: 6,
+    },
+    isElectron: {alignSelf: 'baseline'},
+    isMobile: {
+      position: 'relative',
+      top: -5,
+    },
+  }),
+  timestampContainerMulti: {
+    alignSelf: 'flex-start',
+    position: 'relative',
+    top: -2,
+  },
+}))

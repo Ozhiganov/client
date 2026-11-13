@@ -1,16 +1,16 @@
 #! /usr/bin/env bash
 
 # Prints out the binary name ("keybase", "kbstage", or "kbdev") that
-# corresponds to the current bulid mode. This script helps us avoid duplicating
+# corresponds to the current build mode. This script helps us avoid duplicating
 # the same switch statement in all of our packaging scripts.
 
 set -e -u -o pipefail
 
-here="$(dirname "$BASH_SOURCE")"
+here="$(dirname "${BASH_SOURCE[0]}")"
 
 mode="$("$here/build_mode.sh" "$@")"
 
-if [ "$mode" = "production" -o "$mode" = "prerelease" ] ; then
+if [ "$mode" = "production" ] || [ "$mode" = "prerelease" ] ; then
   echo keybase
 elif [ "$mode" = "staging" ] ; then
   echo kbstage

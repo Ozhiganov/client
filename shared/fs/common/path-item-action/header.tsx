@@ -1,0 +1,42 @@
+import type * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import PathItemInfo from '../path-item-info'
+import PathInfo from '../path-info'
+
+export type Props = {path: T.FS.Path}
+
+const Header = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <Kb.ClickableBox
+      onClick={
+        // This box is necessary as otherwise the click event propagates into
+        // the ListItem backed row.
+        e => e?.stopPropagation()
+      }
+      direction="vertical"
+      fullWidth={true}
+    >
+      <PathItemInfo path={props.path} containerStyle={styles.container} />
+      <Kb.Divider />
+      <PathInfo path={props.path} containerStyle={styles.container} />
+    </Kb.ClickableBox>
+  )
+}
+
+export default Header
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      container: Kb.Styles.platformStyles({
+        common: {
+          padding: Kb.Styles.globalMargins.small,
+        },
+        isMobile: {
+          paddingBottom: Kb.Styles.globalMargins.medium,
+          paddingTop: Kb.Styles.globalMargins.large,
+        },
+      }),
+    }) as const
+)

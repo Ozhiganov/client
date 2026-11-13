@@ -5,24 +5,22 @@ package libkb
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func parse(t *testing.T, kr string) *GpgKeyIndex {
+	tc := SetupTest(t, "parse", 2)
+	defer tc.Cleanup()
 	buf := bytes.NewBufferString(kr)
-	i, w, e := ParseGpgIndexStream(G, buf)
-	if e != nil {
-		t.Fatalf("failure in parse: %s", e)
-	}
+	i, w, e := ParseGpgIndexStream(tc.MetaContext(), buf)
+	require.NoError(t, e,
+		"failure in parse: %s", e)
 
-	if !w.IsEmpty() {
-		t.Errorf("Warnings in parsing:")
-		for _, e := range w.Warnings() {
-			t.Errorf(" - %s", e)
-		}
-		return nil
-	}
+	require.True(t, w.IsEmpty(), "Warnings in parsing")
 	return i
 }
 
@@ -31,67 +29,62 @@ func TestParseMyKeyring(t *testing.T) {
 }
 
 func TestFindMax(t *testing.T) {
+	t.Skip("all keys were expired")
 	index := parse(t, myKeyring)
-	keylist := index.Emails.Get("themax@gmail.com")
-	if keylist == nil {
-		t.Errorf("nil keylist was not expected")
-	} else if len(keylist) != 2 {
-		t.Errorf("expected two keys for max")
-	} else {
-		expected := map[string]bool{
-			"8EFBE2E4DD56B35273634E8F6052B2AD31A6631C": true,
-			"4475293306243408FA5958DC63847B4B83930F0C": true,
-		}
-		for _, k := range keylist {
-			if fp := k.GetFingerprint(); fp == nil {
-				t.Errorf("Unexpected empty fingerprint")
-			} else if ok, found := expected[strings.ToUpper(fp.String())]; !ok || !found {
-				t.Errorf("Unexpected fingerprint: %s", fp.String())
-			}
-		}
+	keylist := index.Emails.Get("max1@keybase.io")
+	require.NotNil(t, keylist, "nil keylist was not expected")
+	require.Len(t, keylist, 1, "expected one key for max, found %d", len(keylist))
+	expected := map[string]bool{
+		"F544F89FB9AFC481DCB26730D28390C6F7CDD0BA": true,
+	}
+	for _, k := range keylist {
+		fp := k.GetFingerprint()
+		require.NotNil(t, fp, "Unexpected empty fingerprint")
+		ok, found := expected[strings.ToUpper(fp.String())]
+		require.True(t, ok && found, "Unexpected fingerprint: %s", fp.String())
 	}
 }
 
 func TestYubikeyFixedSecretKeys(t *testing.T) {
 	index := parse(t, yubikey4fixed)
 	keylist := index.Emails.Get("dain@yubico.com")
-	if keylist == nil {
-		t.Errorf("nil keylist was not expected")
-	} else if len(keylist) != 1 {
-		t.Errorf("expected two keys for max")
-	}
+	require.NotNil(t, keylist, "nil keylist was not expected")
+	require.Len(t, keylist, 1, "expected two keys for max")
 }
 
 func TestYubikeyOrigSecretKeys(t *testing.T) {
 	index := parse(t, yubikey4orig)
 	keylist := index.Emails.Get("dain@yubico.com")
-	if keylist != nil {
-		t.Errorf("nil keylist was expected")
-	}
+	require.Nil(t, keylist, "nil keylist was expected")
 }
 
 func TestGPGIndex2Dot1(t *testing.T) {
 	index := parse(t, gpg2dot1)
-	if index == nil {
-		t.Fatal("parsing failed")
-	}
+	require.NotNil(t, index,
+		"parsing failed")
 	keylist := index.Emails.Get("themax+test@gmail.com")
-	if keylist == nil {
-		t.Errorf("nil keylist was not expected")
-	} else if len(keylist) != 1 {
-		t.Errorf("expected one key for max")
-	}
+	require.NotNil(t, keylist, "nil keylist was not expected")
+	require.Len(t, keylist, 1, "expected one key for max")
 }
 
 func TestGPGFindGreg(t *testing.T) {
 	index := parse(t, greg)
-	if index == nil {
-		t.Fatal("parsing failed")
-	}
+	require.NotNil(t, index,
+		"parsing failed")
 	keys := index.Fingerprints.Get("6A457A06CB07E916EC88EC741193ACD196ED61F2")
-	if len(keys) == 0 {
-		t.Fatal("expected to find greg's key")
+	require.NotEmpty(t, keys, "expected to find greg's key")
+}
+
+func TestGPGRevokedID(t *testing.T) {
+	index := parse(t, keyringRevokedID)
+	require.NotNil(t, index,
+		"parsing failed")
+	keys := index.Fingerprints.Get("582AB5DE7B6BB11F6E2B7075851B3498422B2DFA")
+	require.Len(t, keys, 1, "expected to find one key")
+	if numIDs := len(keys[0].identities); numIDs != 1 {
+		require.FailNow(t, fmt.Sprintf("expected to have one identity (got %v)", numIDs))
 	}
+	require.Equal(t, "This One WIll be rev0ked", keys[0].identities[0].Format(), "Invalid identity: %v", keys[0].identities[0])
 }
 
 const myKeyring = `
@@ -124,11 +117,11 @@ fpr:::::::::222B85B0F90BE2D24CFEB93F47484E50656D16C7:
 uid:u::::1384876967::5379B9706C5D468C86A572B07E28EBDB26BE0E97::Keybase.io Code Signing (v1) <code@keybase.io>:
 sub:u:4096:1:5929664098F03378:1384876967:1511107367:::::e:
 fpr:::::::::10F79F9BEB724B73FB673D385929664098F03378:
-pub:u:4096:1:63847B4B83930F0C:1380929487:1507159887::u:::escaESCA:
+pub:u:4096:1:63847B4B83930F0C:1380929487:1607159887::u:::escaESCA:
 fpr:::::::::4475293306243408FA5958DC63847B4B83930F0C:
 uid:u::::1387217771::759D5C7C38AD60551D46D2E6F34BA03640FE4379::Maxwell Krohn <themax@gmail.com>:
 uid:u::::1380929487::14BC0C35326061518657E0B8F71A23E0CA537034::Max Krohn <themax@gmail.com>:
-sub:u:4096:1:2FE01C454348DA39:1380929487:1507159887:::::esa:
+sub:u:4096:1:2FE01C454348DA39:1380929487:1607159887:::::esa:
 fpr:::::::::C4EE7BCBCE2F0953DCF9E8902FE01C454348DA39:
 pub:u:2048:1:2EE0695E30C55BEF:1392816673:1708176673::u:::scESC:
 fpr:::::::::F1DEFAA6B3DB297FB824CB512EE0695E30C55BEF:
@@ -257,6 +250,7 @@ ssb:u:256:18:A0E78D11A79FE1EF:1475200495::::::e:::+::cv25519:
 fpr:::::::::39DC5F5D9252DDA6F5BF660CA0E78D11A79FE1EF:
 grp:::::::::7872FB84783726E5B066CEF45D6DEC2F2364A2A5:
 `
+
 const greg = `
 sec:u:1024:17:1193ACD196ED61F2:1149381441:::u:::scESC:::+::::
 fpr:::::::::6A457A06CB07E916EC88EC741193ACD196ED61F2:
@@ -269,4 +263,15 @@ uid:u::::1292846928::C9A8CEFCDA1CEF8706A5B815EE4027F1340F209F::Gregory Martin Pf
 ssb:u:2048:16:35259A50693B4429:1149381489::::::e:::+:::
 fpr:::::::::82E14B2AF315373CFFA88C8335259A50693B4429:
 grp:::::::::36714469BDCD99CD5748B39D9463E3DD06BEE2CC:
+`
+
+const keyringRevokedID = `
+sec:u:256:22:851B3498422B2DFA:1491212600:::u:::scESC:::+::ed25519::
+fpr:::::::::582AB5DE7B6BB11F6E2B7075851B3498422B2DFA:
+grp:::::::::45712C069D5ECB349A11DE7C7155E66D1D3E9BC3:
+uid:u::::1491212618::999BA342C3370F86AAE7A163C67EA2518F69ECFE::This One WIll be rev0ked:::::::::
+uid:r::::::30EC553EACC420881282218E39CEDA11E722D937::Hello AA:::::::::
+ssb:u:256:18:151E2B742F97B843:1491212600::::::e:::+::cv25519:
+fpr:::::::::2DEBE37BF89745512A87C69D151E2B742F97B843:
+grp:::::::::788233E7043694A6C4D9DE4562FEC67972C0CBF9:
 `

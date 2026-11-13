@@ -1,0 +1,165 @@
+import {ensureError, RPCError} from '@/util/errors'
+import {printOutstandingRPCs} from '@/local-debug'
+import {getAccountGeneration, survivesAccountChange} from './account-generation'
+import {
+  inputCanceledError,
+  type ClientCancelReason,
+  type CommonResponseHandler,
+  type ResponseType,
+} from './types'
+import {wrapErrors} from '@/util/debug'
+import type {CallPort, ListenParams} from './call-port'
+import {accountChangedError, type DeferRun} from './session'
+
+type ListenEngine = {
+  call: CallPort['call']
+  cancelSession: (sessionID: number, reason?: ClientCancelReason) => void
+  holdServerWork: (sessionID: number) => () => void
+}
+
+export const makeListen = (engine: ListenEngine) => async (p: ListenParams) => {
+  return new Promise((resolve, reject) => {
+    const {method, params, waitingKey} = p
+    const incomingCallMap = (p.incomingCallMap || {}) as {[K in string]: (params: unknown) => Promise<void>}
+    const customResponseIncomingCallMap = (p.customResponseIncomingCallMap || {}) as {
+      [K in string]: (params: unknown, response: Partial<CommonResponseHandler>) => Promise<void>
+    }
+
+    // Handler runs whose timer has not fired yet. The session acks a plain call at once, so the
+    // service may reply before they run; the call settles only once they have, so a caller that
+    // awaits it sees what they write before their first await. What a handler writes after an
+    // await of its own is not ordered with the reply.
+    const pendingRuns = new Set<Promise<void>>()
+
+    // Handlers run on a timer so transport work can flush before heavier state updates. By then an
+    // account switch may have reset the stores the handler writes to, unless this call outlives it.
+    const runDeferred = (
+      run: () => Promise<void>,
+      onStale: () => void,
+      onFailed: () => void,
+      handlerMethod: string
+    ) => {
+      const generation = getAccountGeneration()
+      let fired = () => {}
+      const firing = new Promise<void>(resolve => {
+        fired = resolve
+      })
+      pendingRuns.add(firing)
+      setTimeout(() => {
+        try {
+          if (getAccountGeneration() !== generation && !survivesAccountChange(method)) {
+            onStale()
+            return
+          }
+          // wrapErrors logs the failure
+          wrapErrors(run, handlerMethod)().catch(onFailed)
+        } finally {
+          // Up to the handler's first await only: one that then waits on the user must not hold the call
+          pendingRuns.delete(firing)
+          fired()
+        }
+      }, 0)
+    }
+
+    if (__DEV__) {
+      for (const m of Object.keys(incomingCallMap)) {
+        if (customResponseIncomingCallMap[m]) {
+          throw new Error(`Invalid method in both incomingCallMap and customResponseIncomingCallMap: ${m}`)
+        }
+      }
+    }
+
+    // The session acks these itself
+    const plainMap: {[key: string]: (params: unknown) => void} = {}
+    for (const m of Object.keys(incomingCallMap)) {
+      plainMap[m] = (params: unknown) => {
+        runDeferred(async () => incomingCallMap[m]?.(params), () => {}, () => {}, m)
+      }
+    }
+
+    const customMap: {[key: string]: (params: unknown, response: ResponseType, deferRun: DeferRun) => void} = {}
+    for (const m of Object.keys(customResponseIncomingCallMap)) {
+      customMap[m] = (params: unknown, response: ResponseType, deferRun: DeferRun) => {
+        // The session learns whether the handler answered once it has run
+        const ran = deferRun()
+        // The service is still waiting on this prompt, and no handler will answer it
+        const refuse = () => {
+          if (!response.settled) {
+            response.error?.(inputCanceledError)
+          }
+        }
+        runDeferred(
+          async () => {
+            // Settled meanwhile: the session ended or was cancelled, so nothing reads this answer
+            if (response.settled) {
+              return
+            }
+            const handler = customResponseIncomingCallMap[m]
+            // Gone since the listener started (a hot reload): nothing will answer it
+            if (!handler) {
+              refuse()
+              return
+            }
+            const answered = handler(params, response as Partial<CommonResponseHandler>)
+            ran()
+            await answered
+          },
+          refuse,
+          refuse,
+          m
+        )
+      }
+    }
+
+    // Make the actual call
+    let outstandingIntervalID: ReturnType<typeof setInterval>
+    if (printOutstandingRPCs) {
+      outstandingIntervalID = setInterval(() => {
+        console.log('Engine/Listener with a still-alive eventChannel for method:', method)
+      }, 2000)
+    }
+
+    const sessionID = engine.call({
+      callback: (error?: RPCError, params?: unknown) => {
+        if (printOutstandingRPCs) {
+          clearInterval(outstandingIntervalID)
+        }
+
+        const settle = () => {
+          if (error) {
+            // The RPCError itself, as the promise RPCs reject with, so callers can match on it
+            // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+            reject(error instanceof RPCError ? error : ensureError(error))
+          } else {
+            resolve(params)
+          }
+        }
+        if (pendingRuns.size) {
+          // The session has ended, so an account switch while the handlers wait no longer cancels it
+          const generation = getAccountGeneration()
+          void Promise.all(pendingRuns).then(() => {
+            if (getAccountGeneration() !== generation && !survivesAccountChange(method)) {
+              // An RPCError, as the session rejects with for an account change
+              // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+              reject(accountChangedError())
+            } else {
+              settle()
+            }
+          })
+        } else {
+          settle()
+        }
+      },
+      customResponseIncomingCallMap: customMap,
+      // Always a list, so an unhandled incoming method on a listener is checked against it
+      globalFallthrough: p.globalFallthrough ?? [],
+      incomingCallMap: plainMap,
+      method,
+      params,
+      waitingKey,
+    })
+    p.onSessionCreated?.(reason => engine.cancelSession(sessionID, reason), {
+      holdServerWork: () => engine.holdServerWork(sessionID),
+    })
+  })
+}

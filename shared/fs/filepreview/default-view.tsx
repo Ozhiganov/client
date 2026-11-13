@@ -1,0 +1,134 @@
+import * as T from '@/constants/types'
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import {PathItemAction, LastModifiedLine, ItemIcon, type ClickableProps} from '../common'
+import {
+  useFsDownload,
+  useFsErrorActionOrThrow,
+  useFsFileContext,
+  useOpenPathInSystemFileManagerDesktop,
+  useSystemFileManagerIntegration,
+} from '../common'
+import {hasShare} from '../common/path-item-action/layout'
+import * as FS from '@/constants/fs'
+
+type OwnProps = {path: T.FS.Path}
+
+const Share = (p: ClickableProps) => {
+  const {onClick, mref} = p
+  return <Kb.Button key="share" label="Share" onClick={onClick} ref={mref} />
+}
+
+const Container = (ownProps: OwnProps) => {
+  const styles = useStyles()
+  const {path} = ownProps
+  const {fileContext, pathItem} = useFsFileContext(path)
+  const errorToActionOrThrow = useFsErrorActionOrThrow()
+  const _download = useFsDownload()
+  const {driverStatus} = useSystemFileManagerIntegration()
+  const openPathInSystemFileManagerDesktop = useOpenPathInSystemFileManagerDesktop()
+  const sfmiEnabled = driverStatus.type === T.FS.DriverStatusType.Enabled
+  const download = () => {
+    _download(path, 'download')
+  }
+  const showInSystemFileManager = () => {
+    openPathInSystemFileManagerDesktop(path, errorToActionOrThrow)
+  }
+  return (
+    <Kb.Box2 direction="vertical" fullWidth={true} fullHeight={true} style={styles.container}>
+      <Kb.Box2
+        direction="vertical"
+        fullWidth={true}
+        fullHeight={true}
+        centerChildren={true}
+        flex={1}
+        style={styles.innerContainer}
+      >
+        <ItemIcon path={path} size={96} />
+        <Kb.Text type="BodyBig" style={styles.filename}>
+          {pathItem.name}
+        </Kb.Text>
+        {pathItem.type === T.FS.PathType.File && (
+          <Kb.Text type="BodySmall">{FS.humanReadableFileSize(pathItem.size)}</Kb.Text>
+        )}
+        {isMobile && <LastModifiedLine path={path} mode="default" />}
+        {pathItem.type === T.FS.PathType.Symlink && (
+          <Kb.Text type="BodySmall" style={styles.symlink}>
+            {'This is a symlink' + (pathItem.linkTarget ? ` to: ${pathItem.linkTarget}.` : '.')}
+          </Kb.Text>
+        )}
+        {isMobile && (
+          <Kb.Text center={true} type="BodySmall" style={styles.noOpenMobile}>
+            This document can not be opened on mobile. You can still interact with it using the ••• menu.
+          </Kb.Text>
+        )}
+        {
+          // Enable this button for desktop when we have in-app sharing.
+          hasShare('screen', path, pathItem, fileContext) && (
+            <>
+              <Kb.Box2 direction="vertical" gap="medium" gapStart={true} />
+              <PathItemAction
+                clickable={{
+                  component: Share,
+                  type: 'component',
+                }}
+                path={path}
+                initView={T.FS.PathItemActionMenuView.Share}
+                mode="screen"
+              />
+            </>
+          )
+        }
+        {!isIOS &&
+          (sfmiEnabled ? (
+            <Kb.Button
+              key="open"
+              type="Dim"
+              label={'Show in ' + C.fileUIName}
+              style={{marginTop: Kb.Styles.globalMargins.small}}
+              onClick={showInSystemFileManager}
+            />
+          ) : (
+            <Kb.Button
+              key="download"
+              mode="Secondary"
+              label="Download"
+              style={{marginTop: Kb.Styles.globalMargins.small}}
+              onClick={download}
+            />
+          ))}
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      container: Kb.Styles.platformStyles({
+        isElectron: {padding: Kb.Styles.globalMargins.medium},
+        isMobile: {paddingTop: Kb.Styles.globalMargins.mediumLarge},
+      }),
+      filename: {
+        marginBottom: Kb.Styles.globalMargins.tiny,
+        marginTop: Kb.Styles.globalMargins.small,
+      },
+      innerContainer: Kb.Styles.platformStyles({
+        common: {
+          backgroundColor: theme.white,
+          ...Kb.Styles.globalStyles.flexGrow,
+        },
+        isMobile: {
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.large),
+        },
+      }),
+      noOpenMobile: {
+        marginTop: Kb.Styles.globalMargins.medium,
+      },
+      symlink: {
+        marginTop: Kb.Styles.globalMargins.medium,
+      },
+    }) as const
+)
+
+export default Container

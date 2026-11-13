@@ -4,37 +4,48 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"sync"
+	"time"
 
 	"github.com/keybase/client/go/engine"
+	"github.com/keybase/client/go/gregor"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"golang.org/x/net/context"
 )
+
+const deviceSyncTTL = 30 * time.Second
 
 // DeviceHandler is the RPC handler for the device interface.
 type DeviceHandler struct {
 	*BaseHandler
 	libkb.Contextified
+	gregor         *gregorHandler
+	syncMu         sync.Mutex
+	lastDeviceSync time.Time
 }
 
 // NewDeviceHandler creates a DeviceHandler for the xp transport.
-func NewDeviceHandler(xp rpc.Transporter, g *libkb.GlobalContext) *DeviceHandler {
+func NewDeviceHandler(xp rpc.Transporter, g *libkb.GlobalContext, gregor *gregorHandler) *DeviceHandler {
 	return &DeviceHandler{
-		BaseHandler:  NewBaseHandler(xp),
+		BaseHandler:  NewBaseHandler(g, xp),
 		Contextified: libkb.NewContextified(g),
+		gregor:       gregor,
 	}
 }
 
 // DeviceList returns a list of all the devices for a user.
-func (h *DeviceHandler) DeviceList(_ context.Context, sessionID int) ([]keybase1.Device, error) {
-	ctx := &engine.Context{
+func (h *DeviceHandler) DeviceList(ctx context.Context, sessionID int) ([]keybase1.Device, error) {
+	uis := libkb.UIs{
 		LogUI:     h.getLogUI(sessionID),
 		SessionID: sessionID,
 	}
 	eng := engine.NewDevList(h.G())
-	if err := engine.RunEngine(eng, ctx); err != nil {
+	m := libkb.NewMetaContext(ctx, h.G()).WithUIs(uis)
+	if err := engine.RunEngine2(m, eng); err != nil {
 		return nil, err
 	}
 	return eng.List(), nil
@@ -43,29 +54,53 @@ func (h *DeviceHandler) DeviceList(_ context.Context, sessionID int) ([]keybase1
 // DeviceHistoryList returns a list of all the devices for a user,
 // with detailed history and provisioner, revoker information.
 func (h *DeviceHandler) DeviceHistoryList(nctx context.Context, sessionID int) ([]keybase1.DeviceDetail, error) {
-	ctx := &engine.Context{
-		LogUI:      h.getLogUI(sessionID),
-		NetContext: nctx,
-		SessionID:  sessionID,
+	uis := libkb.UIs{
+		LogUI:     h.getLogUI(sessionID),
+		SessionID: sessionID,
 	}
 	eng := engine.NewDeviceHistorySelf(h.G())
-	if err := engine.RunEngine(eng, ctx); err != nil {
+	m := libkb.NewMetaContext(nctx, h.G()).WithUIs(uis)
+	if err := engine.RunEngine2(m, eng); err != nil {
 		return nil, err
 	}
+	// After returning cached data quickly, refresh secrets in the background
+	// so lastUsedTime values stay current. Fires deviceHistoryChanged when done
+	// so the UI reloads. Debounced to avoid redundant syncs.
+	h.syncMu.Lock()
+	defer h.syncMu.Unlock()
+	if time.Since(h.lastDeviceSync) > deviceSyncTTL {
+		h.lastDeviceSync = time.Now()
+		go h.backgroundSyncDevices()
+	}
 	return eng.Devices(), nil
+}
+
+func (h *DeviceHandler) backgroundSyncDevices() {
+	mctx := libkb.NewMetaContext(context.Background(), h.G())
+	if _, err := mctx.ActiveDevice().SyncSecretsForce(mctx); err != nil {
+		mctx.Debug("DeviceHandler#backgroundSyncDevices error: %v", err)
+		// Reset so the next UI refresh can retry instead of waiting out the TTL.
+		h.syncMu.Lock()
+		defer h.syncMu.Unlock()
+		h.lastDeviceSync = time.Time{}
+		return
+	}
+	if nr := h.G().NotifyRouter; nr != nil {
+		nr.HandleDeviceHistoryChanged()
+	}
 }
 
 // DeviceAdd starts the kex2 device provisioning on the
 // provisioner (device X/C1)
 func (h *DeviceHandler) DeviceAdd(c context.Context, sessionID int) error {
-	ctx := &engine.Context{
+	uis := libkb.UIs{
 		ProvisionUI: h.getProvisionUI(sessionID),
 		SecretUI:    h.getSecretUI(sessionID, h.G()),
 		SessionID:   sessionID,
-		NetContext:  c,
 	}
+	m := libkb.NewMetaContext(c, h.G()).WithUIs(uis)
 	eng := engine.NewDeviceAdd(h.G())
-	return engine.RunEngine(eng, ctx)
+	return engine.RunEngine2(m, eng)
 }
 
 // CheckDeviceNameFormat verifies that the device name has a valid
@@ -78,10 +113,62 @@ func (h *DeviceHandler) CheckDeviceNameFormat(_ context.Context, arg keybase1.Ch
 	return false, errors.New(libkb.CheckDeviceName.Hint)
 }
 
-func (h *DeviceHandler) CheckDeviceNameForUser(_ context.Context, arg keybase1.CheckDeviceNameForUserArg) error {
-	_, err := h.G().API.Get(libkb.APIArg{
+type _deviceChange struct {
+	DeviceID string `json:"device_id"`
+}
+
+func LoopAndDismissForDeviceChangeNotifications(mctx libkb.MetaContext, dismisser libkb.GregorState,
+	gregorState gregor.State, exceptedDeviceID string,
+) (err error) {
+	items, err := gregorState.Items()
+	if err != nil {
+		return err
+	}
+	var body _deviceChange
+	for _, item := range items {
+		category := item.Category().String()
+		if category != "device.revoked" && category != "device.new" {
+			continue
+		}
+		err := json.Unmarshal(item.Body().Bytes(), &body)
+		if err != nil {
+			return err
+		}
+		itemID := item.Metadata().MsgID()
+		if body.DeviceID != exceptedDeviceID {
+			mctx.Debug("dismissing device notification %s for %s", category, body.DeviceID)
+			err := dismisser.DismissItem(mctx.Ctx(), nil, itemID)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (h *DeviceHandler) DismissDeviceChangeNotifications(c context.Context) (err error) {
+	mctx := libkb.NewMetaContext(c, h.G())
+	defer mctx.Trace("DismissDeviceChangeNotifications", &err)()
+
+	gcli, err := h.gregor.getGregorCli()
+	if err != nil {
+		return err
+	}
+	state, err := gcli.StateMachineState(c, nil, true)
+	if err != nil {
+		return err
+	}
+	activeDeviceID := h.G().ActiveDevice.DeviceID().String()
+	dismisser := h.G().GregorState
+	err = LoopAndDismissForDeviceChangeNotifications(mctx, dismisser, state, activeDeviceID)
+	return err
+}
+
+func (h *DeviceHandler) CheckDeviceNameForUser(ctx context.Context, arg keybase1.CheckDeviceNameForUserArg) error {
+	mctx := libkb.NewMetaContext(ctx, h.G())
+	_, err := mctx.G().API.Get(mctx, libkb.APIArg{
 		Endpoint:    "device/check_name",
-		NeedSession: false,
+		SessionType: libkb.APISessionTypeNONE,
 		Args: libkb.HTTPArgs{
 			"username":   libkb.S{Val: arg.Username},
 			"devicename": libkb.S{Val: arg.Devicename},

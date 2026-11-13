@@ -1,0 +1,193 @@
+/// <reference types="vite/client" />
+// Entry point to the chrome part of the app
+import Main from '@/app/main'
+// order of the above must NOT change. needed for patching / hot loading to be correct
+import * as C from '@/constants'
+import * as React from 'react'
+import * as ReactDOM from 'react-dom/client'
+import type * as RemoteGen from '@/constants/remote-actions'
+import {makeEngine} from '@/engine'
+import {disableDragDrop} from '@/util/drag-drop.desktop'
+import {initDesktopStyles} from '@/styles'
+import {isWindows} from '@/constants/platform'
+import KB2 from '@/util/electron'
+import {useConfigState} from '@/stores/config'
+import {useShellState} from '@/stores/shell'
+import {ignorePromise} from '@/constants/utils'
+import {setServiceDecoration} from '@/common-adapters/markdown/react'
+import ServiceDecoration from '@/common-adapters/markdown/service-decoration'
+import {useDarkModeState} from '@/stores/darkmode'
+import {initPlatformListener, onEngineConnected, onEngineDisconnected, onEngineIncoming} from '@/constants/init/index'
+import {eventFromRemoteWindows} from './remote-event-handler.desktop'
+import type {default as NewMainType} from '../../app/main'
+import {dumpLogs} from '@/util/storeless-actions'
+import {listenForCspViolations} from './csp-violations.desktop'
+import {onDesktopNotificationEvent} from '@/util/desktop-notifications'
+// the visual gate's dev-only fixture runtime; production builds resolve this to an empty module
+import '@/tests/e2e/visual/fixtures/runtime'
+setServiceDecoration(ServiceDecoration)
+listenForCspViolations()
+
+const {ipcRendererOn, requestWindowsStartService, appStartedUp} = KB2.functions
+
+// Top level HMR accept
+if (import.meta.hot) {
+  import.meta.hot.accept()
+}
+
+const onEngineLink = (up: boolean) => {
+  if (up) {
+    onEngineConnected()
+  } else {
+    onEngineDisconnected()
+  }
+}
+
+const setupApp = async () => {
+  disableDragDrop()
+
+  const {batch} = C.useWaitingState.getState().dispatch
+  const eng = makeEngine(batch, onEngineLink, onEngineIncoming)
+
+  ipcRendererOn?.('KBdispatchAction', (action: unknown) => {
+    setTimeout(() => {
+      try {
+        eventFromRemoteWindows(action as RemoteGen.Actions)
+      } catch {}
+    }, 0)
+  })
+
+  ipcRendererOn?.('KBnotification', onDesktopNotificationEvent)
+
+  initPlatformListener()
+
+  // The main process sends this renderer the engine link's state, a fresh link on a reload
+  await appStartedUp?.()
+
+  useShellState.getState().dispatch.initNotifySound()
+  ignorePromise(useShellState.getState().dispatch.initDesktopNotifications())
+  useShellState.getState().dispatch.initForceSmallNav()
+  useShellState.getState().dispatch.initOpenAtLogin()
+  useConfigState.getState().dispatch.initAppUpdateLoop()
+  eng.listenersAreReady()
+
+  // See if we're connected, and try starting keybase if not
+  if (isWindows) {
+    setTimeout(() => {
+      requestWindowsStartService?.()
+    }, 0)
+  }
+
+  // After a delay dump logs in case some startup stuff happened
+  setTimeout(() => {
+    dumpLogs('startup')
+      .then(() => {})
+      .catch(() => {})
+  }, 5 * 1000)
+}
+
+const useDarkHookup = () => {
+  const initedRef = React.useRef(false)
+  const setSystemDarkMode = useDarkModeState(s => s.dispatch.setSystemDarkMode)
+  React.useEffect(() => {
+    const m = window.matchMedia('(prefers-color-scheme: dark)')
+    if (!initedRef.current) {
+      initedRef.current = true
+      setSystemDarkMode(m.matches)
+    }
+
+    const handler = (e: MediaQueryListEvent) => {
+      setSystemDarkMode(e.matches)
+    }
+    m.addEventListener('change', handler)
+    return () => {
+      m.removeEventListener('change', handler)
+    }
+  }, [setSystemDarkMode])
+}
+
+const Root = ({children}: {children: React.ReactNode}): React.ReactNode => {
+  useDarkHookup()
+  return children
+}
+
+// awaited before first render so text (and canvas measurements of it) always uses real fonts
+const preloadFonts = async () => {
+  await Promise.all(
+    [
+      '400 16px "kb"',
+      '500 16px "Source Code Pro"',
+      '600 16px "Source Code Pro"',
+      '400 16px "Keybase"',
+      'italic 400 16px "Keybase"',
+      '600 16px "Keybase"',
+      'italic 600 16px "Keybase"',
+      '700 16px "Keybase"',
+      'italic 700 16px "Keybase"',
+    ].map(async f => document.fonts.load(f).catch(() => {}))
+  )
+}
+
+// Cache React root across HMR to avoid remounting the entire tree
+// eslint-disable-next-line
+const _rootRef: {current?: ReactDOM.Root} = (globalThis as any).__hmr_reactRoot ??= {}
+
+const render = (Component = Main) => {
+  const rootEl = document.getElementById('root')
+  if (!rootEl) {
+    throw new Error('No root element?')
+  }
+
+  if (!_rootRef.current) {
+    _rootRef.current = ReactDOM.createRoot(rootEl)
+  }
+
+  _rootRef.current.render(
+    <React.StrictMode>
+      <Root>
+        <div style={{display: 'flex', flex: 1}}>
+          <Component />
+        </div>
+      </Root>
+    </React.StrictMode>
+  )
+}
+
+const setupHMR = () => {
+  if (!import.meta.hot) {
+    return
+  }
+
+  // Re-render with the new Main on hot update. Component-level edits are handled
+  // by react-refresh (@vitejs/plugin-react); this covers a full Main swap.
+  import.meta.hot.accept('@/app/main', newModule => {
+    const NewMain = (newModule as {default?: typeof NewMainType} | undefined)?.default
+    if (NewMain) {
+      try {
+        render(NewMain)
+      } catch {}
+    }
+  })
+}
+
+const load = async () => {
+  if (global.DEBUGLoaded) {
+    // HMR detected — keep the existing engine/transport and rebind it to the
+    // new module instance so incoming RPCs hit the current handlers.
+    console.log('HMR: rebinding engine and reinitializing store subscriptions')
+    const {batch} = C.useWaitingState.getState().dispatch
+    const eng = makeEngine(batch, onEngineLink, onEngineIncoming)
+    initPlatformListener()
+    eng.listenersAreReady()
+    return
+  }
+  global.DEBUGLoaded = true
+  initDesktopStyles()
+  const fontsLoaded = preloadFonts()
+  await setupApp()
+  await fontsLoaded
+  setupHMR()
+  render()
+}
+
+void load()

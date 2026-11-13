@@ -1,0 +1,178 @@
+import * as C from '@/constants'
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import {useSafeNavigation} from '@/util/safe-navigation'
+import {pluralize} from '@/util/string'
+import {useChatTeamMembers} from '../team-hooks'
+import {useConversationMetadata} from '../data-hooks'
+import {refreshConversationParticipants} from '@/chat/inbox/refresh-participants'
+import {getChatRpc} from '../chat-rpc'
+
+type Props = {conversationIDKey?: T.Chat.ConversationIDKey; teamID: T.Teams.TeamID}
+
+// bulkAddToConv only posts a system message - nothing recomputes the channel's
+// participants, so the refresh is what makes every open members list show the new members.
+export const addMembersToChannel = async (
+  conversationIDKey: T.Chat.ConversationIDKey,
+  usernames: ReadonlyArray<string>
+) => {
+  await getChatRpc().addToConversation(conversationIDKey, usernames)
+  await refreshConversationParticipants([conversationIDKey])
+}
+
+const AddToChannel = (props: Props) => {
+  const conversationIDKey = props.conversationIDKey ?? T.Chat.noConversationIDKey
+  return <AddToChannelInner {...props} conversationIDKey={conversationIDKey} />
+}
+
+const AddToChannelInner = (props: Props & {conversationIDKey: T.Chat.ConversationIDKey}) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {conversationIDKey, teamID} = props
+  const nav = useSafeNavigation()
+  const {meta, participants: participantInfo} = useConversationMetadata(conversationIDKey)
+  const channelname = meta.channelname
+
+  const [toAdd, setToAdd] = React.useState(new Set<string>())
+  const [filter, setFilter] = React.useState('')
+  const filterLCase = filter.toLowerCase()
+
+  const participants = participantInfo.all
+  const {loading: loadingMembers, members: teamMembers} = useChatTeamMembers(teamID)
+  const allMembers = [...teamMembers.values()]
+    .filter(m => m.type !== 'restrictedbot' && m.type !== 'bot')
+    .sort((a, b) => a.username.localeCompare(b.username))
+  const membersFiltered = allMembers.filter(
+    m => m.username.toLowerCase().includes(filterLCase) || m.fullName.toLowerCase().includes(filterLCase)
+  )
+
+  const [waiting, setWaiting] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const addToChannel = C.useRPC(addMembersToChannel)
+
+  const onClose = React.useCallback(() => {
+    nav.safeNavigateUp()
+  }, [nav])
+  const onAdd = React.useCallback(() => {
+    setWaiting(true)
+    addToChannel(
+      [conversationIDKey, [...toAdd]],
+      () => {
+        setWaiting(false)
+        onClose()
+      },
+      e => {
+        setError(e.message)
+        setWaiting(false)
+      }
+    )
+  }, [addToChannel, conversationIDKey, onClose, toAdd])
+
+  const loading = loadingMembers && !allMembers.length
+
+  Kb.useModalHeaderAction({
+    enabled: toAdd.size > 0,
+    label: 'Add',
+    onAction: onAdd,
+    title: `Add to #${channelname}`,
+    waiting,
+  })
+
+  return (
+    <Kb.ModalScreen
+      scroll={false}
+      padding="none"
+      banner={error ? <Kb.Banner color="red">{error}</Kb.Banner> : undefined}
+      footer={
+        isMobile ? undefined : (
+          <Kb.ConfirmButtons
+            split={true}
+            waiting={waiting}
+            onCancel={onClose}
+            onConfirm={onAdd}
+            confirmLabel={toAdd.size ? `Add ${toAdd.size} ${pluralize('member', toAdd.size)}` : 'Add...'}
+            confirmDisabled={!toAdd.size}
+          />
+        )
+      }
+    >
+      <Kb.Box2 direction="horizontal" fullWidth={true}>
+        <Kb.SearchFilter
+          onChange={text => setFilter(text)}
+          size="full-width"
+          placeholderText={
+            loading ? 'Loading...' : `Search ${allMembers.length} ${pluralize('member', allMembers.length)}`
+          }
+          style={styles.filterInput}
+        />
+      </Kb.Box2>
+      <Kb.BoxGrow2>
+        <Kb.List
+          keyProperty="username"
+          items={membersFiltered}
+          extraData={toAdd}
+          renderItem={(idx, item) => {
+            const alreadyIn = participants.includes(item.username)
+            const onCheck = () => {
+              if (toAdd.has(item.username)) {
+                toAdd.delete(item.username)
+                setToAdd(new Set(toAdd))
+              } else {
+                toAdd.add(item.username)
+                setToAdd(new Set(toAdd))
+              }
+            }
+            return (
+              <Kb.ListItem
+                firstItem={!isMobile || idx === 0}
+                icon={<Kb.Avatar size={32} username={item.username} />}
+                type="Small"
+                onClick={alreadyIn ? undefined : onCheck}
+                hideHover={alreadyIn}
+                body={
+                  <Kb.Box2 direction="vertical" alignItems="flex-start">
+                    <Kb.ConnectedUsernames type="BodyBold" colorFollowing={true} usernames={item.username} />
+                    <Kb.Text type="BodySmall" lineClamp={1}>
+                      {alreadyIn && <Kb.Text type="BodySmall">Already in{!!item.fullName && ' • '}</Kb.Text>}
+                      {item.fullName}
+                    </Kb.Text>
+                  </Kb.Box2>
+                }
+                action={
+                  <Kb.CheckCircle
+                    key={idx}
+                    onCheck={onCheck}
+                    checked={alreadyIn || toAdd.has(item.username)}
+                    disabled={alreadyIn}
+                    disabledColor={
+                      alreadyIn || toAdd.has(item.username)
+                        ? theme.black_20OrWhite_20
+                        : undefined
+                    }
+                    style={styles.checkCircle}
+                  />
+                }
+              />
+            )
+          }}
+          itemHeight={{sizeType: 'Small', type: 'fixedListItemAuto'}}
+        />
+      </Kb.BoxGrow2>
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  checkCircle: {
+    paddingRight: isMobile ? Kb.Styles.globalMargins.small : Kb.Styles.globalMargins.tiny,
+  },
+  filterInput: Kb.Styles.platformStyles({
+    isElectron: {
+      ...Kb.Styles.marginH(Kb.Styles.globalMargins.small),
+      ...Kb.Styles.marginV(Kb.Styles.globalMargins.tiny),
+    },
+  }),
+}))
+
+export default AddToChannel

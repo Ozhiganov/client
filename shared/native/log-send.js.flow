@@ -1,4 +1,0 @@
-// @flow
-declare function logSend(): Promise<string>
-
-export default logSend

@@ -1,0 +1,170 @@
+import * as React from 'react'
+import type * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import ChooseView from './choose-view'
+import type {SizeType} from '@/common-adapters/icon'
+import * as FS from '@/constants/fs'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type ClickableProps = {
+  onClick: () => void
+  mref: React.RefObject<Kb.MeasureRef | null>
+}
+
+type ClickableComponent = {
+  component: React.ComponentType<ClickableProps>
+  type: 'component'
+}
+
+type ClickableIcon = {
+  actionIconWhite?: boolean
+  sizeType?: SizeType
+  type: 'icon'
+}
+
+export type Clickable = ClickableComponent | ClickableIcon
+
+export type Props = {
+  clickable: Clickable
+  mode: 'row' | 'screen'
+  path: T.FS.Path
+  initView: T.FS.PathItemActionMenuView
+  // Render no trigger, only the popup. The menu is opened imperatively through
+  // the ref handle instead (used by the iOS native header overflow menu).
+  hideTrigger?: boolean
+}
+
+export type PathItemActionHandle = {open: () => void}
+
+type ICProps = {
+  measureRef: React.RefObject<Kb.MeasureRef | null>
+  onClick: () => void
+  testID?: string
+  sizeType: SizeType
+  actionIconWhite?: boolean | undefined
+}
+function IconClickable(props: ICProps) {
+  const theme = Kb.Styles.useTheme()
+  const {measureRef, actionIconWhite, sizeType, onClick, testID} = props
+  return (
+    <Kb.WithTooltip tooltip="More actions">
+      <Kb.Box2 direction="vertical" ref={measureRef}>
+        <Kb.Icon
+          type="iconfont-ellipsis"
+          color={actionIconWhite ? theme.whiteOrBlueDark : theme.black_50}
+          hoverColor={actionIconWhite ? undefined : theme.black}
+          padding="tiny"
+          sizeType={sizeType}
+          onClick={onClick}
+          testID={testID}
+        />
+      </Kb.Box2>
+    </Kb.WithTooltip>
+  )
+}
+
+const PathItemAction = React.forwardRef<PathItemActionHandle, Props>((props, ref) => {
+  const styles = useStyles()
+  const {initView, path, mode, hideTrigger} = props
+  const [previousView, setPreviousView] = React.useState(initView)
+  const [view, setViewState] = React.useState(initView)
+  const [downloadState, setDownloadState] = React.useState<{
+    downloadID?: string
+    downloadIntent?: T.FS.DownloadIntent
+  }>({})
+
+  const setView = (nextView: T.FS.PathItemActionMenuView) => {
+    setPreviousView(view)
+    setViewState(nextView)
+  }
+  const onDownloadStarted = (downloadID: string, downloadIntent?: T.FS.DownloadIntent) => {
+    setDownloadState({downloadID, downloadIntent})
+  }
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+
+    const hide = () => {
+      hidePopup()
+      setPreviousView(initView)
+      setViewState(initView)
+      setDownloadState({})
+    }
+
+    return (
+      <ChooseView
+        downloadID={downloadState.downloadID}
+        downloadIntent={downloadState.downloadIntent}
+        onDownloadStarted={onDownloadStarted}
+        path={path}
+        mode={mode}
+        previousView={previousView}
+        setView={setView}
+        view={view}
+        floatingMenuProps={{
+          attachTo,
+          containerStyle: styles.floatingContainer,
+          hide,
+          visible: true,
+        }}
+      />
+    )
+  }
+  const {showPopup, showingPopup, popup, popupAnchor} = Kb.usePopup2(makePopup)
+
+  const onClick = () => {
+    setPreviousView(initView)
+    setViewState(initView)
+    setDownloadState({})
+    showPopup()
+  }
+
+  React.useImperativeHandle(ref, () => ({open: onClick}))
+
+  if (props.path === FS.defaultPath) {
+    return null
+  }
+
+  if (hideTrigger) {
+    return <>{showingPopup && popup}</>
+  }
+
+  return (
+    <>
+      {props.clickable.type === 'component' && (
+        <props.clickable.component onClick={onClick} mref={popupAnchor} />
+      )}
+      {props.clickable.type === 'icon' && (
+        <IconClickable
+          onClick={onClick}
+          measureRef={popupAnchor}
+          sizeType={props.clickable.sizeType ?? 'Default'}
+          actionIconWhite={props.clickable.actionIconWhite}
+          testID={mode === 'row' ? TestIDs.FILES_ROW_MENU : undefined}
+        />
+      )}
+      {showingPopup && popup}
+    </>
+  )
+})
+
+const useStyles = Kb.Styles.createStyleHook(
+  () =>
+    ({
+      floatingContainer: Kb.Styles.platformStyles({
+        common: {
+          overflow: 'visible',
+        },
+        isElectron: {
+          marginTop: 12,
+        },
+        isMobile: {
+          marginTop: undefined,
+        },
+      }),
+    }) as const
+)
+
+PathItemAction.displayName = 'PathItemAction'
+
+export default PathItemAction

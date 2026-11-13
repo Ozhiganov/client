@@ -1,0 +1,556 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import * as React from 'react'
+import * as Teams from '@/constants/teams'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import SaveIndicator from '@/common-adapters/save-indicator'
+import logger from '@/logger'
+import {registerExternalResetter} from '@/util/zustand'
+import {useEngineActionListener} from '@/engine/action-listener'
+import {
+  type CachedResourceCache,
+  createCachedResourceCache,
+  getCachedResourceCache,
+  useCachedResource,
+} from '@/util/use-cached-resource'
+import {useLoadedTeam} from '../../use-loaded-team'
+import {useConfirm} from './use-confirm'
+import {ConversationThreadProvider, useThreadMeta} from '@/chat/conversation/thread-context'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type RetentionEntityType = 'adhoc' | 'channel' | 'small team' | 'big team'
+
+export type Props = {
+  entityType: RetentionEntityType
+  canSetPolicy: boolean
+  policy: T.Retention.RetentionPolicy
+  policyIsExploding: boolean
+  teamPolicy?: T.Retention.RetentionPolicy
+  loading: boolean // for when we're waiting to fetch the team policy
+  showInheritOption: boolean
+  showOverrideNotice: boolean
+  showSaveIndicator: boolean
+  teamID: T.Teams.TeamID
+  saveRetentionPolicy: (policy: T.Retention.RetentionPolicy) => void
+  onSelect?: (policy: T.Retention.RetentionPolicy, changed: boolean, decreased: boolean) => void
+}
+
+const RetentionPicker = (p: Props) => {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {policy, showInheritOption, teamPolicy, saveRetentionPolicy, entityType} = p
+  const {policyIsExploding, showOverrideNotice, showSaveIndicator} = p
+  const [pendingPolicy, setPendingPolicy] = React.useState<T.Retention.RetentionPolicy | undefined>(undefined)
+  const [selected, setSelected] = React.useState<T.Retention.RetentionPolicy | undefined>(undefined)
+
+  const isSelected = (p: T.Retention.RetentionPolicy) => policyEquals(policy, p)
+
+  const modalConfirmed = useConfirm(s => s.confirmed)
+  const updateConfirm = useConfirm(s => s.dispatch.updateConfirm)
+
+  const navigateAppend = C.Router2.navigateAppend
+  const confirmedSubmittedRef = React.useRef<T.Retention.RetentionPolicy | undefined>(undefined)
+  const selectedMatchesConfirmed =
+    !!selected &&
+    !!modalConfirmed &&
+    (policyEquals(selected, modalConfirmed) ||
+      (selected.type === 'inherit' && !!teamPolicy && policyEquals(teamPolicy, modalConfirmed)))
+
+  React.useEffect(() => {
+    if (!modalConfirmed) {
+      confirmedSubmittedRef.current = undefined
+      return
+    }
+    if (selected && selectedMatchesConfirmed && confirmedSubmittedRef.current !== modalConfirmed) {
+      confirmedSubmittedRef.current = modalConfirmed
+      saveRetentionPolicy(selected)
+    }
+    updateConfirm(undefined)
+  }, [modalConfirmed, saveRetentionPolicy, selected, selectedMatchesConfirmed, updateConfirm])
+
+  const selectPolicy = (nextPolicy: T.Retention.RetentionPolicy) => {
+    setSelected(nextPolicy)
+    const changed = !policyEquals(nextPolicy, policy)
+    if (!changed) {
+      setPendingPolicy(undefined)
+      return
+    }
+
+    const decreased = policyToComparable(nextPolicy, teamPolicy) < policyToComparable(policy, teamPolicy)
+    if (decreased) {
+      setPendingPolicy(undefined)
+      navigateAppend({
+        name: 'retentionWarning',
+        params: {entityType, policy: nextPolicy.type === 'inherit' && teamPolicy ? teamPolicy : nextPolicy},
+      })
+      return
+    }
+
+    saveRetentionPolicy(nextPolicy)
+    setPendingPolicy(nextPolicy)
+  }
+
+  const saving = !!pendingPolicy && !policyEquals(policy, pendingPolicy)
+
+  const makePopup = (p: Kb.Popup2Parms) => {
+    const {attachTo, hidePopup} = p
+
+    const makeItems = () => {
+      const policies = Teams.baseRetentionPolicies.slice()
+      if (showInheritOption) {
+        policies.unshift(Teams.retentionPolicies.policyInherit)
+      }
+      return policies.reduce((arr, policy) => {
+        switch (policy.type) {
+          case 'retain':
+          case 'expire':
+            return [
+              ...arr,
+              {
+                isSelected: isSelected(policy),
+                onClick: () => selectPolicy(policy),
+                title: policy.title,
+              } as const,
+            ]
+          case 'inherit':
+            if (teamPolicy) {
+              let title = ''
+              switch (teamPolicy.type) {
+                case 'retain':
+                  title = 'Team default (Never)'
+                  break
+                case 'expire':
+                case 'explode':
+                  title = `Team default (${teamPolicy.title})`
+                  break
+                default:
+              }
+              return [
+                {
+                  isSelected: isSelected(policy),
+                  onClick: () => selectPolicy(policy),
+                  title,
+                } as const,
+                'Divider' as const,
+                ...arr,
+              ]
+            } else {
+              throw new Error(`Got policy of type 'inherit' without an inheritable parent policy`)
+            }
+          case 'explode':
+            return [
+              ...arr,
+              {
+                icon: 'iconfont-timer',
+                iconIsVisible: true,
+                isSelected: isSelected(policy),
+                onClick: () => selectPolicy(policy),
+                title: policy.title,
+              } as const,
+            ]
+          default:
+            return arr
+        }
+      }, new Array<Kb.MenuItems[0]>())
+    }
+    const items = makeItems()
+    return (
+      <Kb.FloatingMenu
+        attachTo={attachTo}
+        closeOnSelect={true}
+        visible={true}
+        onHidden={hidePopup}
+        items={items}
+        position="top center"
+      />
+    )
+  }
+  const {showPopup, popup, popupAnchor} = Kb.usePopup2(makePopup)
+
+  return (
+    <Kb.Box2 direction="vertical" gap="tiny" fullWidth={true}>
+      {popup}
+      <Kb.Box2 direction="horizontal" alignItems="center" gap="xtiny">
+        <Kb.Text type="BodySmallSemibold">Message deletion</Kb.Text>
+        {showSaveIndicator && <SaveIndicator saving={saving} style={styles.saveState} />}
+      </Kb.Box2>
+      <Kb.ClickableBox
+        onClick={showPopup}
+        ref={popupAnchor}
+        direction="horizontal"
+        alignItems="center"
+        style={styles.retentionDropdown}
+        testID={TestIDs.TEAMS_RETENTION_DROPDOWN}
+      >
+        <Kb.Box2 direction="horizontal" alignItems="center" gap="tiny" fullWidth={true} style={styles.label}>
+          {policyToLabel(theme, policy, teamPolicy)}
+        </Kb.Box2>
+        <Kb.Icon type="iconfont-caret-down" color="inherit" fontSize={7} sizeType="Tiny" />
+      </Kb.ClickableBox>
+      {policyIsExploding && (
+        <Kb.Box2 direction="horizontal" alignItems="center" fullWidth={true} gap="xtiny">
+          <Kb.Text type="BodySmall">Participants will see their message explode.</Kb.Text>
+          <Kb.Icon color={theme.black_50} sizeType="Big" type="iconfont-boom" />
+        </Kb.Box2>
+      )}
+      {showOverrideNotice && <Kb.Text type="BodySmall">Individual channels can override this.</Kb.Text>}
+    </Kb.Box2>
+  )
+}
+
+const RetentionDisplay = (
+  props: {
+    entityType: RetentionEntityType
+  } & Props
+) => {
+  let convType: string
+  switch (props.entityType) {
+    case 'big team':
+      convType = 'team'
+      break
+    case 'small team':
+      convType = 'chat'
+      break
+    case 'channel':
+      convType = 'channel'
+      break
+    default:
+      throw new Error(`Bad entityType encountered in RetentionDisplay: ${props.entityType}`)
+  }
+  const text = policyToExplanation(convType, props.policy, props.teamPolicy)
+  return (
+    <Kb.Box2 direction="vertical" gap="xxtiny" fullWidth={true}>
+      <Kb.Box2 direction="horizontal" alignItems="center" fullWidth={true}>
+        <Kb.Text type="BodySmallSemibold">Message deletion</Kb.Text>
+      </Kb.Box2>
+      <Kb.Text type="BodySmall">{text}</Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      label: {
+        minHeight: isMobile ? 40 : 32,
+        paddingLeft: Kb.Styles.globalMargins.xsmall,
+      },
+      progressIndicator: {
+        ...Kb.Styles.size(30),
+        marginTop: Kb.Styles.globalMargins.small,
+      },
+      retentionDropdown: {
+        ...Kb.Styles.border(theme.grey, 1, Kb.Styles.borderRadius),
+        paddingRight: Kb.Styles.globalMargins.small,
+        width: '100%',
+      },
+      saveState: {height: 17},
+    }) as const
+)
+
+// Utilities for transforming retention policies <-> labels
+const policyToLabel = (
+  theme: Kb.Styles.Theme,
+  p?: T.Retention.RetentionPolicy,
+  parent?: T.Retention.RetentionPolicy
+) => {
+  let text = ''
+  let timer = false
+  if (p) {
+    switch (p.type) {
+      case 'retain':
+        text = 'Never auto-delete'
+        break
+      case 'expire':
+      case 'explode':
+        text = p.title
+        timer = p.type === 'explode'
+        break
+      case 'inherit':
+        if (!parent) {
+          // Don't throw an error, as this may happen when deleting a
+          // channel.
+          text = 'Team default'
+          break
+        }
+        switch (parent.type) {
+          case 'retain':
+            text = 'Team default (Never)'
+            break
+          case 'expire':
+          case 'explode':
+            text = `Team default (${parent.title})`
+            timer = parent.type === 'explode'
+            break
+          default:
+        }
+    }
+  } else {
+    text = 'Never auto-delete'
+  }
+  return [
+    timer ? <Kb.Icon color={theme.black} type="iconfont-timer" key="timer" /> : null,
+    <Kb.Text type="BodySemibold" key="label">
+      {text}
+    </Kb.Text>,
+  ]
+}
+// Use only for comparing policy durations
+const policyToComparable = (
+  p?: T.Retention.RetentionPolicy,
+  parent?: T.Retention.RetentionPolicy
+): number => {
+  if (!p) {
+    return Infinity
+  }
+  let res: number = -1
+  switch (p.type) {
+    case 'retain':
+      res = Infinity
+      break
+    case 'inherit':
+      if (!parent) {
+        throw new Error(`Got policy of type 'inherit' without an inheritable parent policy`)
+      }
+      res = policyToComparable(parent)
+      break
+    case 'expire':
+    case 'explode':
+      res = p.seconds
+      break
+  }
+  if (res === -1) {
+    // no good
+    throw new Error('Impossible case encountered: res = -1 in retention policyToComparable')
+  }
+  return res
+}
+const policyEquals = (p1?: T.Retention.RetentionPolicy, p2?: T.Retention.RetentionPolicy): boolean => {
+  if (p1 && p2) {
+    return p1.type === p2.type && p1.seconds === p2.seconds
+  }
+  return p1 === p2
+}
+const policyToExplanation = (
+  convType: string,
+  p: T.Retention.RetentionPolicy,
+  parent?: T.Retention.RetentionPolicy
+) => {
+  let exp = ''
+  switch (p.type) {
+    case 'inherit':
+      {
+        if (!parent) {
+          throw new Error(`Got policy of type 'inherit' with no inheritable policy`)
+        }
+        let behavior = ''
+        switch (parent.type) {
+          case 'inherit':
+            throw new Error(`Got invalid type 'inherit' for team-wide policy`)
+          case 'retain':
+            behavior = 'be retained indefinitely'
+            break
+          case 'expire':
+            behavior = `expire after ${parent.title}`
+            break
+          case 'explode':
+            behavior = `explode after ${parent.title}`
+            break
+        }
+        exp = `Messages in this ${convType} will ${behavior}, which is the team default.`
+      }
+      break
+    case 'retain':
+      exp = `Admins have set this ${convType} to retain messages indefinitely.`
+      break
+    case 'expire':
+      exp = `Admins have set this ${convType} to auto-delete messages after ${p.title}.`
+      break
+    case 'explode':
+      exp = `Admins have set messages in this ${convType} to explode after ${p.title}.`
+      break
+  }
+  return exp
+}
+
+type TeamRetentionData = T.Retention.RetentionPolicy | undefined
+
+const teamRetentionStaleMs = 5_000
+const noTeamRetentionPolicy: TeamRetentionData = undefined
+
+// One cache per team, shared by every consumer (settings tab and every chat info
+// panel for the team): a burst of remounts would otherwise be a burst of
+// GetTeamRetentionLocal calls with identical arguments.
+const teamRetentionCaches = new Map<T.Teams.TeamID, CachedResourceCache<TeamRetentionData, T.Teams.TeamID>>()
+
+// module scope outlives sign-out, so the next user would inherit this user's policies
+registerExternalResetter('teams-retention-caches', () => {
+  teamRetentionCaches.clear()
+})
+
+const useLoadedTeamRetentionPolicy = (teamID: T.Teams.TeamID) => {
+  const enabled = !!teamID && teamID !== T.Teams.noTeamID
+  // an adhoc conversation has no team, and useCachedResource resets the cache it
+  // holds when disabled — give those instances their own throwaway cache so they
+  // can't wipe the shared one out from under a real loader
+  const [localCache] = React.useState<CachedResourceCache<TeamRetentionData, T.Teams.TeamID>>(() =>
+    createCachedResourceCache<TeamRetentionData, T.Teams.TeamID>(noTeamRetentionPolicy, teamID)
+  )
+  const sharedCache = React.useMemo(
+    () => getCachedResourceCache(teamRetentionCaches, noTeamRetentionPolicy, teamID),
+    [teamID]
+  )
+  const {data: teamPolicy, reload} = useCachedResource({
+    cache: enabled ? sharedCache : localCache,
+    cacheKey: teamID,
+    enabled,
+    initialData: noTeamRetentionPolicy,
+    // resolve rather than reject on failure: the picker falls back to the default
+    // "retain" policy on error instead of spinning forever
+    load: async () => {
+      let servicePolicy: T.RPCChat.RetentionPolicy | undefined | null
+      try {
+        servicePolicy = await T.RPCChat.localGetTeamRetentionLocalRpcPromise(
+          {teamID},
+          C.waitingKeyTeamsLoadRetentionPolicy(teamID)
+        )
+      } catch (error) {
+        logger.warn(`Failed to load team retention policy for ${teamID}`, error)
+      }
+      const policy = Teams.serviceRetentionPolicyToRetentionPolicy(servicePolicy)
+      return policy.type === 'inherit' ? Teams.retentionPolicies.policyRetain : policy
+    },
+    staleMs: teamRetentionStaleMs,
+  })
+
+  // the notification carries the new policy, but reload() is what actually
+  // invalidates the shared cache for the other consumers
+  useEngineActionListener('chat.1.NotifyChat.ChatSetTeamRetention', action => {
+    if (action.payload.params.teamID === teamID) {
+      void reload()
+    }
+  })
+
+  return {
+    loading: !teamPolicy,
+    teamPolicy,
+  }
+}
+
+// Switcher to avoid having RetentionPicker try to process nonexistent data
+const RetentionSwitcher = (props: {entityType: RetentionEntityType} & Props) => {
+  const styles = useStyles()
+  if (props.loading) {
+    return <Kb.ProgressIndicator style={styles.progressIndicator} />
+  }
+  return props.canSetPolicy ? <RetentionPicker {...props} /> : <RetentionDisplay {...props} />
+}
+
+export type OwnProps = {
+  conversationIDKey?: T.Chat.ConversationIDKey
+  entityType: RetentionEntityType
+  showSaveIndicator: boolean
+  teamID: T.Teams.TeamID
+}
+
+const RetentionPickerContainer = (ownProps: OwnProps) => {
+  const {conversationIDKey: _cid, entityType} = ownProps
+  if (!_cid && !entityType.endsWith('team')) {
+    throw new Error(`RetentionPicker needs a conversationIDKey to set ${entityType} retention policies`)
+  }
+  if (_cid) {
+    return (
+      <ConversationThreadProvider id={_cid}>
+        <ConversationPolicyContainer {...ownProps} conversationIDKey={_cid} />
+      </ConversationThreadProvider>
+    )
+  }
+  return (
+    <ContainerWithPolicy
+      {...ownProps}
+      conversationIDKey={Chat.noConversationIDKey}
+      policy={Teams.retentionPolicies.policyRetain}
+    />
+  )
+}
+
+const ConversationPolicyContainer = (ownProps: OwnProps & {conversationIDKey: T.Chat.ConversationIDKey}) => {
+  const policy = useThreadMeta(m => m.retentionPolicy)
+  return <ContainerWithPolicy {...ownProps} policy={policy} />
+}
+
+const ContainerWithPolicy = (
+  ownProps: OwnProps & {
+    conversationIDKey: T.Chat.ConversationIDKey
+    policy: T.Retention.RetentionPolicy
+  }
+) => {
+  const {entityType, conversationIDKey, policy: loadedPolicy, teamID} = ownProps
+  const {loading: loadingTeamPolicy, teamPolicy: loadedTeamPolicy} = useLoadedTeamRetentionPolicy(teamID)
+  const {yourOperations} = useLoadedTeam(teamID)
+  const setConvRetentionPolicyRPC = C.useRPC(T.RPCChat.localSetConvRetentionLocalRpcPromise)
+  const setTeamRetentionPolicyRPC = C.useRPC(T.RPCChat.localSetTeamRetentionLocalRpcPromise)
+
+  let loading = false
+  let teamPolicy: T.Retention.RetentionPolicy | undefined
+  let policy = loadedPolicy
+  if (entityType !== 'adhoc') {
+    loading = loadingTeamPolicy
+    if (loadedTeamPolicy) {
+      if (entityType === 'channel') {
+        teamPolicy = loadedTeamPolicy
+      } else {
+        policy = loadedTeamPolicy
+      }
+    }
+  }
+
+  const canSetPolicy = entityType === 'adhoc' || yourOperations.setRetentionPolicy
+  const policyIsExploding =
+    policy.type === 'explode' || (policy.type === 'inherit' && teamPolicy?.type === 'explode')
+  const showInheritOption = entityType === 'channel'
+  const showOverrideNotice = entityType === 'big team'
+  const saveRetentionPolicy = (policy: T.Retention.RetentionPolicy) => {
+    if (['small team', 'big team'].includes(entityType)) {
+      setTeamRetentionPolicyRPC(
+        [
+          {policy: Teams.retentionPolicyToServiceRetentionPolicy(policy), teamID},
+          C.waitingKeyTeamsSetRetentionPolicy(teamID),
+        ],
+        () => {},
+        () => {}
+      )
+    } else if (['adhoc', 'channel'].includes(entityType)) {
+      // we couldn't get here without throwing an error for !conversationIDKey
+      setConvRetentionPolicyRPC(
+        [
+          {
+            convID: T.Chat.keyToConversationID(conversationIDKey),
+            policy: Teams.retentionPolicyToServiceRetentionPolicy(policy),
+          },
+        ],
+        () => {},
+        () => {}
+      )
+    } else {
+      throw new Error(`RetentionPicker: impossible entityType encountered: ${entityType}`)
+    }
+  }
+  const props = {
+    canSetPolicy,
+    entityType,
+    loading,
+    policy,
+    policyIsExploding,
+    saveRetentionPolicy,
+    showInheritOption,
+    showOverrideNotice,
+    showSaveIndicator: ownProps.showSaveIndicator,
+    teamID,
+    teamPolicy,
+  }
+  return <RetentionSwitcher {...props} />
+}
+
+export default RetentionPickerContainer

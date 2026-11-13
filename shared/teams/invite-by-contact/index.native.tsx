@@ -1,0 +1,172 @@
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import {FloatingRolePicker} from '../role-picker'
+import type * as T from '@/constants/types'
+import type {Contact} from '../common/use-contacts.native'
+
+// Contact info + other things needed for list row.
+export type ContactRowProps = Contact & {
+  id: string
+  alreadyInvited: boolean
+  loading: boolean
+  onClick: () => void
+}
+
+const ContactRow = (props: ContactRowProps) => {
+  const styles = useStyles()
+  const hasThumbnail = !!props.pictureUri
+
+  return (
+    <Kb.Box2 direction="horizontal" fullWidth={true} alignItems="center" style={styles.contactRowBox}>
+      <Kb.Box2 direction="horizontal" alignItems="center" flex={1}>
+        {!!hasThumbnail && !!props.pictureUri && (
+          <Kb.Image style={styles.thumbnail} src={props.pictureUri} />
+        )}
+        {!hasThumbnail && <Kb.Avatar size={48} style={styles.placeHolderAvatar} />}
+        <Kb.Box2 direction="vertical" flex={1}>
+          <Kb.Box2 direction="horizontal" fullWidth={true}>
+            <Kb.Text type="BodySemibold">{props.name}</Kb.Text>
+          </Kb.Box2>
+          <Kb.Box2 direction="horizontal" fullWidth={true}>
+            <Kb.Text type="BodySmall">{props.valueFormatted || props.value}</Kb.Text>
+          </Kb.Box2>
+        </Kb.Box2>
+        <Kb.Button
+          type="Success"
+          mode={props.alreadyInvited ? 'Secondary' : 'Primary'}
+          label={props.alreadyInvited ? 'Invited!' : 'Invite'}
+          waiting={props.loading}
+          small={true}
+          onClick={props.onClick}
+          style={styles.inviteButton}
+        />
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const contactRow = (_: number, props: ContactRowProps) => <ContactRow {...props} />
+
+type InviteByContactProps = {
+  selectedRole: T.Teams.TeamRoleType
+  onRoleChange: (newRole: T.Teams.TeamRoleType) => void
+  teamName: string
+  listItems: Array<ContactRowProps>
+  errorMessage?: string
+}
+
+export const InviteByContact = (props: InviteByContactProps) => {
+  const styles = useStyles()
+  const [isRolePickerOpen, setRolePickerOpen] = React.useState(false)
+  const [filterValue, setFilterValue] = React.useState('')
+
+  const {errorMessage, onRoleChange, selectedRole, teamName} = props
+  let {listItems} = props
+  // Remember if we have any data before appying filtering.
+  const hasItems = listItems.length > 0
+  if (filterValue) {
+    listItems = listItems.filter(row =>
+      [row.name, row.value, row.valueFormatted].some(s =>
+        s
+          ?.replace(/^[^a-z0-9@._+()]/i, '')
+          .toLowerCase()
+          .includes(filterValue.toLowerCase())
+      )
+    )
+  }
+
+  return (
+    <Kb.ModalScreen scroll={false} padding="none">
+      {!!errorMessage && (
+        <Kb.Box2 direction="horizontal" style={styles.errorMessageContainer} fullWidth={true} justifyContent="center">
+          <Kb.Text center={true} type="BodySemibold" negative={true}>
+            {errorMessage}
+          </Kb.Text>
+        </Kb.Box2>
+      )}
+      {hasItems && (
+        <Kb.Box2 direction="vertical" fullWidth={true} flex={1} style={styles.listContainer}>
+          <Kb.Box2 alignSelf="center" direction="horizontal" style={styles.filterContainer}>
+            <Kb.Input3
+              autoFocus={true}
+              keyboardType="email-address"
+              value={filterValue}
+              onChangeText={setFilterValue}
+              placeholder="Search"
+              hideBorder={true}
+            />
+          </Kb.Box2>
+          <FloatingRolePicker
+            presetRole={selectedRole}
+            onConfirm={role => {
+              onRoleChange(role)
+              setRolePickerOpen(false)
+            }}
+            open={isRolePickerOpen}
+            position="bottom center"
+            disabledRoles={{owner: 'Cannot invite an owner via email.'}}
+          />
+          <Kb.ClickableBox alignSelf="center" direction="vertical" centerChildren={true} onClick={() => setRolePickerOpen(true)} style={styles.rolePickerBox}>
+            <Kb.Text center={true} type="BodySmall">
+              Users will be invited to {teamName} as
+              <Kb.Text type="BodySmallPrimaryLink">{' ' + selectedRole + 's'}</Kb.Text>.
+            </Kb.Text>
+          </Kb.ClickableBox>
+          <Kb.List
+            keyProperty="id"
+            items={listItems}
+            itemHeight={{height: 56, type: 'fixed'}}
+            renderItem={contactRow}
+            style={styles.contactList}
+          />
+        </Kb.Box2>
+      )}
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      contactList: {
+        alignSelf: 'stretch',
+      },
+      contactRowBox: {
+        height: 56,
+        padding: Kb.Styles.globalMargins.small,
+      },
+      errorMessageContainer: {
+        alignItems: 'center',
+        backgroundColor: theme.red,
+        padding: Kb.Styles.globalMargins.tiny,
+      },
+      filterContainer: {
+        borderBottomColor: theme.black_10,
+        borderBottomWidth: Kb.Styles.hairlineWidth,
+        padding: Kb.Styles.globalMargins.small,
+      },
+      inviteButton: {
+        paddingLeft: Kb.Styles.globalMargins.small,
+        paddingRight: Kb.Styles.globalMargins.small,
+        width: 100,
+      },
+      listContainer: {
+        paddingBottom: Kb.Styles.globalMargins.xtiny,
+      },
+      placeHolderAvatar: {
+        marginRight: 16,
+      },
+      rolePickerBox: {
+        borderBottomColor: theme.black_10,
+        borderBottomWidth: Kb.Styles.hairlineWidth,
+        marginBottom: Kb.Styles.globalMargins.xtiny,
+        padding: Kb.Styles.globalMargins.small,
+      },
+      thumbnail: {
+        borderRadius: 24,
+        height: 48,
+        marginRight: 16,
+        width: 48,
+      },
+    }) as const
+)

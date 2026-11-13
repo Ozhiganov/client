@@ -1,0 +1,94 @@
+import {Box2} from './box'
+import Text from './text'
+import * as Styles from '@/styles'
+
+const Kb = {
+  Box2,
+  Text,
+}
+
+export type Badge2Props = {
+  badgeNumber?: number
+  className?: string
+  fontSize?: number
+  height?: number
+  leftRightPadding?: number
+  containerStyle?: Styles.StylesCrossPlatform
+  badgeStyle?: Styles.StylesCrossPlatform
+  badgeNumberStyle?: Styles.StylesCrossPlatform
+  border?: boolean
+}
+
+function Badge(p: Badge2Props) {
+  const styles = useStyles()
+  const {border, containerStyle, className, badgeNumberStyle, badgeNumber, badgeStyle} = p
+  const fontSize = p.fontSize ?? (isMobile ? 12 : 10)
+  const height = p.height ?? (isMobile ? 20 : 16)
+  const leftRightPadding = p.leftRightPadding ?? (Styles.isPhone ? 5 : 4)
+
+  // with a border the badge shrinks inside a white ring box of the full height
+  const innerSize = border ? height - 3 : height
+  const badge = (
+    <Kb.Box2
+      direction="vertical"
+      className={className}
+      pointerEvents={border ? undefined : 'none'}
+      style={Styles.collapseStyles([
+        styles.badge,
+        {
+          ...Styles.paddingH(leftRightPadding),
+          borderRadius: innerSize,
+          height: innerSize,
+          minWidth: innerSize,
+        },
+        badgeStyle,
+      ])}
+    >
+      {!!badgeNumber && (
+        <Kb.Text
+          center={true}
+          type="BodyTinyBold"
+          style={Styles.collapseStyles([
+            styles.text,
+            {fontSize, height, lineHeight: border || isMobile ? height : `${height}px`} as const,
+            badgeNumberStyle,
+          ])}
+        >
+          {badgeNumber}
+        </Kb.Text>
+      )}
+    </Kb.Box2>
+  )
+
+  if (!border) {
+    return badge
+  }
+  return (
+    <Kb.Box2
+      direction="vertical"
+      pointerEvents="none"
+      centerChildren={true}
+      style={Styles.collapseStyles([
+        styles.container,
+        {
+          borderRadius: height,
+          height,
+          minWidth: height,
+        },
+        containerStyle,
+      ])}
+    >
+      {badge}
+    </Kb.Box2>
+  )
+}
+export default Badge
+
+const useStyles = Styles.createStyleHook(theme => ({
+  badge: {
+    ...Styles.globalStyles.flexBoxCenter,
+    backgroundColor: theme.orange,
+  },
+  container: {backgroundColor: theme.white},
+  text: {color: theme.white},
+}))

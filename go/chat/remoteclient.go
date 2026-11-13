@@ -1,0 +1,55 @@
+package chat
+
+import (
+	"context"
+	"time"
+
+	"github.com/keybase/client/go/chat/globals"
+	"github.com/keybase/client/go/chat/types"
+	"github.com/keybase/client/go/chat/utils"
+	"github.com/keybase/go-framed-msgpack-rpc/rpc"
+)
+
+type RemoteClient struct {
+	utils.DebugLabeler
+
+	cli rpc.GenericClient
+}
+
+func NewRemoteClient(g *globals.Context, cli rpc.GenericClient) *RemoteClient {
+	return &RemoteClient{
+		DebugLabeler: utils.NewDebugLabeler(g.ExternalG(), "RemoteClient", false),
+		cli:          cli,
+	}
+}
+
+func (c *RemoteClient) Call(ctx context.Context, method string, arg any,
+	res any, timeout time.Duration,
+) (err error) {
+	defer c.Trace(ctx, &err, "%s", method)()
+	err = c.cli.Call(ctx, method, arg, res, timeout)
+	if err == nil {
+		if rlRes, ok := res.(types.RateLimitedResult); ok {
+			globals.CtxAddRateLimit(ctx, rlRes.GetRateLimit())
+		}
+	}
+	return err
+}
+
+func (c *RemoteClient) CallCompressed(ctx context.Context, method string, arg any,
+	res any, ctype rpc.CompressionType, timeout time.Duration,
+) (err error) {
+	defer c.Trace(ctx, &err, "%s", method)()
+	err = c.cli.CallCompressed(ctx, method, arg, res, ctype, timeout)
+	if err == nil {
+		if rlRes, ok := res.(types.RateLimitedResult); ok {
+			globals.CtxAddRateLimit(ctx, rlRes.GetRateLimit())
+		}
+	}
+	return err
+}
+
+func (c *RemoteClient) Notify(ctx context.Context, method string, arg any, timeout time.Duration) (err error) {
+	defer c.Trace(ctx, &err, "%s", method)()
+	return c.cli.Notify(ctx, method, arg, timeout)
+}

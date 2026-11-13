@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build windows
+//go:build windows
 
 package libkb
 
@@ -33,7 +33,7 @@ func (f *LockPIDFile) Lock() (err error) {
 	fmt.Fprintf(f.file, "%d", pid)
 	f.file.Sync()
 
-	G.Log.Debug("Locked pidfile %s for pid=%d", f.name, pid)
+	f.G().Log.Debug("Locked pidfile %s for pid=%d", f.name, pid)
 
 	return nil
 }

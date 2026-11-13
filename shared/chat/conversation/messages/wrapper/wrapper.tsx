@@ -1,0 +1,1154 @@
+import * as C from '@/constants'
+import {getMessageKey} from '@/constants/chat/helpers'
+import * as Chat from '@/constants/chat'
+import * as Kb from '@/common-adapters'
+import * as React from 'react'
+import * as InputState from '../../input-area/input-state'
+import * as RowMetadata from '../row-metadata'
+import {MessageContext, RowHoveredContext, useOrdinal} from '../ids-context'
+import EmojiRow from '../emoji-row'
+import ExplodingHeightRetainer from './exploding-height-retainer'
+import ExplodingMeta from './exploding-meta'
+import LongPressable from './long-pressable'
+import {useMessagePopup} from '../message-popup'
+import ReactionsRow from '../reactions-rows'
+import {useSyncRowLayout} from '../use-sync-row-layout'
+import SendIndicator from './send-indicator'
+import * as T from '@/constants/types'
+import capitalize from 'lodash/capitalize'
+import {useEdited} from './edited'
+import {Sent} from './sent'
+import {useCurrentUserState} from '@/stores/current-user'
+import {navToProfile} from '@/constants/router'
+import {formatTimeForChat} from '@/util/timestamp'
+import {
+  getConversationThreadDisplayMessage,
+  ShownUsernameCacheContext,
+  useConversationThreadActions,
+  useConversationThreadSelector,
+  useThreadMeta,
+} from '../../thread-context'
+import {emptyParticipantInfo} from '../../data-hooks'
+import {deleteMessage, toggleReaction, useThreadMessageTarget} from '../../message-commands'
+import {useInboxMetadataState} from '@/chat/inbox/metadata'
+import type {ConversationInputState} from '../../input-area/input-state'
+import {useChatTeamMemberRole} from '../../team-hooks'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type AccountsInfoMap = ReadonlyMap<T.RPCChat.MessageID, T.Chat.ChatRequestInfo | T.Chat.ChatPaymentInfo>
+type PaymentStatusMap = ReadonlyMap<T.Wallets.PaymentID, T.Chat.ChatPaymentInfo>
+type UnfurlPromptMap = ReadonlyMap<T.Chat.MessageID, ReadonlySet<string>>
+
+export type Props = {
+  isCenteredHighlight?: boolean
+  ordinal: T.Chat.Ordinal
+}
+
+const messageShowsPopup = (type?: T.Chat.Message['type']) =>
+  !!type &&
+  [
+    'text',
+    'attachment',
+    'sendPayment',
+    'requestPayment',
+    'setChannelname',
+    'setDescription',
+    'pin',
+    'systemAddedToTeam',
+    'systemChangeAvatar',
+    'systemChangeRetention',
+    'systemGitPush',
+    'systemInviteAccepted',
+    'systemSimpleToComplex',
+    'systemSBSResolved',
+    'systemText',
+    'systemUsersAddedToConversation',
+    'systemNewChannel',
+    'journeycard',
+  ].includes(type)
+
+// If there is no matching message treat it like a deleted
+const missingMessage = Chat.makeMessageDeleted({})
+
+type AuthorProps = {
+  author: string
+  botAlias: string
+  hiddenHeader: boolean
+  isAdhocBot: boolean
+  teamID: T.Teams.TeamID
+  teamType: T.Chat.TeamType
+  teamname: string
+  timestamp: number
+  showUsername: string
+}
+
+type RowActions = Pick<ConversationInputState['dispatch'], 'setEditing' | 'reply'> & {
+  messageDelete: (ordinal: T.Chat.Ordinal) => void
+  messageRetry: (outboxID: T.Chat.OutboxID) => void
+  toggleMessageReaction: (ordinal: T.Chat.Ordinal, emoji: string) => void
+}
+
+type EditCancelRetryData = {
+  failureDescription: string
+  outboxID?: T.Chat.OutboxID
+}
+
+type FlatAuthorData = {
+  author: string
+  botAlias: string
+  hiddenHeader: boolean
+  isAdhocBot: boolean
+  showUsername: string
+  teamID: T.Teams.TeamID
+  teamType: T.Chat.TeamType
+  teamname: string
+  timestamp: number
+}
+
+const emptyAuthorData: FlatAuthorData = {
+  author: '',
+  botAlias: '',
+  hiddenHeader: false,
+  isAdhocBot: false,
+  showUsername: '',
+  teamID: '' as T.Teams.TeamID,
+  teamType: 'adhoc',
+  teamname: '',
+  timestamp: 0,
+}
+
+const getRowActions = (
+  messageActions: Pick<RowActions, 'messageDelete' | 'toggleMessageReaction'>,
+  uiDispatch: Pick<ConversationInputState['dispatch'], 'setEditing' | 'reply'>,
+  messageRetry: RowActions['messageRetry']
+): RowActions => {
+  const {messageDelete, toggleMessageReaction} = messageActions
+  const {setEditing, reply} = uiDispatch
+  return {messageDelete, messageRetry, setEditing, reply, toggleMessageReaction}
+}
+
+function AuthorSection(p: AuthorProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {author, botAlias, hiddenHeader, isAdhocBot, teamID, teamType, teamname, timestamp} = p
+  const {showUsername} = p
+
+  const authorRoleInTeam = useChatTeamMemberRole(teamID, author)
+  const onAuthorClick = () => navToProfile(showUsername)
+
+  const authorIsOwner = authorRoleInTeam === 'owner'
+  const authorIsAdmin = authorRoleInTeam === 'admin'
+  const authorIsBot = teamname
+    ? authorRoleInTeam === 'restrictedbot' || authorRoleInTeam === 'bot'
+    : isAdhocBot
+  const allowCrown = teamType !== 'adhoc' && (authorIsOwner || authorIsAdmin)
+
+  const usernameNode = (
+    <Kb.ConnectedUsernames
+      colorBroken={true}
+      colorFollowing={true}
+      colorYou={true}
+      onUsernameClicked={onAuthorClick}
+      type="BodySmallBold"
+      usernames={showUsername}
+      virtualText={true}
+      className="separator-text"
+    />
+  )
+
+  const ownerAdminTooltipIcon = allowCrown ? (
+    <Kb.Box2 alignSelf="center" direction="vertical" tooltip={authorIsOwner ? 'Owner' : 'Admin'}>
+      <Kb.Icon
+        color={authorIsOwner ? theme.yellowDark : theme.black_35}
+        fontSize={10}
+        type="iconfont-crown-owner"
+      />
+    </Kb.Box2>
+  ) : null
+
+  const botIcon = authorIsBot ? (
+    <Kb.Box2 direction="vertical" tooltip="Bot">
+      <Kb.Icon fontSize={13} color={theme.black_35} type="iconfont-bot" />
+    </Kb.Box2>
+  ) : null
+
+  const botAliasOrUsername = botAlias ? (
+    <Kb.Text type="BodySmallBold" style={styles.botAlias} lineClamp={1} className="separator-text">
+      {botAlias} {' [' + showUsername + ']'}
+    </Kb.Text>
+  ) : (
+    usernameNode
+  )
+
+  // hidden: the header keeps its space so the row height never changes, but nothing of it shows.
+  // The avatar is absolutely positioned, so dropping it (and its image fetch) costs no height.
+  return (
+    <>
+      {hiddenHeader ? null : (
+        <Kb.Avatar size={32} username={showUsername} onClick={onAuthorClick} style={styles.avatar} />
+      )}
+      <Kb.Box2
+        pointerEvents={hiddenHeader ? 'none' : 'box-none'}
+        key="author"
+        direction="horizontal"
+        alignItems="flex-start"
+        alignSelf="flex-start"
+        style={hiddenHeader ? styles.authorContainerHidden : styles.authorContainer}
+        gap="tiny"
+      >
+        <Kb.Box2
+          pointerEvents="box-none"
+          direction="horizontal"
+          gap="xtiny"
+          fullWidth={true}
+          style={styles.usernameCrown}
+        >
+          {botAliasOrUsername}
+          {ownerAdminTooltipIcon}
+          {botIcon}
+          <Kb.Text type="BodyTiny" virtualText={true} className="separator-text">
+            {formatTimeForChat(timestamp)}
+          </Kb.Text>
+        </Kb.Box2>
+      </Kb.Box2>
+    </>
+  )
+}
+
+const getAuthorData = (
+  message: T.Chat.Message,
+  meta: Pick<T.Chat.ConversationMeta, 'botAliases' | 'teamID' | 'teamType' | 'teamname'>,
+  participants: T.Chat.ParticipantInfo,
+  showUsername: string,
+  reserveHeader: boolean
+): FlatAuthorData => {
+  if (!showUsername && !reserveHeader) {
+    return emptyAuthorData
+  }
+  const {author, timestamp} = message
+  const {teamID, botAliases, teamType, teamname} = meta
+  const participantInfoNames = participants.name
+  const isAdhocBot =
+    teamType === 'adhoc' && participantInfoNames.length > 0 ? !participantInfoNames.includes(author) : false
+  return {
+    author,
+    botAlias: botAliases[author] ?? '',
+    hiddenHeader: !showUsername,
+    isAdhocBot,
+    // the hidden header still renders the author line, it just doesn't show; it needs a name to
+    // lay out the same way the visible one did
+    showUsername: showUsername || author,
+    teamID,
+    teamType,
+    teamname,
+    timestamp,
+  }
+}
+
+function AuthorHeader(p: FlatAuthorData) {
+  if (!p.showUsername) return null
+  return <AuthorSection {...p} />
+}
+
+const getEcrType = (message: T.Chat.Message, you: string) => {
+  const {errorReason, type, submitState} = message
+  if (!errorReason) return EditCancelRetryType.NONE
+  if (!you) return errorReason ? EditCancelRetryType.NOACTION : EditCancelRetryType.NONE
+  if (message.type === 'text' && message.flipGameID) return EditCancelRetryType.NONE
+  if ((type !== 'text' && type !== 'attachment') || (submitState !== 'pending' && submitState !== 'failed')) {
+    return EditCancelRetryType.NOACTION
+  }
+  const {outboxID, errorTyp} = message
+  if (!!outboxID && errorTyp === T.RPCChat.OutboxErrorType.toolong) return EditCancelRetryType.EDIT_CANCEL
+  if (outboxID) {
+    switch (errorTyp) {
+      case T.RPCChat.OutboxErrorType.minwriter:
+      case T.RPCChat.OutboxErrorType.restrictedbot:
+        return EditCancelRetryType.CANCEL
+      default:
+    }
+  }
+  return EditCancelRetryType.RETRY_CANCEL
+}
+
+const getCommonMessageData = ({
+  accountsInfoMap,
+  isCenteredHighlight,
+  isEditing,
+  message,
+  paymentStatusMap,
+  unfurlPrompt,
+  you,
+}: {
+  accountsInfoMap: AccountsInfoMap
+  isCenteredHighlight?: boolean
+  isEditing: boolean
+  message: T.Chat.Message
+  paymentStatusMap: PaymentStatusMap
+  unfurlPrompt: UnfurlPromptMap
+  you: string
+}) => {
+  const {submitState, author, id, botUsername} = message
+  const type = message.type
+  const exploded = !!message.exploded
+  const hasMessageID = !!T.Chat.messageIDToNumber(id)
+  const idMatchesOrdinal = T.Chat.ordinalToNumber(message.ordinal) === T.Chat.messageIDToNumber(id)
+  const exploding = !!message.exploding
+  const decorate = !exploded && !message.errorReason
+  const isShowingUploadProgressBar =
+    you === author && message.type === 'attachment' && message.inlineVideoPlayable
+  const showSendIndicator =
+    !!submitState && !exploded && you === author && !idMatchesOrdinal && !isShowingUploadProgressBar
+  const showRevoked = !!message.deviceRevokedAt
+  const showExplodingCountdown = !!exploding && !exploded && submitState !== 'failed'
+  const showCoinsIcon = hasSuccessfulInlinePayments(paymentStatusMap, message)
+  const hasReactions = (message.reactions?.size ?? 0) > 0
+  const botname = botUsername === author ? '' : (botUsername ?? '')
+  const canShowReactionsPopup = hasMessageID && Chat.isMessageWithReactions(message)
+  const ecrType = getEcrType(message, you)
+  const shouldShowPopup = hasMessageID && Chat.shouldShowPopup(accountsInfoMap, message)
+  const hasBeenEdited = message.hasBeenEdited ?? false
+  const hasCoinFlip = message.type === 'text' && !!message.flipGameID
+  const hasUnfurlList = (message.unfurls?.size ?? 0) > 0
+  const hasUnfurlPrompts = hasMessageID && !!unfurlPrompt.get(id)?.size
+  const textType: 'error' | 'sent' | 'pending' = message.errorReason
+    ? 'error'
+    : !submitState
+      ? 'sent'
+      : 'pending'
+  const replyTo = message.type === 'text' ? message.replyTo : undefined
+  const reactions = message.reactions
+  const isExplodingMessage = message.type === 'text' || message.type === 'attachment'
+  const showReplyTo = !!replyTo
+  const text =
+    message.type === 'text' ? (message.decoratedText?.stringValue() ?? message.text.stringValue()) : ''
+  const showCenteredHighlight = !!isCenteredHighlight
+  // a message of yours that hasn't been confirmed by the server yet
+  const youSent = you === author && !idMatchesOrdinal && !!submitState
+
+  return {
+    botname,
+    canShowReactionsPopup,
+    decorate,
+    ecrType,
+    exploded,
+    explodedBy: isExplodingMessage ? message.explodedBy : undefined,
+    explodesAt: isExplodingMessage ? message.explodingTime : 0,
+    exploding,
+    forceExplodingRetainer: isExplodingMessage ? !!message.explodingUnreadable : false,
+    hasBeenEdited,
+    hasCoinFlip,
+    hasReactions,
+    hasUnfurlList,
+    hasUnfurlPrompts,
+    isEditing,
+    messageKey: isExplodingMessage ? getMessageKey(message) : '',
+    reactions,
+    replyTo,
+    sendIndicatorFailed:
+      (message.type === 'text' || message.type === 'attachment') && message.submitState === 'failed',
+    sendIndicatorID: message.timestamp,
+    sendIndicatorSent:
+      (message.type !== 'text' && message.type !== 'attachment') || !message.submitState || message.exploded,
+    shouldShowPopup,
+    showCenteredHighlight,
+    showCoinsIcon,
+    showExplodingCountdown,
+    showReplyTo,
+    showRevoked,
+    showSendIndicator,
+    submitState,
+    text,
+    textType,
+    type,
+    youSent,
+  }
+}
+
+const getEditCancelRetryData = (
+  ecrType: EditCancelRetryType,
+  message: T.Chat.Message
+): EditCancelRetryData => {
+  const reason = message.errorReason ?? ''
+  return {
+    failureDescription:
+      ecrType === EditCancelRetryType.NOACTION
+        ? reason
+        : `This message failed to send${reason ? '. ' : ''}${capitalize(reason)}`,
+    outboxID: message.outboxID,
+  }
+}
+
+// Combined selector hook that fetches all common wrapper data in a single subscription.
+// Subscribes to the derived isEditing boolean (not the raw editing ordinal) so only
+// the affected rows re-render when editing starts/stops.
+export const useMessageData = (ordinal: T.Chat.Ordinal, isCenteredHighlight?: boolean) => {
+  const you = useCurrentUserState(s => s.username)
+  const isEditing = InputState.useConversationInput(s => s.editing === ordinal)
+  const uiDispatch = InputState.useConversationInputDispatch(
+    C.useShallow(s => ({setEditing: s.setEditing, reply: s.reply}))
+  )
+  const {retryMessage} = useConversationThreadActions()
+  const target = useThreadMessageTarget(ordinal)
+  const {conversationIDKey} = target
+  const shownCache = React.useContext(ShownUsernameCacheContext)
+  const messageActions = {
+    messageDelete: (ordinal: T.Chat.Ordinal) => deleteMessage({...target, ordinal}),
+    toggleMessageReaction: (ordinal: T.Chat.Ordinal, emoji: string) => toggleReaction({...target, ordinal}, emoji),
+  }
+  // Reload-free read: avoid useConversationParticipants' per-mount unboxRows + engine
+  // listener registration, which is too expensive to pay per message row.
+  const participantInfo = useInboxMetadataState(s => s.participants.get(conversationIDKey)) ?? emptyParticipantInfo
+  const authorMeta = useThreadMeta(
+    C.useShallow(m => ({
+      botAliases: m.botAliases,
+      teamID: m.teamID,
+      teamType: m.teamType,
+      teamname: m.teamname,
+    }))
+  )
+
+  return useConversationThreadSelector(
+    C.useShallow(s => {
+      const message = getConversationThreadDisplayMessage(s, ordinal) ?? missingMessage
+      const commonData = getCommonMessageData({
+        accountsInfoMap: s.accountsInfoMap,
+        isCenteredHighlight,
+        isEditing,
+        message,
+        paymentStatusMap: s.paymentStatusMap,
+        unfurlPrompt: s.unfurlPrompt,
+        you,
+      })
+      const {reserveHeader, showUsername} = RowMetadata.getMessageShowUsername({
+        message,
+        messageMap: s.messageMap,
+        messageOrdinals: s.messageOrdinals ?? [],
+        ordinal,
+        you,
+        shownCache,
+      })
+      return {
+        ...commonData,
+        ...getEditCancelRetryData(commonData.ecrType, message),
+        ...getRowActions(messageActions, uiDispatch, retryMessage),
+        ...getAuthorData(message, authorMeta, participantInfo, showUsername, reserveHeader),
+        message,
+      }
+    })
+  )
+}
+
+const useWrapperPopup = (
+  ordinal: T.Chat.Ordinal,
+  data: Pick<ReturnType<typeof useMessageData>, 'shouldShowPopup' | 'type'>
+) => {
+  const styles = useStyles()
+  const {type, shouldShowPopup} = data
+
+  const shouldShow = () => {
+    return messageShowsPopup(type) && shouldShowPopup
+  }
+  const {showPopup, showingPopup, popup, popupAnchor} = useMessagePopup({
+    ordinal,
+    shouldShow,
+    style: styles.messagePopupContainer,
+  })
+  return {popup, popupAnchor, showPopup, showingPopup}
+}
+
+export const useWrapperMessage = (ordinal: T.Chat.Ordinal, isCenteredHighlight?: boolean) => {
+  const messageData = useMessageData(ordinal, isCenteredHighlight)
+  return {...useWrapperPopup(ordinal, messageData), messageData}
+}
+
+export function makeMessageWrapper<Type extends T.Chat.Message['type']>(
+  type: Type,
+  render: (message: Extract<T.Chat.Message, {type: Type}>) => React.ReactNode
+) {
+  return function WrapperGenerated(p: Props) {
+    const {ordinal, isCenteredHighlight} = p
+    const wrapper = useWrapperMessage(ordinal, isCenteredHighlight)
+    const {message} = wrapper.messageData
+    if (message.type !== type) return null
+    const child = render(message as Extract<T.Chat.Message, {type: Type}>)
+    if (child === null || child === undefined || child === false) return null
+    return (
+      <WrapperMessage {...p} {...wrapper}>
+        {child}
+      </WrapperMessage>
+    )
+  }
+}
+
+type WrapperMessageProps = {
+  children: React.ReactNode
+  bottomChildren?: React.ReactNode
+  showPopup: () => void
+  showingPopup: boolean
+  popup: React.ReactNode
+  popupAnchor: React.RefObject<Kb.MeasureRef | null>
+  messageData: ReturnType<typeof useMessageData>
+} & Props
+
+const successfulInlinePaymentStatuses = ['completed', 'claimable']
+const hasSuccessfulInlinePayments = (
+  paymentStatusMap: PaymentStatusMap,
+  message: T.Chat.Message
+): boolean => {
+  if (message.type !== 'text' || !message.inlinePaymentIDs) {
+    return false
+  }
+  return (
+    message.inlinePaymentSuccessful ||
+    message.inlinePaymentIDs.some(id => {
+      const s = paymentStatusMap.get(id)
+      return !!s && successfulInlinePaymentStatuses.includes(s.status)
+    })
+  )
+}
+
+type TSProps = {
+  botname: string
+  bottomChildren: React.ReactNode
+  canShowReactionsPopup: boolean
+  children: React.ReactNode
+  decorate: boolean
+  ecrType: EditCancelRetryType
+  exploding: boolean
+  exploded: boolean
+  explodedBy?: string
+  explodesAt: number
+  forceExplodingRetainer: boolean
+  hasBeenEdited: boolean
+  hasReactions: boolean
+  hasUnfurlList: boolean
+  isHighlighted: boolean
+  messageKey: string
+  messageDelete: RowActions['messageDelete']
+  messageRetry: RowActions['messageRetry']
+  ordinal: T.Chat.Ordinal
+  outboxID?: T.Chat.OutboxID
+  popupAnchor: React.RefObject<Kb.MeasureRef | null>
+  reactions?: T.Chat.Reactions
+  sendIndicatorFailed: boolean
+  sendIndicatorID: number
+  sendIndicatorSent: boolean
+  setEditing: RowActions['setEditing']
+  reply: RowActions['reply']
+  setShowingPicker: (s: boolean) => void
+  shouldShowPopup: boolean
+  showCoinsIcon: boolean
+  showExplodingCountdown: boolean
+  failureDescription: string
+  showRevoked: boolean
+  showSendIndicator: boolean
+  showingPicker: boolean
+  showingPopup: boolean
+  showPopup: () => void
+  submitState?: T.Chat.Message['submitState']
+  toggleMessageReaction: RowActions['toggleMessageReaction']
+  type: T.Chat.MessageType
+}
+
+const NormalWrapper = ({
+  children,
+  style,
+}: {
+  children: React.ReactNode
+  style: Kb.Styles.StylesCrossPlatform
+}) => {
+  return (
+    <Kb.Box2 direction="vertical" flex={1} relative={true} alignSelf="stretch" style={style} fullWidth={!isMobile}>
+      {children}
+    </Kb.Box2>
+  )
+}
+
+function TextAndSiblings(p: TSProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {
+    botname,
+    bottomChildren,
+    canShowReactionsPopup,
+    children,
+    decorate,
+    hasBeenEdited,
+    hasUnfurlList,
+    isHighlighted,
+  } = p
+  const {showingPopup, ecrType, exploding, exploded, explodedBy, explodesAt, forceExplodingRetainer} = p
+  const {hasReactions, popupAnchor, reactions, sendIndicatorFailed, sendIndicatorID} = p
+  const {sendIndicatorSent, type, setShowingPicker, showCoinsIcon, shouldShowPopup} = p
+  const {showPopup, showExplodingCountdown, showRevoked, showSendIndicator, showingPicker, submitState} = p
+  // Reactions appearing and an unfurl card loading both grow the row after first paint; flush the
+  // measure so the list re-pins to the newest message instead of parking above it.
+  useSyncRowLayout(`${reactions?.size ?? 0}|${hasUnfurlList ? 1 : 0}`)
+  const pressableProps = isMobile
+    ? {
+        onLongPress: decorate && shouldShowPopup ? showPopup : undefined,
+        style: isHighlighted ? {backgroundColor: theme.yellowOrYellowAlt} : undefined,
+      }
+    : {
+        className: Kb.Styles.classNames({
+          TextAndSiblings: true,
+          systemMessage: type.startsWith('system'),
+          // eslint-disable-next-line sort-keys
+          active: showingPopup || showingPicker,
+        }),
+        onContextMenu: shouldShowPopup ? showPopup : undefined,
+      }
+
+  const content = exploding ? (
+    <Kb.Box2 direction="horizontal" fullWidth={true}>
+      <ExplodingHeightRetainer
+        explodedBy={explodedBy}
+        exploding={exploding}
+        messageKey={p.messageKey}
+        retainHeight={forceExplodingRetainer || exploded}
+      >
+        {children as React.ReactElement}
+      </ExplodingHeightRetainer>
+    </Kb.Box2>
+  ) : (
+    children
+  )
+
+  return (
+    <LongPressable {...pressableProps}>
+      <Kb.Box2
+        direction="vertical"
+        flex={1}
+        relative={true}
+        style={styles.middle}
+        alignSelf={isMobile ? 'center' : undefined}
+        fullWidth={!isMobile}
+      >
+        <NormalWrapper style={styles.background}>
+          {content}
+          <BottomSide
+            ecrType={ecrType}
+            exploding={exploding}
+            failureDescription={p.failureDescription}
+            hasBeenEdited={hasBeenEdited}
+            hasReactions={hasReactions}
+            bottomChildren={bottomChildren}
+            canShowReactionsPopup={canShowReactionsPopup}
+            hasUnfurlList={hasUnfurlList}
+            messageDelete={p.messageDelete}
+            messageRetry={p.messageRetry}
+            messageType={type}
+            ordinal={p.ordinal}
+            outboxID={p.outboxID}
+            reactions={reactions}
+            setEditing={p.setEditing}
+            reply={p.reply}
+            setShowingPicker={setShowingPicker}
+            showingPopup={showingPopup}
+            toggleMessageReaction={p.toggleMessageReaction}
+          />
+        </NormalWrapper>
+      </Kb.Box2>
+      <RightSide
+        shouldShowPopup={shouldShowPopup}
+        botname={botname}
+        explodesAt={explodesAt}
+        exploded={exploded}
+        exploding={exploding}
+        messageKey={p.messageKey}
+        sendIndicatorFailed={sendIndicatorFailed}
+        sendIndicatorID={sendIndicatorID}
+        sendIndicatorSent={sendIndicatorSent}
+        showSendIndicator={showSendIndicator}
+        showExplodingCountdown={showExplodingCountdown}
+        showRevoked={showRevoked}
+        showCoinsIcon={showCoinsIcon}
+        showPopup={showPopup}
+        popupAnchor={popupAnchor}
+        submitState={submitState}
+      />
+    </LongPressable>
+  )
+}
+
+// Author
+enum EditCancelRetryType {
+  NONE,
+  NOACTION,
+  CANCEL,
+  EDIT_CANCEL,
+  RETRY_CANCEL,
+}
+function EditCancelRetry(p: {
+  ecrType: EditCancelRetryType
+  exploding: boolean
+  failureDescription: string
+  messageDelete: RowActions['messageDelete']
+  messageRetry: RowActions['messageRetry']
+  outboxID?: T.Chat.OutboxID
+  setEditing: RowActions['setEditing']
+}) {
+  const styles = useStyles()
+  const {ecrType, exploding, failureDescription, messageDelete, messageRetry, outboxID, setEditing} = p
+  const ordinal = useOrdinal()
+  const onCancel = () => {
+    messageDelete(ordinal)
+  }
+  const onEdit = () => {
+    setEditing(ordinal)
+  }
+  const onRetry = () => {
+    if (outboxID) {
+      messageRetry(outboxID)
+    }
+  }
+
+  const cancel =
+    ecrType === EditCancelRetryType.EDIT_CANCEL || ecrType === EditCancelRetryType.RETRY_CANCEL ? (
+      <Kb.Text type="BodySmall" style={styles.failUnderline} onClick={onCancel} virtualText={true}>
+        Cancel
+      </Kb.Text>
+    ) : null
+
+  const or =
+    ecrType === EditCancelRetryType.EDIT_CANCEL || ecrType === EditCancelRetryType.RETRY_CANCEL ? (
+      <Kb.Text type="BodySmall" virtualText={true}>
+        {' or '}
+      </Kb.Text>
+    ) : null
+
+  const action: React.ReactNode =
+    ecrType === EditCancelRetryType.EDIT_CANCEL || ecrType === EditCancelRetryType.RETRY_CANCEL ? (
+      <Kb.Text
+        type="BodySmall"
+        style={styles.failUnderline}
+        onClick={ecrType === EditCancelRetryType.EDIT_CANCEL ? onEdit : onRetry}
+        virtualText={true}
+      >
+        {ecrType === EditCancelRetryType.EDIT_CANCEL ? 'Edit' : 'Retry'}
+      </Kb.Text>
+    ) : null
+
+  return (
+    <Kb.Text key="isFailed" type="BodySmall">
+      <Kb.Text type="BodySmall" style={exploding ? styles.failExploding : styles.fail}>
+        {exploding ? (
+          <>
+            <Kb.Icon fontSize={16} type="iconfont-block" />{' '}
+          </>
+        ) : null}
+        {`${failureDescription}. `}
+      </Kb.Text>
+      {action}
+      {or}
+      {cancel}
+    </Kb.Text>
+  )
+}
+
+type BProps = {
+  showingPopup: boolean
+  setShowingPicker: (s: boolean) => void
+  bottomChildren?: React.ReactNode
+  canShowReactionsPopup: boolean
+  exploding: boolean
+  failureDescription: string
+  hasBeenEdited: boolean
+  hasReactions: boolean
+  hasUnfurlList: boolean
+  messageType: T.Chat.MessageType
+  messageDelete: RowActions['messageDelete']
+  messageRetry: RowActions['messageRetry']
+  ordinal: T.Chat.Ordinal
+  outboxID?: T.Chat.OutboxID
+  reactions?: T.Chat.Reactions
+  setEditing: RowActions['setEditing']
+  reply: RowActions['reply']
+  toggleMessageReaction: RowActions['toggleMessageReaction']
+  ecrType: EditCancelRetryType
+}
+// reactions
+function BottomSide(p: BProps) {
+  const styles = useStyles()
+  const {showingPopup, setShowingPicker, bottomChildren, canShowReactionsPopup, ecrType, hasBeenEdited} = p
+  const {exploding, failureDescription, hasReactions, hasUnfurlList, messageType, ordinal, reactions} = p
+  const {messageDelete, messageRetry, outboxID, setEditing, reply, toggleMessageReaction} = p
+
+  const onReact = (emoji: string) => {
+    toggleMessageReaction(ordinal, emoji)
+  }
+  const onReply = () => {
+    reply(ordinal)
+  }
+
+  const reactionsRow = hasReactions ? (
+    <ReactionsRow
+      hasUnfurls={hasUnfurlList}
+      messageType={messageType}
+      onReact={onReact}
+      onReply={onReply}
+      reactions={reactions}
+    />
+  ) : null
+
+  // EmojiRow is a heavy subtree that's display:none until the row is hovered (CSS
+  // hover-visible), so don't mount it until the pointer has actually entered the row.
+  const rowHovered = React.useContext(RowHoveredContext)
+  const canShowDesktopReactionsPopup = !isMobile && !hasReactions && canShowReactionsPopup
+  const desktopReactionsPopup =
+    canShowDesktopReactionsPopup && rowHovered && !showingPopup ? (
+      <EmojiRow
+        className={Kb.Styles.classNames('WrapperMessage-emojiButton', 'hover-visible')}
+        hasUnfurls={hasUnfurlList}
+        keepWithinList={true}
+        messageType={messageType}
+        onReact={onReact}
+        onReply={onReply}
+        onShowingEmojiPicker={setShowingPicker}
+        style={styles.emojiRow}
+      />
+    ) : null
+
+  const edited = useEdited(hasBeenEdited)
+
+  return (
+    <>
+      {edited}
+      {bottomChildren ?? null}
+      {ecrType !== EditCancelRetryType.NONE ? (
+        <EditCancelRetry
+          ecrType={ecrType}
+          exploding={exploding}
+          failureDescription={failureDescription}
+          messageDelete={messageDelete}
+          messageRetry={messageRetry}
+          outboxID={outboxID}
+          setEditing={setEditing}
+        />
+      ) : null}
+      {reactionsRow}
+      {desktopReactionsPopup}
+    </>
+  )
+}
+
+// Exploding, ... , sending, tombstone
+type RProps = {
+  showPopup: () => void
+  showSendIndicator: boolean
+  showExplodingCountdown: boolean
+  showRevoked: boolean
+  showCoinsIcon: boolean
+  botname: string
+  exploded: boolean
+  exploding: boolean
+  explodesAt: number
+  messageKey: string
+  shouldShowPopup: boolean
+  popupAnchor: React.RefObject<Kb.MeasureRef | null>
+  sendIndicatorFailed: boolean
+  sendIndicatorID: number
+  sendIndicatorSent: boolean
+  submitState?: T.Chat.Message['submitState']
+}
+function RightSide(p: RProps) {
+  const styles = useStyles()
+  const theme = Kb.Styles.useTheme()
+  const {showPopup, showSendIndicator, showCoinsIcon, popupAnchor} = p
+  const {showExplodingCountdown, showRevoked, botname, shouldShowPopup} = p
+  const sendIndicator = showSendIndicator ? (
+    <SendIndicator
+      failed={p.sendIndicatorFailed}
+      id={p.sendIndicatorID}
+      isExploding={p.exploding}
+      sent={p.sendIndicatorSent}
+    />
+  ) : null
+
+  const explodingCountdown = showExplodingCountdown ? (
+    <ExplodingMeta
+      exploded={p.exploded}
+      exploding={p.exploding}
+      explodesAt={p.explodesAt}
+      messageKey={p.messageKey}
+      onClick={shouldShowPopup ? showPopup : undefined}
+      submitState={p.submitState}
+    />
+  ) : null
+
+  const revokedIcon = showRevoked ? (
+    <Kb.Box2 direction="vertical" tooltip="Revoked device" className="tooltip-bottom-left">
+      <Kb.Icon type="iconfont-rip" color={theme.black_35} />
+    </Kb.Box2>
+  ) : null
+
+  const coinsIcon = showCoinsIcon ? <Kb.ImageIcon type="icon-stellar-coins-stacked-16" /> : null
+
+  const bot = botname ? (
+    <Kb.Box2 alignSelf="center" direction="vertical" tooltip={`Encrypted for @${botname}`} className="tooltip-bottom-left">
+      <Kb.Icon color={theme.black_35} type="iconfont-bot" />
+    </Kb.Box2>
+  ) : null
+
+  const hasVisibleItems = !!explodingCountdown || !!revokedIcon || !!coinsIcon || !!bot
+
+  // On mobile there is no ... menu
+  // On Desktop we float the menu on top, if there are no items
+  // if there are items we show them. We want the ... to take space but not be visible, so we move it to the
+  // left, then on hover we invert the list so its on the right. Theres usually only 1 non menu item so this
+  // is fine
+
+  const menu =
+    isMobile || !shouldShowPopup ? null : (
+      <Kb.Box2
+        direction="vertical"
+        tooltip="More actions..."
+        className={Kb.Styles.classNames(
+          hasVisibleItems ? 'hover-opacity-full' : 'hover-visible',
+          'tooltip-left'
+        )}
+      >
+        <Kb.Box2 direction="vertical">
+          <Kb.Icon type="iconfont-ellipsis" onClick={showPopup} testID={TestIDs.CHAT_MESSAGE_MENU_BUTTON} />
+        </Kb.Box2>
+      </Kb.Box2>
+    )
+
+  const visibleItems =
+    hasVisibleItems || menu ? (
+      <Kb.Box2
+        direction="horizontal"
+        alignSelf="flex-start"
+        style={hasVisibleItems ? styles.rightSideItems : styles.rightSide}
+        gap="tiny"
+        className={Kb.Styles.classNames({
+          'hover-reverse-row': hasVisibleItems && menu,
+          'hover-visible': !hasVisibleItems && menu,
+        })}
+        ref={popupAnchor}
+      >
+        {menu}
+        {explodingCountdown}
+        {revokedIcon}
+        {coinsIcon}
+        {bot}
+      </Kb.Box2>
+    ) : null
+
+  return (
+    <>
+      {visibleItems}
+      {sendIndicator}
+    </>
+  )
+}
+
+export function WrapperMessage(p: WrapperMessageProps) {
+  const {ordinal, bottomChildren, children, messageData: mdata} = p
+  const {showPopup, showingPopup, popup, popupAnchor} = p
+
+  const {decorate, type, hasReactions, isEditing, shouldShowPopup} = mdata
+  const {canShowReactionsPopup, ecrType, exploded, explodesAt, forceExplodingRetainer, messageKey} = mdata
+  const {reactions, sendIndicatorFailed, sendIndicatorID, sendIndicatorSent, submitState} = mdata
+  const {showSendIndicator, showRevoked, showExplodingCountdown, exploding} = mdata
+  const {showCoinsIcon, botname, hasBeenEdited, hasUnfurlList, showCenteredHighlight} = mdata
+  const {failureDescription, messageDelete, messageRetry, outboxID} = mdata
+  const {setEditing, reply, toggleMessageReaction} = mdata
+  const {author, botAlias, hiddenHeader, isAdhocBot, showUsername, teamID, teamType, teamname} = mdata
+  const {timestamp} = mdata
+
+  // Both pieces of per-row state are keyed to messageKey and reset when it changes: with
+  // recycleItems the component instance is REUSED for a different message, so plain mount-captured
+  // state would leak across rows (picker open on the wrong row, sent-animation wrapper stuck on).
+  // Same-message updates keep the captured value, so the tree stays stable when the message is
+  // later confirmed (youSent flips false).
+  const [rowState, setRowState] = React.useState(() => ({
+    animateSent: isMobile && mdata.youSent,
+    key: messageKey,
+    showingPicker: false,
+  }))
+  if (rowState.key !== messageKey) {
+    setRowState({animateSent: isMobile && mdata.youSent, key: messageKey, showingPicker: false})
+  }
+  const {animateSent, showingPicker} = rowState
+  const setShowingPicker = React.useCallback((s: boolean) => {
+    setRowState(prev => (prev.showingPicker === s ? prev : {...prev, showingPicker: s}))
+  }, [])
+
+  const isHighlighted = showCenteredHighlight || isEditing
+  const tsprops = {
+    botname,
+    bottomChildren,
+    canShowReactionsPopup,
+    children,
+    decorate,
+    ecrType,
+    exploded,
+    explodedBy: mdata.explodedBy,
+    explodesAt,
+    exploding,
+    failureDescription,
+    forceExplodingRetainer,
+    hasBeenEdited,
+    hasReactions,
+    hasUnfurlList,
+    isHighlighted,
+    messageDelete,
+    messageKey,
+    messageRetry,
+    ordinal,
+    outboxID,
+    popupAnchor,
+    reactions,
+    sendIndicatorFailed,
+    sendIndicatorID,
+    sendIndicatorSent,
+    setEditing,
+    reply,
+    setShowingPicker,
+    shouldShowPopup,
+    showCoinsIcon,
+    showExplodingCountdown,
+    showPopup,
+    showRevoked,
+    showSendIndicator,
+    showingPicker,
+    showingPopup,
+    submitState,
+    toggleMessageReaction,
+    type,
+  }
+
+  const messageContext = {isHighlighted: showCenteredHighlight, ordinal}
+
+  const row = (
+    <Kb.Box2 direction="vertical" relative={true} fullWidth={true}>
+      <AuthorHeader
+        author={author}
+        botAlias={botAlias}
+        hiddenHeader={hiddenHeader}
+        isAdhocBot={isAdhocBot}
+        showUsername={showUsername}
+        teamID={teamID}
+        teamType={teamType}
+        teamname={teamname}
+        timestamp={timestamp}
+      />
+      <TextAndSiblings {...tsprops} />
+    </Kb.Box2>
+  )
+
+  return (
+    <MessageContext value={messageContext}>
+      {/* keyed so a recycled container going straight from one of your sends to another remounts
+          the Animated.View — the entering animation only plays on mount */}
+      {animateSent ? <Sent key={messageKey}>{row}</Sent> : row}
+      {popup}
+    </MessageContext>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      authorContainer: Kb.Styles.platformStyles({
+        common: {
+          marginLeft: isMobile ? 48 : 56,
+        },
+        isElectron: {
+          ...Kb.Styles.marginV(0),
+        },
+        isMobile: {marginTop: 8},
+      }),
+      authorContainerHidden: Kb.Styles.platformStyles({
+        common: {
+          marginLeft: isMobile ? 48 : 56,
+          opacity: 0,
+        },
+        isElectron: {
+          ...Kb.Styles.marginV(0),
+          visibility: 'hidden',
+        },
+        isMobile: {marginTop: 8},
+      }),
+      avatar: Kb.Styles.platformStyles({
+        common: {position: 'absolute', top: 4},
+        isElectron: {
+          left: Kb.Styles.globalMargins.small,
+          top: 4,
+          zIndex: 2,
+        },
+        isMobile: {
+          left: Kb.Styles.globalMargins.tiny,
+          zIndex: 2,
+        },
+      }),
+      background: {
+        flexShrink: 1,
+      },
+      botAlias: Kb.Styles.platformStyles({
+        common: {color: theme.black},
+        isElectron: {
+          maxWidth: 240,
+          wordBreak: 'break-all',
+        },
+        isMobile: {maxWidth: 120},
+      }),
+      emojiRow: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.white,
+          border: `1px solid ${theme.black_10}`,
+          borderRadius: Kb.Styles.borderRadius,
+          bottom: -Kb.Styles.globalMargins.medium + 3,
+          paddingRight: Kb.Styles.globalMargins.xtiny,
+          position: 'absolute',
+          right: 96,
+          zIndex: 2,
+        },
+      }),
+      fail: {color: theme.redDark},
+      failExploding: {color: theme.black_50},
+      failUnderline: {color: theme.redDark, textDecorationLine: 'underline'},
+      // desktop anchored menu offset; on mobile this would shift the bottom sheet's content left
+      messagePopupContainer: Kb.Styles.platformStyles({
+        isElectron: {marginRight: Kb.Styles.globalMargins.small},
+      }),
+      middle: {
+        flexShrink: 1,
+        paddingLeft: isMobile ? 48 : 56,
+        paddingRight: 4,
+      },
+      rightSide: Kb.Styles.platformStyles({
+        common: {
+          borderRadius: Kb.Styles.borderRadius,
+          minHeight: 20,
+          ...Kb.Styles.paddingH(Kb.Styles.globalMargins.tiny),
+        },
+        isElectron: {
+          backgroundColor: theme.white_90,
+          minHeight: 14,
+          position: 'absolute',
+          right: 16,
+          top: 4,
+        },
+      }),
+      rightSideItems: Kb.Styles.platformStyles({
+        common: {
+          borderRadius: Kb.Styles.borderRadius,
+          minHeight: 20,
+          paddingLeft: Kb.Styles.globalMargins.tiny,
+        },
+        isElectron: {minHeight: 14},
+      }),
+      usernameCrown: Kb.Styles.platformStyles({
+        isElectron: {
+          alignItems: 'baseline',
+          marginRight: 48,
+          position: 'relative',
+          top: -2,
+        },
+        isMobile: {alignItems: 'center'},
+      }),
+    }) as const
+)

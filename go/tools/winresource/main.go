@@ -5,6 +5,7 @@
 // for printing out or generating compiled resources for the windows
 // executable.
 
+//go:build windows
 // +build windows
 
 package main
@@ -17,9 +18,8 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
-	"time"
-
 	"strconv"
+	"time"
 
 	"github.com/akavel/rsrc/binutil"
 	"github.com/akavel/rsrc/coff"
@@ -37,7 +37,6 @@ func getBuildName() string {
 	}
 
 	return fmt.Sprintf("%d%02d%02d%02d%02d%02d+%s", time.Now().Year(), time.Now().Month(), time.Now().Day(), time.Now().Hour(), time.Now().Minute(), time.Now().Second(), gitHash)
-
 }
 
 // kbWriteSyso creates a resource file from the version info and optionally an icon.
@@ -45,7 +44,6 @@ func getBuildName() string {
 // Note this is partially lifted from josephspurrier/goversioninfo, which we
 // extend here to write multiple icons.
 func kbWriteSyso(vi *goversioninfo.VersionInfo, filename string, arch string, icons []string) error {
-
 	// Channel for generating IDs
 	newID := make(chan uint16)
 	go func() {
@@ -64,7 +62,7 @@ func kbWriteSyso(vi *goversioninfo.VersionInfo, filename string, arch string, ic
 	}
 
 	// ID 16 is for Version Information
-	coff.AddResource(16, 1, goversioninfo.SizedReader{&vi.Buffer})
+	coff.AddResource(16, 1, goversioninfo.SizedReader{Buffer: &vi.Buffer})
 
 	// NOTE: if/when we start using a manifest, it goes here
 
@@ -76,8 +74,10 @@ func kbWriteSyso(vi *goversioninfo.VersionInfo, filename string, arch string, ic
 	}
 	// if extra icons were passed in
 	for _, i := range icons {
-		if err := addIcon(coff, i, newID); err != nil {
-			return err
+		if i != "" {
+			if err := addIcon(coff, i, newID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -126,14 +126,13 @@ func writeCoffTo(w io.WriteCloser, coff *coff.Coff) error {
 
 // Create the syso and custom build file
 func main() {
-
 	outPtr := flag.String("o", "rsrc_windows.syso", "resource output pathname")
 	printverPtr := flag.Bool("v", false, "print version to console (no .syso output)")
 	printCustomVerPtr := flag.Bool("cv", false, "print custom version to console (no .syso output)")
 	printCustomBuildPtr := flag.Bool("cb", false, "print custom build number to console (no .syso output)")
 	printWinVerPtr := flag.Bool("w", false, "print windows format version to console (no .syso output)")
 	iconPtr := flag.String("i", "../../media/icons/Keybase.ico", "icon pathname")
-	kbfsIconPtr := flag.String("kbfsicon", "../../media/icons/windows/keybase-root-icon.ico", "icon pathname")
+	kbfsIconPtr := flag.String("kbfsicon", "", "icon pathname")
 	fileDescriptionPtr := flag.String("d", "Keybase utility", "File Description")
 	originalFilenamePtr := flag.String("n", "keybase.exe", "File name")
 
@@ -218,5 +217,4 @@ func main() {
 		log.Printf("Error writing %s: %v", *outPtr, err)
 		os.Exit(3)
 	}
-
 }

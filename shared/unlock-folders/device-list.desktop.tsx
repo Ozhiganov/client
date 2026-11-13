@@ -1,0 +1,90 @@
+import * as Kb from '@/common-adapters'
+import type {UnlockFolderDevice} from './store'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type Props = {
+  devices: ReadonlyArray<UnlockFolderDevice>
+  toPaperKeyInput: () => void
+}
+
+const DeviceRow = ({device}: {device: UnlockFolderDevice}) => {
+  const styles = useStyles()
+  const icon = (
+    {
+      backup: 'icon-paper-key-32',
+      desktop: 'icon-computer-32',
+      mobile: 'icon-phone-32',
+    } as const
+  )[device.type]
+
+  return (
+    <Kb.Box2 direction="horizontal" gap="small">
+      <Kb.Box2 alignSelf="center" direction="horizontal" centerChildren={true} style={styles.iconWrapper}>
+        <Kb.ImageIcon type={icon} style={{height: 22}} />
+      </Kb.Box2>
+      <Kb.Text type="BodySemibold">{device.name}</Kb.Text>
+    </Kb.Box2>
+  )
+}
+
+const DeviceList = (props: Props) => {
+  const styles = useStyles()
+  return (
+    <Kb.Box2 direction="vertical" alignItems="center">
+      <Kb.Text center={true} type="Body" style={styles.infoText}>
+        This computer and possibly others are unable to read some of your folders. To avoid losing data forever,
+        please turn on one of the devices below:
+      </Kb.Text>
+      <Kb.Box2 direction="vertical" gap="small" style={styles.devicesContainer} testID={TestIDs.UNLOCK_FOLDERS_DEVICES}>
+        {props.devices.map(d => (
+          <DeviceRow key={d.deviceID} device={d} />
+        ))}
+      </Kb.Box2>
+      <Kb.Box2 direction="horizontal" style={styles.buttonsContainer}>
+        <Kb.Button
+          type="Dim"
+          label="Enter a paper key instead"
+          style={styles.enterPaperKey}
+          onClick={props.toPaperKeyInput}
+          testID={TestIDs.UNLOCK_FOLDERS_PAPER_KEY_BUTTON}
+        />
+      </Kb.Box2>
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(
+  theme =>
+    ({
+      buttonsContainer: {
+        marginRight: 30,
+        marginTop: Kb.Styles.globalMargins.small,
+      },
+      devicesContainer: Kb.Styles.platformStyles({
+        isElectron: {
+          backgroundColor: theme.greyLight,
+          height: 162,
+          overflowY: 'auto',
+          ...Kb.Styles.paddingV(Kb.Styles.globalMargins.small),
+          scrollbarGutter: 'stable',
+          width: 440,
+        },
+      }),
+      enterPaperKey: {
+        height: 32,
+        marginRight: 7,
+        width: 236,
+      },
+      iconWrapper: {
+        marginLeft: 33,
+        width: 24,
+      },
+      infoText: {
+        marginBottom: 8,
+        marginTop: 5,
+        ...Kb.Styles.paddingH(55),
+      },
+    }) as const
+)
+
+export default DeviceList

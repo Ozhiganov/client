@@ -6,7 +6,9 @@ package engine
 import (
 	"testing"
 
+	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPGPKeyGenPush(t *testing.T) {
@@ -15,7 +17,7 @@ func TestPGPKeyGenPush(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "pgp")
 	pgpUI := &TestPgpUI{ShouldPush: true}
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 		PgpUI:    pgpUI,
@@ -29,8 +31,13 @@ func TestPGPKeyGenPush(t *testing.T) {
 		},
 	}
 	eng := NewPGPKeyGen(tc.G, arg)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng.genArg = &libkb.PGPGenArg{
+		PrimaryBits: 768,
+		SubkeyBits:  768,
+	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	xarg := keybase1.PGPExportArg{
@@ -39,13 +46,11 @@ func TestPGPKeyGenPush(t *testing.T) {
 			Query:  pgpUI.Generated.Key.Fingerprint,
 		},
 	}
-	xe := NewPGPKeyExportEngine(xarg, tc.G)
-	if err := RunEngine(xe, ctx); err != nil {
-		t.Fatal(err)
+	xe := NewPGPKeyExportEngine(tc.G, xarg)
+	if err := RunEngine2(m, xe); err != nil {
+		require.NoError(t, err)
 	}
-	if len(xe.Results()) != 1 {
-		t.Errorf("result keys: %d, expected 1", len(xe.Results()))
-	}
+	require.Len(t, xe.Results(), 1, "result keys: %d, expected 1", len(xe.Results()))
 }
 
 func TestPGPKeyGenNoPush(t *testing.T) {
@@ -54,7 +59,7 @@ func TestPGPKeyGenNoPush(t *testing.T) {
 
 	u := CreateAndSignupFakeUser(tc, "pgp")
 	pgpUI := &TestPgpUI{ShouldPush: false}
-	ctx := &Context{
+	uis := libkb.UIs{
 		LogUI:    tc.G.UI.GetLogUI(),
 		SecretUI: u.NewSecretUI(),
 		PgpUI:    pgpUI,
@@ -68,8 +73,13 @@ func TestPGPKeyGenNoPush(t *testing.T) {
 		},
 	}
 	eng := NewPGPKeyGen(tc.G, arg)
-	if err := RunEngine(eng, ctx); err != nil {
-		t.Fatal(err)
+	eng.genArg = &libkb.PGPGenArg{
+		PrimaryBits: 768,
+		SubkeyBits:  768,
+	}
+	m := NewMetaContextForTest(tc).WithUIs(uis)
+	if err := RunEngine2(m, eng); err != nil {
+		require.NoError(t, err)
 	}
 
 	xarg := keybase1.PGPExportArg{
@@ -78,11 +88,9 @@ func TestPGPKeyGenNoPush(t *testing.T) {
 			Query:  pgpUI.Generated.Key.Fingerprint,
 		},
 	}
-	xe := NewPGPKeyExportEngine(xarg, tc.G)
-	if err := RunEngine(xe, ctx); err != nil {
-		t.Fatal(err)
+	xe := NewPGPKeyExportEngine(tc.G, xarg)
+	if err := RunEngine2(m, xe); err != nil {
+		require.NoError(t, err)
 	}
-	if len(xe.Results()) != 1 {
-		t.Errorf("result keys: %d, expected 1", len(xe.Results()))
-	}
+	require.Len(t, xe.Results(), 1, "result keys: %d, expected 1", len(xe.Results()))
 }

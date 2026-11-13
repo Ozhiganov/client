@@ -1,0 +1,243 @@
+import * as C from '@/constants'
+import * as Chat from '@/constants/chat'
+import * as React from 'react'
+import {produce} from 'immer'
+import * as T from '@/constants/types'
+import {useConfigState} from '@/stores/config'
+import {useCurrentUserState} from '@/stores/current-user'
+import {useInboxBadgeState} from '@/chat/inbox/badge-state'
+import {useIsFocused} from '@react-navigation/core'
+import type {ChatInboxRowItem} from './rowitem'
+import {useInboxLayout, useInboxRetryState} from './layout-state'
+import {buildInboxRows} from './rows'
+import {queueMetaToRequest} from './metadata'
+
+const useInboxBadges = (inboxRows: ReadonlyArray<ChatInboxRowItem>, selectedConversationIDKey: string) => {
+  const bigConvIds = React.useMemo(() => {
+    return inboxRows.map(r => (r.type === 'big' ? r.conversationIDKey : ''))
+  }, [inboxRows])
+
+  const unreadBadges = useInboxBadgeState(
+    C.useShallow(s =>
+      bigConvIds.map(conversationIDKey =>
+        conversationIDKey ? (s.counts.get(conversationIDKey)?.badgeCount ?? 0) : 0
+      )
+    )
+  )
+
+  const unreadIndices = React.useMemo(() => {
+    const next: Map<number, number> = new Map()
+    unreadBadges.forEach((badge, idx) => {
+      if (badge > 0) {
+        next.set(idx, badge)
+      }
+    })
+    return next
+  }, [unreadBadges])
+
+  let unreadTotal = 0
+  unreadIndices.forEach(count => {
+    unreadTotal += count
+  })
+
+  if (selectedConversationIDKey === Chat.noConversationIDKey || !unreadIndices.size) {
+    return {unreadIndices, unreadTotal}
+  }
+
+  const filteredIndices = new Map<number, number>()
+  let filteredTotal = 0
+  unreadIndices.forEach((badge, idx) => {
+    const row = inboxRows[idx]
+    if (row?.type === 'big' && row.conversationIDKey !== selectedConversationIDKey) {
+      filteredIndices.set(idx, badge)
+      filteredTotal += badge
+    }
+  })
+  return {unreadIndices: filteredIndices, unreadTotal: filteredTotal}
+}
+
+export function useInboxState(
+  conversationIDKey?: string,
+  isSearching = false,
+  refreshInbox?: T.Chat.ChatRootInboxRefresh
+) {
+  const isFocused = useIsFocused()
+  // Matches isChatSessionReady, which gates the inbox RPCs: loads skipped while a switch runs have
+  // to fire again once it ends.
+  const sessionReady = useConfigState(s => s.loggedIn && !s.userSwitching)
+  const username = useCurrentUserState(s => s.username)
+  const loadInboxNumSmallRows = C.useRPC(T.RPCGen.configGuiGetValueRpcPromise)
+
+  const {hasLoaded: inboxHasLoaded, layout: inboxLayout, refresh: inboxRefresh} = useInboxLayout()
+  const {retriedOnCurrentEmpty: inboxRetriedOnCurrentEmpty, setRetriedOnCurrentEmpty} = useInboxRetryState()
+  const [inboxControls, setInboxControls] = React.useState(() => ({
+    inboxNumSmallRows: 5,
+    inboxNumSmallRowsLoaded: false,
+    inboxNumSmallRowsUserChanged: false,
+    smallTeamsExpanded: false,
+  }))
+  const {inboxNumSmallRows, inboxNumSmallRowsLoaded, smallTeamsExpanded} = inboxControls
+  const inboxNumSmallRowsLoadVersionRef = React.useRef(0)
+
+  const setInboxNumSmallRows = React.useCallback((rows: number, persist = true) => {
+    if (rows <= 0) {
+      return
+    }
+    setInboxControls(
+      produce(draft => {
+        draft.inboxNumSmallRows = rows
+        draft.inboxNumSmallRowsLoaded = true
+        draft.inboxNumSmallRowsUserChanged = true
+      })
+    )
+    if (!persist) {
+      return
+    }
+    const f = async () => {
+      try {
+        await T.RPCGen.configGuiSetValueRpcPromise({
+          path: 'ui.inboxSmallRows',
+          value: {i: rows, isNull: false},
+        })
+      } catch {}
+    }
+    C.ignorePromise(f())
+  }, [])
+  const toggleSmallTeamsExpanded = React.useCallback(() => {
+    setInboxControls(
+      produce(draft => {
+        draft.smallTeamsExpanded = !draft.smallTeamsExpanded
+      })
+    )
+  }, [])
+
+  const {
+    allowShowFloatingButton,
+    rows: inboxRows,
+    smallTeamsExpanded: showAllSmallTeams,
+  } = React.useMemo(
+    () => buildInboxRows(inboxLayout, inboxNumSmallRows, smallTeamsExpanded),
+    [inboxLayout, inboxNumSmallRows, smallTeamsExpanded]
+  )
+
+  const appendNewChatBuilder = C.Router2.appendNewChatBuilder
+  const selectedConversationIDKey = conversationIDKey ?? Chat.noConversationIDKey
+
+  const handledRefreshNonceRef = React.useRef('')
+
+  C.useOnMountOnce(() => {
+    if (!C.isPhone && !inboxHasLoaded) {
+      C.ignorePromise(inboxRefresh('componentNeverLoaded'))
+    }
+  })
+
+  React.useEffect(() => {
+    const ready = sessionReady && !!username && (!isMobile || isFocused)
+    if (!ready || !refreshInbox || handledRefreshNonceRef.current === refreshInbox.nonce) {
+      return
+    }
+    handledRefreshNonceRef.current = refreshInbox.nonce
+    C.ignorePromise(inboxRefresh(refreshInbox.reason))
+    C.Router2.setChatRootParams({refreshInbox: undefined})
+  }, [inboxRefresh, isFocused, sessionReady, refreshInbox, username])
+
+  C.Router2.useSafeFocusEffect(
+    React.useCallback(() => {
+      if (!inboxHasLoaded) {
+        C.ignorePromise(inboxRefresh('componentNeverLoaded'))
+      }
+    }, [inboxHasLoaded, inboxRefresh])
+  )
+
+  React.useEffect(() => {
+    const ready = sessionReady && !!username
+    const shouldRetry = !inboxHasLoaded && ready && (!isMobile || isFocused)
+    if (shouldRetry) {
+      C.ignorePromise(inboxRefresh('componentNeverLoaded'))
+    }
+  }, [inboxHasLoaded, inboxRefresh, isFocused, sessionReady, username])
+
+  React.useEffect(() => {
+    const ready = sessionReady && !!username
+    if (!ready) {
+      return
+    }
+    if (inboxNumSmallRowsLoaded) {
+      return
+    }
+    const loadVersion = inboxNumSmallRowsLoadVersionRef.current + 1
+    inboxNumSmallRowsLoadVersionRef.current = loadVersion
+    loadInboxNumSmallRows(
+      [{path: 'ui.inboxSmallRows'}],
+      rows => {
+        if (inboxNumSmallRowsLoadVersionRef.current !== loadVersion) {
+          return
+        }
+        const count = rows.i ?? -1
+        setInboxControls(
+          produce(draft => {
+            if (draft.inboxNumSmallRowsUserChanged) {
+              return
+            }
+            if (count > 0) {
+              draft.inboxNumSmallRows = count
+            }
+            draft.inboxNumSmallRowsLoaded = true
+          })
+        )
+      },
+      () => {
+        if (inboxNumSmallRowsLoadVersionRef.current !== loadVersion) {
+          return
+        }
+        setInboxControls(
+          produce(draft => {
+            draft.inboxNumSmallRowsLoaded = true
+          })
+        )
+      }
+    )
+    return () => {
+      if (inboxNumSmallRowsLoadVersionRef.current === loadVersion) {
+        inboxNumSmallRowsLoadVersionRef.current++
+      }
+    }
+  }, [inboxNumSmallRowsLoaded, loadInboxNumSmallRows, sessionReady, username])
+
+  React.useEffect(() => {
+    const ready = sessionReady && !!username && (!isMobile || isFocused)
+    if (!ready || isSearching || !inboxHasLoaded || inboxRows.length > 0 || inboxRetriedOnCurrentEmpty) {
+      return
+    }
+    setRetriedOnCurrentEmpty(true)
+    C.ignorePromise(inboxRefresh('inboxSyncedCurrentButEmpty'))
+  }, [
+    inboxHasLoaded,
+    inboxRefresh,
+    inboxRetriedOnCurrentEmpty,
+    inboxRows.length,
+    isFocused,
+    isSearching,
+    sessionReady,
+    setRetriedOnCurrentEmpty,
+    username,
+  ])
+
+  const {unreadIndices, unreadTotal} = useInboxBadges(inboxRows, selectedConversationIDKey)
+
+  return {
+    allowShowFloatingButton,
+    inboxNumSmallRows,
+    isSearching,
+    neverLoaded: !inboxHasLoaded,
+    onNewChat: appendNewChatBuilder,
+    onUntrustedInboxVisible: queueMetaToRequest,
+    rows: inboxRows,
+    selectedConversationIDKey,
+    setInboxNumSmallRows,
+    smallTeamsExpanded: showAllSmallTeams,
+    toggleSmallTeamsExpanded,
+    unreadIndices,
+    unreadTotal,
+  }
+}

@@ -1,0 +1,70 @@
+// Copyright 2016 Keybase Inc. All rights reserved.
+// Use of this source code is governed by a BSD
+// license that can be found in the LICENSE file.
+
+package kbfssync
+
+import (
+	"context"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func testRepeatedWaitGroupSimpleWait(t *testing.T, rwg *RepeatedWaitGroup) {
+	// Start 10 tasks, wait for them all to complete
+	rwg.Add(10)
+	errChan := make(chan error)
+	go func() {
+		errChan <- rwg.Wait(context.Background())
+	}()
+	for range 10 {
+		rwg.Done()
+	}
+	err := <-errChan
+	assert.NoError(t, err,
+		"Error on wait: %v", err)
+}
+
+func TestRepeatedWaitGroupSimpleWait(t *testing.T) {
+	var rwg RepeatedWaitGroup
+	testRepeatedWaitGroupSimpleWait(t, &rwg)
+}
+
+func TestRepeatedWaitGroupCanceledWait(t *testing.T) {
+	// Start 10 tasks, wait for them all to complete
+	var rwg RepeatedWaitGroup
+	rwg.Add(10)
+	errChan := make(chan error)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		errChan <- rwg.Wait(ctx)
+	}()
+	// Only finish half the tasks
+	for range 5 {
+		rwg.Done()
+	}
+	cancel()
+	err := <-errChan
+	require.ErrorIs(t, err, context.Canceled,
+		"Unexpected error on wait: %v", err)
+}
+
+func TestRepeatedWaitGroupMultiWait(t *testing.T) {
+	var rwg RepeatedWaitGroup
+	// Three in serial
+	for range 3 {
+		testRepeatedWaitGroupSimpleWait(t, &rwg)
+	}
+
+	// Three in parallel!
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() {
+			testRepeatedWaitGroupSimpleWait(t, &rwg)
+		})
+	}
+	wg.Wait()
+}

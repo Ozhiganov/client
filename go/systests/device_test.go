@@ -1,13 +1,14 @@
 package systests
 
 import (
+	"context"
 	"fmt"
+	"testing"
+
 	"github.com/keybase/client/go/client"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
-	context "golang.org/x/net/context"
-	"strings"
-	"testing"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRevokeDevices(t *testing.T) {
@@ -34,14 +35,14 @@ func TestRevokeDevices(t *testing.T) {
 
 	// Add a new TLF (private/tester#alice) that's fully keyed
 	dev1.keyNewTLF(set.uid,
-		[]tlfUser{tlfUser{set.uid, []keybase1.KID{dev1.KID(), dev2.KID(), set.backupKeys[0].KID}}},
+		[]tlfUser{{set.uid, []keybase1.KID{dev1.KID(), dev2.KID(), set.backupKeys[0].KID}}},
 		[]tlfUser{alice},
 	)
 
 	// Add a new TLF (private/tester#mike) that isn't keyed for the current
 	// device
 	tlf2 := dev1.keyNewTLF(set.uid,
-		[]tlfUser{tlfUser{set.uid, []keybase1.KID{dev2.KID(), set.backupKeys[0].KID}}},
+		[]tlfUser{{set.uid, []keybase1.KID{dev2.KID(), set.backupKeys[0].KID}}},
 		[]tlfUser{mike},
 	)
 
@@ -52,22 +53,20 @@ func TestRevokeDevices(t *testing.T) {
 		ActingDevice: dev1.deviceID,
 		TargetDevice: dev2.deviceID,
 	})
-
-	if err != nil {
-		t.Fatalf("Bad answer from RPC: %s", err)
-	}
+	require.NoError(t, err,
+		"Bad answer from RPC: %s", err)
 
 	if n := len(res.EndangeredTLFs); n != 1 {
-		t.Fatalf("Expected 1 endangered TLF: got %d", n)
+		require.FailNow(t, fmt.Sprintf("Expected 1 endangered TLF: got %d", n))
 	}
 
 	if id := res.EndangeredTLFs[0].Id; id != tlf2.id {
-		t.Fatalf("Got wrong TLF ID; wanted %s; but got %s", tlf2.id, id)
+		require.FailNow(t, fmt.Sprintf("Got wrong TLF ID; wanted %s; but got %s", tlf2.id, id))
 	}
 
 	expectedName := fmt.Sprintf("private/%s#%s", set.username, "t_mike")
 	if nm := res.EndangeredTLFs[0].Name; nm != expectedName {
-		t.Fatalf("Got wrong TLF name; wanted %q; but got %q", expectedName, nm)
+		require.FailNow(t, fmt.Sprintf("Got wrong TLF name; wanted %q; but got %q", expectedName, nm))
 	}
 
 	run := func(accept bool) {
@@ -91,13 +90,10 @@ func TestRevokeDevices(t *testing.T) {
 		runner.SetIDOrName(dev2.deviceName)
 		err = runner.Run()
 
-		if (err == nil) != accept {
-			t.Fatalf("With accept=%v, got unexpected error: %v", accept, err)
-		}
+		require.Equal(t, accept, err == nil, "With accept=%v, got unexpected error: %v", accept, err)
 
-		if strings.Index(prompt, expectedName) < 0 {
-			t.Fatalf("didn't find expected TLF name %q", expectedName)
-		}
+		require.Contains(t, prompt, expectedName,
+			"didn't find expected TLF name %q", expectedName)
 	}
 	run(false)
 	run(true)

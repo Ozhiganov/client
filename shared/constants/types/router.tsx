@@ -1,0 +1,74 @@
+import type * as Styles from '@/styles'
+import type {NativeStackNavigationProp, NativeStackNavigationOptions} from '@react-navigation/native-stack'
+import type {ParamListBase, RouteProp} from '@react-navigation/native'
+import type {HeaderBackButtonProps} from '@react-navigation/elements'
+
+type RouteNameFor<ParamList extends ParamListBase> = Extract<keyof ParamList, string>
+
+export type GetOptionsParams<
+  ParamList extends ParamListBase = ParamListBase,
+  RouteName extends RouteNameFor<ParamList> = RouteNameFor<ParamList>,
+> = {
+  navigation: NativeStackNavigationProp<ParamList, RouteName>
+  route: RouteProp<ParamList, RouteName>
+}
+
+export type ModalSize = 'small' | 'medium' | 'large'
+
+// Properties consumed by our layout functions (not React Navigation)
+export type LayoutOptions = {
+  safeAreaStyle?: Styles.StylesCrossPlatform
+  // which edges the modal SafeAreaView insets; omit = all edges. Drop 'bottom'
+  // to let a scrolling body run edge-to-edge (its own content inset clears the
+  // home indicator) instead of leaving a blank safe-area strip below it.
+  safeAreaEdges?: ReadonlyArray<'top' | 'right' | 'bottom' | 'left'>
+  overlayAvoidTabs?: boolean
+  overlayTransparent?: boolean
+  overlayNoClose?: boolean
+  // desktop modal box: small (default) 400w with auto height up to min(560px, 85vh); medium 560w
+  // with a fixed min(560px, 85vh) height; large 80% × 80%
+  modalSize?: ModalSize
+  headerBottomStyle?: Styles.StylesCrossPlatform
+  headerRightActions?: (p: HeaderBackButtonProps) => React.ReactNode
+}
+
+// NativeStackNavigationOptions is the source of truth. We extend it with:
+// - LayoutOptions: custom properties consumed by our layout wrappers (stripped before passing to RN)
+// - headerStyle override: RN types this narrowly as {backgroundColor?: string} but our custom
+//   header supports full style objects
+// - Header container styles: @react-navigation/elements HeaderOptions that work at runtime
+//   through our custom header but aren't exposed in NativeStackNavigationOptions
+export type GetOptionsRet =
+  | (Omit<NativeStackNavigationOptions, 'headerStyle'> &
+      LayoutOptions & {
+        headerStyle?: Styles.StylesCrossPlatform
+        headerBackgroundContainerStyle?: Styles.StylesCrossPlatform
+        headerLeftContainerStyle?: Styles.StylesCrossPlatform
+        headerRightContainerStyle?: Styles.StylesCrossPlatform
+        headerTitleContainerStyle?: Styles.StylesCrossPlatform
+      })
+  | undefined
+
+type AnyScreen = React.ComponentType<any> | React.LazyExoticComponent<any>
+type ScreenRouteParams<Screen extends AnyScreen> =
+  React.ComponentProps<Screen> extends {route: {params: infer Params}}
+    ? Params
+    : React.ComponentProps<Screen> extends {route: {params?: infer Params}}
+      ? Params
+      : undefined
+
+export type GetOptions<Screen extends AnyScreen = AnyScreen> =
+  | GetOptionsRet
+  | ((p: React.ComponentProps<Screen>) => GetOptionsRet)
+
+export type RouteDef<Screen extends AnyScreen = AnyScreen, Params = ScreenRouteParams<Screen>> = {
+  // Use `any` for the function param to avoid RouteDef being contravariant in Screen.
+  // GetOptions<Screen> would cause RouteDef<SpecificScreen> to not be assignable to RouteDef<AnyScreen>
+  // because of function parameter contravariance. Typed getOptions are used in makeScreen / makeChatScreen.
+  getOptions?: GetOptionsRet | ((p: any) => GetOptionsRet)
+  initialParams?: Params
+  screen: Screen
+}
+
+export const defineRouteMap = <const Routes,>(routes: Routes) => routes
+

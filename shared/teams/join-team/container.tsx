@@ -1,0 +1,144 @@
+import * as C from '@/constants'
+import * as T from '@/constants/types'
+import * as Kb from '@/common-adapters'
+import {RPCError} from '@/util/errors'
+import upperFirst from 'lodash/upperFirst'
+import * as React from 'react'
+import Success from './success'
+import {useNavigation} from '@react-navigation/native'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+type OwnProps = {initialTeamname?: string; success?: boolean}
+export const getJoinTeamError = (error: unknown) => {
+  if (error instanceof RPCError) {
+    return (
+      error.code === T.RPCGen.StatusCode.scteaminvitebadtoken
+        ? 'Sorry, that team name or token is not valid.'
+        : error.code === T.RPCGen.StatusCode.scnotfound
+          ? 'This invitation is no longer valid, or has expired.'
+          : error.desc
+    )
+  }
+  return error instanceof Error ? error.message : 'Something went wrong.'
+}
+
+// keyed so a different initial teamname starts the dialog fresh
+const JoinTeam = (props: OwnProps) => <JoinTeamInner key={props.initialTeamname ?? ''} {...props} />
+
+const JoinTeamInner = ({initialTeamname, success: successParam}: OwnProps) => {
+  const styles = useStyles()
+  const [errorText, setErrorText] = React.useState('')
+  const [open, setOpen] = React.useState(false)
+  const [successTeamName, setSuccessTeamName] = React.useState('')
+  const [name, _setName] = React.useState(initialTeamname ?? '')
+  const joinTeam = C.useRPC(T.RPCGen.teamsTeamAcceptInviteOrRequestAccessRpcListener)
+  const navigation = useNavigation('teamJoinTeamDialog')
+  const navigateUp = C.Router2.navigateUp
+  const success = !!successParam
+  const handoffToInviteRef = React.useRef(false)
+
+  const setName = (n: string) => _setName(n.toLowerCase())
+  const onBack = () => navigateUp()
+
+  const onSubmit = () => {
+    setErrorText('')
+    setOpen(false)
+    setSuccessTeamName('')
+    joinTeam(
+      [
+        {
+          customResponseIncomingCallMap: {
+            'keybase.1.teamsUi.confirmInviteLinkAccept': (params, response) => {
+              handoffToInviteRef.current = true
+              C.Router2.navigateAppend(
+                {
+                  name: 'teamInviteLinkJoin',
+                  params: {
+                    inviteDetails: params.details,
+                    inviteKey: name,
+                  },
+                },
+                true
+              )
+              response.result(false)
+            },
+          },
+          incomingCallMap: {},
+          params: {tokenOrName: name},
+          waitingKey: C.waitingKeyTeamsJoinTeam,
+        },
+      ],
+      result => {
+        setOpen(result.wasOpenTeam)
+        setSuccessTeamName(result.wasTeamName ? name : '')
+        navigation.setParams({initialTeamname, success: true})
+      },
+      error => {
+        if (handoffToInviteRef.current) {
+          handoffToInviteRef.current = false
+          return
+        }
+        setErrorText(upperFirst(getJoinTeamError(error)))
+      }
+    )
+  }
+
+  return (
+    <Kb.ModalScreen
+      centered={success && open}
+      banner={
+        errorText ? (
+          <Kb.Banner color="red">
+            <Kb.BannerParagraph bannerColor="red" content={errorText} />
+          </Kb.Banner>
+        ) : success && !open ? (
+          <Kb.Box2 direction="horizontal" fullWidth={true} style={styles.banner} centerChildren={true}>
+            <Kb.ImageIcon type="icon-illustration-teams-zen-460-96" />
+          </Kb.Box2>
+        ) : undefined
+      }
+      footer={
+        <Kb.WaitingButton
+          fullWidth={true}
+          label={success ? 'Close' : 'Continue'}
+          onClick={success ? onBack : onSubmit}
+          type={success ? 'Dim' : 'Default'}
+          waitingKey={C.waitingKeyTeamsJoinTeam}
+        />
+      }
+    >
+      {success ? (
+        open ? (
+          <Success teamname={successTeamName} />
+        ) : (
+          <Kb.Text center={true} type="Body">
+            Your request was sent to the admins of{' '}
+            {successTeamName ? <Kb.Text type="BodySemibold">{successTeamName}</Kb.Text> : 'the team'}.
+            {"Hang tight, you'll get notified as soon as you're let in."}
+          </Kb.Text>
+        )
+      ) : (
+        <Kb.Box2 direction="vertical" fullWidth={true} gap="tiny">
+          <Kb.RoundedBox>
+            <Kb.Input3
+              autoFocus={true}
+              onChangeText={setName}
+              onEnterKeyDown={onSubmit}
+              placeholder="Token or team name"
+              value={name}
+              hideBorder={true}
+              testID={TestIDs.TEAMS_JOIN_TEAM_INPUT}
+            />
+          </Kb.RoundedBox>
+          <Kb.Text type="BodySmall">Examples: keybasefriends, stellar.public, etc.</Kb.Text>
+        </Kb.Box2>
+      )}
+    </Kb.ModalScreen>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  banner: Kb.Styles.platformStyles({isElectron: {overflowX: 'hidden'}}),
+}))
+
+export default JoinTeam

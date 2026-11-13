@@ -4,44 +4,398 @@
 package keybase
 
 import (
-	"encoding/base64"
+	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"runtime/trace"
+	"strings"
 	"sync"
+	"time"
+
+	"github.com/keybase/client/go/chat/globals"
+	"github.com/keybase/client/go/chat/types"
+	"github.com/keybase/client/go/status"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/keybase/client/go/externals"
+	"github.com/keybase/client/go/kbfs/env"
+	"github.com/keybase/client/go/kbfs/fsrpc"
+	"github.com/keybase/client/go/kbfs/libgit"
+	"github.com/keybase/client/go/kbfs/libkbfs"
+	"github.com/keybase/client/go/kbfs/simplefs"
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/chat1"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/client/go/service"
+	"github.com/keybase/client/go/uidmap"
 	"github.com/keybase/go-framed-msgpack-rpc/rpc"
-	"github.com/keybase/kbfs/fsrpc"
-	"github.com/keybase/kbfs/libkbfs"
 )
 
-var kbCtx *libkb.GlobalContext
-var conn net.Conn
-var startOnce sync.Once
-var logSendContext libkb.LogSendContext
-var kbfsConfig libkbfs.Config
+var (
+	kbCtx          *libkb.GlobalContext
+	kbChatCtx      *globals.ChatContext
+	kbSvc          *service.Service
+	conn           net.Conn
+	startOnce      sync.Once
+	logSendContext status.LogSendContext
+)
+
+var (
+	initMutex    sync.Mutex
+	initComplete bool
+)
+
+// JS readiness synchronization
+var (
+	jsReadyOnce sync.Once
+	jsReadyCh   = make(chan struct{})
+	connMutex   sync.Mutex // Protects conn and connEpoch
+)
+
+// connEpoch increments every time ensureConnection successfully (re)dials.
+// Callers that observed a failure on a particular conn capture the epoch
+// alongside it (while holding connMutex) and pass it to ResetIfCurrent,
+// which only tears down the connection if nothing has re-dialed since —
+// otherwise some other caller already recovered and this call is a stale,
+// no-op complaint. Protected by connMutex.
+var connEpoch int64
+
+// lastReadEpoch is the epoch of the connection the most recent ReadArr call
+// read (or is about to read) from, captured atomically with the connection
+// reference itself. See LastReadEpoch. Protected by connMutex.
+var lastReadEpoch int64
+
+func describeConn(c net.Conn) string {
+	if c == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%T@%p", c, c)
+}
+
+func appStateForLog() string {
+	if kbCtx == nil || kbCtx.MobileAppState == nil {
+		return "<unknown>"
+	}
+	return fmt.Sprintf("%v", kbCtx.MobileAppState.State())
+}
+
+// log writes to kbCtx.Log if available, otherwise falls back to stderr.
+// Stderr lands in the stderr capture file (see captureStderr) and the Xcode
+// console, making early Init messages visible before kbCtx.Log is configured.
+func log(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if kbCtx != nil && kbCtx.Log != nil {
+		kbCtx.Log.Info(msg)
+	} else {
+		fmt.Fprintf(os.Stderr, "keybase: %s\n", msg)
+	}
+}
+
+// stderrFile keeps the stderr capture file open for the life of the process.
+var stderrFile *os.File
+
+// Cap growth of the stderr capture file across runs; non-panic noise written
+// to fd 2 (e.g. by native libraries) accumulates since the file is opened in
+// append mode.
+const maxStderrFileSize = 5 * 1024 * 1024
+
+// stderrLogPath returns the path of the stderr capture file for a service
+// log path, or "" if there is no log file.
+func stderrLogPath(logFile string) string {
+	if logFile == "" {
+		return ""
+	}
+	return logFile + ".stderr"
+}
+
+// captureStderr points fd 2 at <logFile>.stderr. Go runtime panic and fatal
+// error tracebacks are written to fd 2, and Apple crash reports only show
+// the cgo trampoline frames (runtime.raise_trampoline / exit) for a Go
+// crash, so without this the goroutine traceback that names the culprit is
+// lost on device. The capture file rides along with log sends as the start
+// log (status.Logs.Start).
+//
+// Called twice from Init: at the top to cover panics before logging is
+// configured, and again after kbCtx.Configure, which points fd 2 at the
+// service log (logger.LogFileWriter.Open).
+func captureStderr(logFile string) {
+	if runtime.GOOS == "android" {
+		// Redirecting fd 2 is not supported on Android (see
+		// logger.RedirectStderrTo); panics are visible in logcat instead.
+		return
+	}
+	path := stderrLogPath(logFile)
+	if path == "" {
+		return
+	}
+	if stderrFile == nil {
+		flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		if fi, err := os.Stat(path); err == nil && fi.Size() > maxStderrFileSize {
+			flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+		}
+		f, err := os.OpenFile(path, flags, libkb.PermFile)
+		if err != nil {
+			log("Go: captureStderr: unable to open %s: %s", path, err)
+			return
+		}
+		fmt.Fprintf(f, "\n--- keybase start %s ---\n", time.Now().Format(time.RFC3339))
+		stderrFile = f
+	}
+	if err := logger.RedirectStderrTo(stderrFile); err != nil {
+		log("Go: captureStderr: unable to redirect stderr: %s", err)
+	}
+}
+
+// CurrentUID returns the UID of the currently active account, or empty string if not logged in.
+// Used by the Android push listener to gate notification actions on the active account.
+func CurrentUID() string {
+	if kbCtx == nil {
+		return ""
+	}
+	return kbCtx.Env.GetUID().String()
+}
+
+type PushNotifier interface {
+	LocalNotification(ident string, title string, msg string, badgeCount int, soundName string, convID string, typ string, uid string)
+	DisplayChatNotification(notification *ChatNotification)
+}
+
+type NativeVideoHelper interface {
+	Thumbnail(filename string) []byte
+	Duration(filename string) int
+	// AudioAmps returns IEEE 754 float32 samples encoded as little-endian bytes,
+	// representing RMS amplitude values in [0,1] for waveform visualization.
+	AudioAmps(filename string) []byte
+}
+
+// ShareIntentDonator is implemented by the native iOS layer to donate INSendMessageIntent
+// for recent conversations. When nil (Android, desktop), donations are skipped.
+// Uses JSON string because gomobile does not support []struct in interface methods.
+type ShareIntentDonator interface {
+	DonateShareConversations(conversationsJSON string)
+	DeleteAllDonations()
+	DeleteDonation(conversationID string)
+}
+
+// shareIntentDonatorAdapter adapts keybase.ShareIntentDonator to types.ShareIntentDonator.
+type shareIntentDonatorAdapter struct {
+	wrapped ShareIntentDonator
+}
+
+func (a shareIntentDonatorAdapter) DonateShareConversations(conversations []types.ShareConversation) {
+	if a.wrapped == nil {
+		return
+	}
+	// Serialize to JSON; gomobile does not support []struct in interface methods.
+	data, err := json.Marshal(conversations)
+	if err != nil {
+		log("shareIntentDonatorAdapter: JSON marshal failed: %v", err)
+		return
+	}
+	a.wrapped.DonateShareConversations(string(data))
+}
+
+func (a shareIntentDonatorAdapter) DeleteAllDonations() {
+	if a.wrapped == nil {
+		return
+	}
+	a.wrapped.DeleteAllDonations()
+}
+
+func (a shareIntentDonatorAdapter) DeleteDonation(conversationID string) {
+	if a.wrapped == nil {
+		return
+	}
+	a.wrapped.DeleteDonation(conversationID)
+}
+
+// NativeInstallReferrerListener is implemented in Java on Android.
+type NativeInstallReferrerListener interface {
+	// StartInstallReferrerListener is used to get referrer information from the
+	// google play store on Android (to implement deferred deep links). This is
+	// asynchronous (due to the underlying play store api being so): pass it a
+	// callback function which will be called with the referrer string once it
+	// is available (or an empty string in case of errors).
+	StartInstallReferrerListener(callback StringReceiver)
+}
+
+type StringReceiver interface {
+	CallbackWithString(s string)
+}
+
+// InstallReferrerListener is a wrapper around NativeInstallReferrerListener to
+// work around gomobile/gobind limitations while preventing import cycles.
+type InstallReferrerListener struct {
+	n NativeInstallReferrerListener
+}
+
+func (i InstallReferrerListener) StartInstallReferrerListener(callback service.StringReceiver) {
+	i.n.StartInstallReferrerListener(callback)
+}
+
+var _ service.InstallReferrerListener = InstallReferrerListener{}
+
+func newInstallReferrerListener(n NativeInstallReferrerListener) service.InstallReferrerListener {
+	return InstallReferrerListener{n: n}
+}
+
+type videoHelper struct {
+	nvh NativeVideoHelper
+}
+
+func newVideoHelper(nvh NativeVideoHelper) videoHelper {
+	return videoHelper{
+		nvh: nvh,
+	}
+}
+
+func (v videoHelper) ThumbnailAndDuration(ctx context.Context, filename string) ([]byte, int, error) {
+	return v.nvh.Thumbnail(filename), v.nvh.Duration(filename), nil
+}
+
+func (v videoHelper) AudioAmps(ctx context.Context, filename string) ([]float64, error) {
+	data := v.nvh.AudioAmps(filename)
+	if len(data) == 0 || len(data)%4 != 0 {
+		return nil, nil
+	}
+	amps := make([]float64, len(data)/4)
+	for i := range amps {
+		bits := binary.LittleEndian.Uint32(data[i*4:])
+		amps[i] = float64(math.Float32frombits(bits))
+	}
+	return amps, nil
+}
+
+type ExternalDNSNSFetcher interface {
+	GetServers() []byte
+}
+
+type dnsNSFetcher struct {
+	externalFetcher ExternalDNSNSFetcher
+}
+
+func newDNSNSFetcher(d ExternalDNSNSFetcher) dnsNSFetcher {
+	return dnsNSFetcher{
+		externalFetcher: d,
+	}
+}
+
+func (d dnsNSFetcher) processExternalResult(raw []byte) []string {
+	return strings.Split(string(raw), ",")
+}
+
+func (d dnsNSFetcher) GetServers() []string {
+	if d.externalFetcher != nil {
+		return d.processExternalResult(d.externalFetcher.GetServers())
+	}
+	return getDNSServers()
+}
+
+var _ libkb.DNSNameServerFetcher = dnsNSFetcher{}
+
+func flattenError(err error) error {
+	if err != nil {
+		return errors.New(err.Error())
+	}
+	return err
+}
+
+func isInited() bool {
+	initMutex.Lock()
+	defer initMutex.Unlock()
+	return initComplete
+}
+
+func setInited() {
+	initMutex.Lock()
+	defer initMutex.Unlock()
+	initComplete = true
+}
 
 // InitOnce runs the Keybase services (only runs one time)
-func InitOnce(homeDir string, logFile string, runModeStr string, accessGroupOverride bool) {
+func InitOnce(homeDir, mobileSharedHome, logFile, runModeStr string,
+	accessGroupOverride bool, dnsNSFetcher ExternalDNSNSFetcher, nvh NativeVideoHelper,
+	mobileOsVersion string, isIPad bool, installReferrerListener NativeInstallReferrerListener, isIOS bool,
+	shareIntentDonator ShareIntentDonator,
+) {
 	startOnce.Do(func() {
-		if err := Init(homeDir, logFile, runModeStr, accessGroupOverride); err != nil {
-			kbCtx.Log.Errorf("Init error: %s", err)
+		if err := Init(homeDir, mobileSharedHome, logFile, runModeStr, accessGroupOverride, dnsNSFetcher, nvh, mobileOsVersion, isIPad, installReferrerListener, isIOS, shareIntentDonator); err != nil {
+			log("Init error: %s", err)
 		}
 	})
 }
 
 // Init runs the Keybase services
-func Init(homeDir string, logFile string, runModeStr string, accessGroupOverride bool) error {
-	fmt.Println("Go: Initializing")
-	fmt.Printf("Go: Using log: %s\n", logFile)
-	kbCtx = libkb.G
+func Init(homeDir, mobileSharedHome, logFile, runModeStr string,
+	accessGroupOverride bool, externalDNSNSFetcher ExternalDNSNSFetcher, nvh NativeVideoHelper,
+	mobileOsVersion string, isIPad bool, installReferrerListener NativeInstallReferrerListener, isIOS bool,
+	shareIntentDonator ShareIntentDonator,
+) (err error) {
+	// Dump all goroutines on a fatal error; the GOTRACEBACK env var can't be
+	// used here since the runtime reads it before Init runs.
+	debug.SetTraceback("crash")
+	captureStderr(logFile)
+
+	begin := time.Now()
+	log("Go: Initializing: home: %s mobileSharedHome: %s", homeDir, mobileSharedHome)
+	defer func() {
+		err = flattenError(err)
+		if err == nil {
+			setInited()
+		}
+		log("Go: Init complete: %v err: %v", time.Since(begin), err)
+	}()
+
+	// Buffer for the conn.Read. Bytes cross the bridge raw and the
+	// framed-msgpack transport tolerates arbitrary chunking, so the size is
+	// just a throughput knob.
+	buffer = make([]byte, 300*1024)
+
+	var perfLogFile, ekLogFile, guiLogFile string
+	if logFile != "" {
+		log("Go: Using log: %s", logFile)
+		ekLogFile = logFile + ".ek"
+		log("Go: Using eklog: %s", ekLogFile)
+		perfLogFile = logFile + ".perf"
+		log("Go: Using perfLog: %s", perfLogFile)
+		guiLogFile = logFile + ".gui"
+		log("Go: Using guilog: %s", guiLogFile)
+	}
+	libkb.IsIPad = isIPad
+
+	startTrace(logFile)
+
+	dnsNSFetcher := newDNSNSFetcher(externalDNSNSFetcher)
+	dnsServers := dnsNSFetcher.GetServers()
+	for _, srv := range dnsServers {
+		log("Go: DNS Server: %s", srv)
+	}
+
+	kbCtx = libkb.NewGlobalContext()
 	kbCtx.Init()
-	kbCtx.SetServices(externals.GetServices())
+	kbCtx.SetProofServices(externals.NewProofServices(kbCtx))
+	kbCtx.AddLoginHook(accountCacheHook{})
+	kbCtx.AddLogoutHook(accountCacheHook{}, "notifications/accountCache")
+
+	var suffix string
+	if isIPad {
+		suffix = " (iPad)"
+	}
+	log("Go (GOOS:%s): Mobile OS version is: %q%v", runtime.GOOS, mobileOsVersion, suffix)
+	kbCtx.MobileOsVersion = mobileOsVersion
+
+	// 10k uid -> FullName cache entries allowed
+	kbCtx.SetUIDMapper(uidmap.NewUIDMap(10000))
+	kbCtx.SetServiceSummaryMapper(uidmap.NewServiceSummaryMap(1000))
 	usage := libkb.Usage{
 		Config:    true,
 		API:       true,
@@ -52,56 +406,125 @@ func Init(homeDir string, logFile string, runModeStr string, accessGroupOverride
 		return err
 	}
 	config := libkb.AppConfig{
-		HomeDir:                     homeDir,
-		LogFile:                     logFile,
-		RunMode:                     runMode,
-		Debug:                       true,
-		LocalRPCDebug:               "",
-		SecurityAccessGroupOverride: accessGroupOverride,
+		HomeDir:                        homeDir,
+		MobileSharedHomeDir:            mobileSharedHome,
+		LogFile:                        logFile,
+		EKLogFile:                      ekLogFile,
+		PerfLogFile:                    perfLogFile,
+		GUILogFile:                     guiLogFile,
+		RunMode:                        runMode,
+		Debug:                          true,
+		LocalRPCDebug:                  "",
+		VDebugSetting:                  "mobile", // use empty string for same logging as desktop default
+		SecurityAccessGroupOverride:    accessGroupOverride,
+		ChatInboxSourceLocalizeThreads: 2,
+		LinkCacheSize:                  1000,
 	}
-	err = kbCtx.Configure(config, usage)
-	if err != nil {
+	if err = kbCtx.Configure(config, usage); err != nil {
+		log("failed to configure: %s", err)
 		return err
 	}
+	// Configure pointed fd 2 at the service log; point it back at the
+	// dedicated capture file so crash tracebacks stay in one small file
+	// that is uploaded whole, not subject to the service log's tail limit.
+	captureStderr(logFile)
 
-	svc := service.NewService(kbCtx, false)
-	svc.StartLoopbackServer()
+	kbSvc = service.NewService(kbCtx, false)
+	// LoginAttemptNone: the login attempt happens inside RunBackgroundOperations
+	// below, off the Init path. It can block for seconds (leveldb
+	// open/recovery, keychain reads) and Init runs on the native main thread;
+	// GetBootstrapStatus waits for the attempt so the GUI doesn't see a stale
+	// logged-out state.
+	phase := time.Now()
+	if err = kbSvc.StartLoopbackServer(libkb.LoginAttemptNone); err != nil {
+		log("failed to start loopback: %s", err)
+		return err
+	}
+	log("Go: Init: loopback server up: %s", time.Since(phase))
 	kbCtx.SetService()
 	uir := service.NewUIRouter(kbCtx)
 	kbCtx.SetUIRouter(uir)
-	svc.RunBackgroundOperations(uir)
+	kbCtx.SetDNSNameServerFetcher(dnsNSFetcher)
+	phase = time.Now()
+	if err = kbSvc.SetupCriticalSubServices(); err != nil {
+		log("failed subservices setup: %s", err)
+		return err
+	}
+	log("Go: Init: critical subservices up: %s", time.Since(phase))
+	kbSvc.SetupChatModules(nil)
+	if installReferrerListener != nil {
+		kbSvc.SetInstallReferrerListener(newInstallReferrerListener(installReferrerListener))
+	}
+	kbChatCtx = kbSvc.ChatG()
+	kbChatCtx.NativeVideoHelper = newVideoHelper(nvh)
+	if shareIntentDonator != nil {
+		kbChatCtx.ShareIntentDonator = shareIntentDonatorAdapter{wrapped: shareIntentDonator}
+	}
+	// Runs the startup login attempt and then the long-lived background
+	// tasks. Off the Init thread so a slow login can't hold up app launch;
+	// must start after the chat context fields above are set since chat
+	// modules read them once started.
+	go kbSvc.RunBackgroundOperations(uir)
 
-	serviceLog := config.GetLogFile()
-	logs := libkb.Logs{
-		Service: serviceLog,
+	logs := status.Logs{
+		Service: config.GetLogFile(),
+		EK:      config.GetEKLogFile(),
+		Perf:    config.GetPerfLogFile(),
+		// Stderr capture file with Go panic tracebacks (see captureStderr);
+		// uploaded as the start log, which is otherwise unused on mobile.
+		Start: stderrLogPath(config.GetLogFile()),
 	}
 
-	logSendContext = libkb.LogSendContext{
+	log("Go: Using config: %+v", kbCtx.Env.GetLogFileConfig(config.GetLogFile()))
+
+	logSendContext = status.LogSendContext{
 		Contextified: libkb.NewContextified(kbCtx),
 		Logs:         logs,
 	}
 
-	// FIXME (MBG): This is causing RPC responses to sometimes not be recieved
-	// on iOS. Repro by hooking up getExtendedStatus to a button in the iOS
-	// client and watching JS logs. Disabling until we have a root cause / fix.
-	kbfsParams := libkbfs.DefaultInitParams(kbCtx)
-	kbfsConfig, err = libkbfs.Init(kbCtx, kbfsParams, serviceCn{}, func() {}, kbCtx.Log)
-	if err != nil {
+	// open the connection
+	if err = Reset(); err != nil {
+		log("failed conn setup %s", err)
 		return err
 	}
 
-	return Reset()
+	go func() {
+		kbfsCtx := env.NewContextFromGlobalContext(kbCtx)
+		kbfsParams := libkbfs.DefaultInitParams(kbfsCtx)
+		// Setting this flag will enable KBFS debug logging to always
+		// be true in a mobile setting. Change these back to the
+		// commented-out values if we need to make a mobile release
+		// before KBFS-on-mobile is ready.
+		kbfsParams.Debug = true                         // false
+		kbfsParams.Mode = libkbfs.InitConstrainedString // libkbfs.InitMinimalString
+		if _, err = libkbfs.Init(
+			context.Background(), kbfsCtx, kbfsParams, serviceCn{}, nil,
+			kbCtx.Log); err != nil {
+			log("unable to init KBFS: %s", err)
+		}
+	}()
+
+	return nil
 }
 
-type serviceCn struct {
-	ctx *libkb.GlobalContext
+func LogToService(str string) {
+	log("%s", str)
 }
+
+type serviceCn struct{}
 
 func (s serviceCn) NewKeybaseService(config libkbfs.Config, params libkbfs.InitParams, ctx libkbfs.Context, log logger.Logger) (libkbfs.KeybaseService, error) {
-	keybaseService := libkbfs.NewKeybaseDaemonRPC(config, ctx, log, true)
-	keybaseService.AddProtocols([]rpc.Protocol{
+	// TODO: plumb the func somewhere it can be called on shutdown?
+	gitrpc, _ := libgit.NewRPCHandlerWithCtx(
+		ctx, config, nil)
+	sfsIface, _ := simplefs.NewSimpleFS(ctx, config)
+	additionalProtocols := []rpc.Protocol{
+		keybase1.SimpleFSProtocol(sfsIface),
+		keybase1.KBFSGitProtocol(gitrpc),
 		keybase1.FsProtocol(fsrpc.NewFS(config, log)),
-	})
+	}
+	keybaseService := libkbfs.NewKeybaseDaemonRPC(
+		config, ctx, log, true, additionalProtocols)
 	return keybaseService, nil
 }
 
@@ -109,69 +532,649 @@ func (s serviceCn) NewCrypto(config libkbfs.Config, params libkbfs.InitParams, c
 	return libkbfs.NewCryptoClientRPC(config, ctx), nil
 }
 
-// LogSend sends a log to Keybase
-func LogSend(uiLogPath string) (string, error) {
-	logSendContext.Logs.Desktop = uiLogPath
-	return logSendContext.LogSend("", 10000)
+func (s serviceCn) NewChat(config libkbfs.Config, params libkbfs.InitParams, ctx libkbfs.Context, log logger.Logger) (libkbfs.Chat, error) {
+	return libkbfs.NewChatRPC(config, ctx), nil
 }
 
-// WriteB64 sends a base64 encoded msgpack rpc payload
-func WriteB64(str string) error {
-	data, err := base64.StdEncoding.DecodeString(str)
-	if err != nil {
-		return fmt.Errorf("Base64 decode error: %s; %s", err, str)
+// LogSend sends a log to Keybase
+func LogSend(statusJSON string, feedback string, sendLogs, sendMaxBytes bool, traceDir, cpuProfileDir string) (res string, err error) {
+	defer func() { err = flattenError(err) }()
+	if !isInited() {
+		return "", errors.New("LogSend: service not initialized")
 	}
-	n, err := conn.Write(data)
+	env := kbCtx.Env
+	logSendContext.UID = env.GetUID()
+	logSendContext.InstallID = env.GetInstallID()
+	logSendContext.StatusJSON = statusJSON
+	logSendContext.Feedback = feedback
+	logSendContext.Logs.GUI = env.GetGUILogFile()
+	logSendContext.Logs.Trace = traceDir
+	logSendContext.Logs.CPUProfile = cpuProfileDir
+	var numBytes int
+	switch kbCtx.MobileNetState.State() {
+	case keybase1.MobileNetworkState_WIFI:
+		numBytes = status.LogSendDefaultBytesMobileWifi
+	default:
+		numBytes = status.LogSendDefaultBytesMobileNoWifi
+	}
+	if sendMaxBytes {
+		numBytes = status.LogSendMaxBytes
+	}
+
+	logSendID, err := logSendContext.LogSend(sendLogs, numBytes, true /* mergeExtendedStatus */, true /* addNetworkStats */)
+	logSendContext.Clear()
+	return string(logSendID), err
+}
+
+// WriteArr sends raw bytes encoded msgpack rpc payload from the native layer (iOS and Android)
+func WriteArr(b []byte) (err error) {
+	// The copy is load-bearing: gomobile only pins b's backing memory for
+	// the duration of this call, and the loopback conn's Write retains the
+	// slice instead of copying it.
+	bytes := make([]byte, len(b))
+	copy(bytes, b)
+	defer func() { err = flattenError(err) }()
+
+	// Lazily initialize connection on first write
+	connMutex.Lock()
+	if conn == nil {
+		if err := ensureConnection(); err != nil {
+			connMutex.Unlock()
+			return fmt.Errorf("Failed to establish connection: %s", err)
+		}
+	}
+	currentConn := conn
+	currentEpoch := connEpoch
+	connMutex.Unlock()
+
+	if currentConn == nil {
+		return errors.New("connection not initialized")
+	}
+
+	n, err := currentConn.Write(bytes)
 	if err != nil {
+		log("Go: WriteArr error conn=%s len=%d wrote=%d appState=%s err=%v",
+			describeConn(currentConn), len(bytes), n, appStateForLog(), err)
+		// net.Conn permits n > 0 alongside the error, so the peer's framer may
+		// be holding a partial frame -- the same corruption the short-write
+		// path below drops the connection for. Reset unconditionally rather
+		// than only when n > 0: a write that failed outright has already told
+		// us this conn is broken, and ReadArr resets on its own error for the
+		// same reason. ResetIfCurrent so this doesn't tear down a connection a
+		// concurrent caller has redialed since currentConn was captured.
+		if ierr := ResetIfCurrent(currentEpoch); ierr != nil {
+			log("failed to Reset after write error: %v", ierr)
+		}
 		return fmt.Errorf("Write error: %s", err)
 	}
-	if n != len(data) {
-		return errors.New("Did not write all the data")
+	if n != len(bytes) {
+		log("Go: WriteArr short write conn=%s wrote=%d expected=%d appState=%s",
+			describeConn(currentConn), n, len(bytes), appStateForLog())
+		// Not reachable through LoopbackConn today, whose Write is
+		// all-or-nothing. If a future transport can short-write, the peer's
+		// framer is left holding a partial frame and every later write would
+		// be consumed as its remainder, so drop the connection rather than
+		// corrupt the stream indefinitely. ResetIfCurrent (rather than Reset)
+		// so this doesn't tear down a connection some concurrent caller has
+		// already redialed since currentConn was captured above.
+		if ierr := ResetIfCurrent(currentEpoch); ierr != nil {
+			log("failed to Reset after short write: %v", ierr)
+		}
+		return fmt.Errorf("Did not write all the data: wrote %d of %d", n, len(bytes))
 	}
 	return nil
 }
 
-const targetBufferSize = 50 * 1024
+// buffer for the conn.Read; allocated in Init.
+var buffer []byte
 
-// bufferSize must be divisible by 3 to ensure that we don't split
-// our b64 encode across a payload boundary if we go over our buffer
-// size.
-const bufferSize = targetBufferSize - (targetBufferSize % 3)
+// ReadArr is a blocking read for msgpack rpc data.
+// It must still be called serially by the mobile run loops: conn.Read
+// ordering depends on it, and the msgpack::unpacker behind onDataFromGo
+// on the C++ side is not thread-safe. The returned slice is this call's own
+// copy, which only protects the caller of ReadArr — a second concurrent
+// caller would still interleave its Read into the shared package-level
+// buffer above, garbling frame content, not just ordering.
+func ReadArr() (data []byte, err error) {
+	defer func() { err = flattenError(err) }()
 
-// ReadB64 is a blocking read for base64 encoded msgpack rpc data.
-func ReadB64() (string, error) {
-	data := make([]byte, bufferSize)
+	// Wait for JS to signal it's ready (only blocks once)
+	<-jsReadyCh
 
-	n, err := conn.Read(data)
-	if n > 0 && err == nil {
-		str := base64.StdEncoding.EncodeToString(data[0:n])
-		return str, nil
+	// Lazily initialize connection on first read
+	connMutex.Lock()
+	if conn == nil {
+		if err := ensureConnection(); err != nil {
+			connMutex.Unlock()
+			return nil, fmt.Errorf("Failed to establish connection: %s", err)
+		}
+	}
+	currentConn := conn
+	currentEpoch := connEpoch
+	lastReadEpoch = currentEpoch
+	connMutex.Unlock()
+
+	if currentConn == nil {
+		return nil, errors.New("connection not initialized")
+	}
+
+	n, err := currentConn.Read(buffer)
+	if n > 0 {
+		// Coalesce already-pending writes into this delivery. Every ReadArr
+		// return costs a full native->JS bridge hop, and the JSI side
+		// batches however many frames arrive in one call.
+		if lb, ok := currentConn.(*libkb.LoopbackConn); ok {
+			for n < len(buffer) {
+				m, terr := lb.TryRead(buffer[n:])
+				if m <= 0 || terr != nil {
+					break
+				}
+				n += m
+			}
+		}
+		// Deliver data even if err != nil (allowed by the net.Conn
+		// contract); a persistent failure is returned by a later call.
+		//
+		// Copy out of the shared buffer rather than returning a view of it:
+		// gomobile copies again at the JNI/ObjC boundary regardless, so this
+		// costs one extra memcpy of a few KB on a call already crossing a
+		// language boundary, and it removes buffer aliasing as a hazard.
+		out := make([]byte, n)
+		copy(out, buffer[:n])
+		return out, nil
 	}
 
 	if err != nil {
-		// Attempt to fix the connection
-		Reset()
-		return "", fmt.Errorf("Read error: %s", err)
+		// Attempt to fix the connection. ResetIfCurrent so a stale failure
+		// on an already-superseded conn doesn't tear down one a concurrent
+		// WriteArr just redialed.
+		if ierr := ResetIfCurrent(currentEpoch); ierr != nil {
+			log("failed to Reset: %v", ierr)
+		}
+		return nil, fmt.Errorf("Read error: %s", err)
 	}
 
-	return "", nil
+	return nil, nil
 }
 
-// Reset resets the socket connection
-func Reset() error {
-	if conn != nil {
-		conn.Close()
+// ensureConnection establishes the loopback connection if not already connected.
+// Must be called with connMutex held.
+func ensureConnection() error {
+	if !isInited() {
+		log("ensureConnection: keybase not initialized")
+		return errors.New("keybase not initialized")
+	}
+	if kbCtx == nil || kbCtx.LoopbackListener == nil {
+		log("ensureConnection: loopback listener not initialized (kbCtx nil: %v)", kbCtx == nil)
+		return errors.New("loopback listener not initialized")
 	}
 
 	var err error
 	conn, err = kbCtx.LoopbackListener.Dial()
 	if err != nil {
-		return fmt.Errorf("Socket error: %s", err)
+		log("ensureConnection: Dial failed (%v), restarting loopback server", err)
+		l, rerr := kbCtx.MakeLoopbackServer()
+		if rerr != nil {
+			log("ensureConnection: MakeLoopbackServer failed: %v", rerr)
+			return fmt.Errorf("failed to restart loopback server: %s", rerr)
+		}
+		go func() { _ = kbSvc.ListenLoop(l) }()
+		conn, err = kbCtx.LoopbackListener.Dial()
+		if err != nil {
+			log("ensureConnection: Dial failed after restart: %v", err)
+			return fmt.Errorf("failed to dial after loopback restart: %s", err)
+		}
+		connEpoch++
+		log("ensureConnection: loopback server restarted successfully conn=%s epoch=%d appState=%s",
+			describeConn(conn), connEpoch, appStateForLog())
+		return nil
 	}
+	connEpoch++
+	log("Go: Established loopback connection conn=%s epoch=%d appState=%s",
+		describeConn(conn), connEpoch, appStateForLog())
 	return nil
+}
+
+// Reset unconditionally resets the socket connection. Use this only when the
+// caller genuinely means "tear down whatever connection is current" (e.g.
+// iOS invalidate, Android destroy/engineReset) — it will happily close a
+// connection some concurrent failure-driven caller never saw fail. Callers
+// reacting to a failure on a specific connection should use ResetIfCurrent
+// instead so a stale complaint can't clobber a connection that has already
+// been recovered.
+func Reset() error {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+	return resetLocked()
+}
+
+// LastReadEpoch returns the epoch of the connection the most recent ReadArr
+// call read its bytes from. A caller that is about to hand off a batch of
+// bytes it just got back from ReadArr (e.g. a platform reader loop, right
+// before passing the data into the native bridge for parsing) should call
+// this immediately after ReadArr returns and capture the result there, not
+// later once some asynchronous handler for that batch actually runs —
+// ensureConnection may have re-dialed by then, and passing the wrong
+// (newer) epoch to ResetIfCurrent would tear down a good connection
+// instead of leaving it alone.
+//
+// This is exact only because there is exactly one permanent ReadArr caller
+// for the life of the process (enforced on both platforms: a single serial
+// reader loop). With one reader, nothing can start a second ReadArr call
+// between this one's internal epoch capture and this accessor being read
+// afterward, so the value can never be stale by the time the caller reads
+// it. A design with concurrent readers would need to thread the epoch
+// through ReadArr's return value instead.
+func LastReadEpoch() int64 {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+	return lastReadEpoch
+}
+
+// ResetIfCurrent closes the connection only if epoch (obtained implicitly by
+// whoever last dialed) still matches the live connection's epoch. If
+// ensureConnection has re-dialed since, the
+// epoch has moved on and this call is a stale no-op: some other caller
+// already recovered, and closing the newer connection would silently
+// discard whatever was just written to it.
+func ResetIfCurrent(epoch int64) error {
+	_, err := resetIfCurrent(epoch)
+	return err
+}
+
+// ResetIfCurrentDidReset behaves exactly like ResetIfCurrent, additionally
+// reporting whether the reset actually ran (epoch matched connEpoch) as
+// opposed to being a stale no-op (epoch was already superseded).
+//
+// Platform readers need this distinction: they also reset their local parser
+// state (resetRecv/nativeResetRecv) alongside the Go connection, and doing so
+// unconditionally after a stale no-op drops bytes already in flight on a
+// connection nothing here actually touched. See Kb.mm and KbModule.kt.
+func ResetIfCurrentDidReset(epoch int64) bool {
+	didReset, err := resetIfCurrent(epoch)
+	if err != nil {
+		log("Go: ResetIfCurrentDidReset: reset error: %v", err)
+	}
+	return didReset
+}
+
+// resetIfCurrent is the shared implementation behind ResetIfCurrent and
+// ResetIfCurrentDidReset. didReset reports whether epoch matched connEpoch
+// (i.e. whether resetLocked actually ran), independent of whether resetLocked
+// itself returned an error.
+func resetIfCurrent(epoch int64) (didReset bool, err error) {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+	if epoch != connEpoch {
+		log("Go: ResetIfCurrent skipped, stale epoch=%d current=%d appState=%s",
+			epoch, connEpoch, appStateForLog())
+		return false, nil
+	}
+	return true, resetLocked()
+}
+
+// resetLocked does the actual teardown. Must be called with connMutex held.
+func resetLocked() error {
+	log("Go: Reset start conn=%s epoch=%d appState=%s", describeConn(conn), connEpoch, appStateForLog())
+	if conn != nil {
+		conn.Close()
+		conn = nil
+	}
+	if kbCtx == nil || kbCtx.LoopbackListener == nil {
+		log("Go: Reset complete without listener appState=%s", appStateForLog())
+		return nil
+	}
+
+	// Connection will be re-established lazily on next read/write
+	log("Go: Connection reset, will reconnect on next operation appState=%s", appStateForLog())
+	return nil
+}
+
+// NotifyJSReady signals that the JavaScript side is ready to send/receive RPCs.
+// This unblocks the ReadArr loop and allows bidirectional communication.
+// jsReadyCh is closed once and stays closed, so repeated engine resets are no-ops.
+func NotifyJSReady() {
+	jsReadyOnce.Do(func() {
+		connMutex.Lock()
+		currentConn := conn
+		connMutex.Unlock()
+		log("Go: JS signaled ready, unblocking RPC communication appState=%s conn=%s",
+			appStateForLog(), describeConn(currentConn))
+		close(jsReadyCh)
+	})
+}
+
+// ForceGC Forces a gc
+func ForceGC() {
+	if kbCtx != nil {
+		log("Flushing global caches")
+		kbCtx.FlushCaches()
+		log("Done flushing global caches")
+	}
+	runtime.GC()
+	log("Starting force gc")
+	debug.FreeOSMemory()
+	log("Done force gc")
 }
 
 // Version returns semantic version string
 func Version() string {
 	return libkb.VersionString()
+}
+
+func IsAppStateForeground() bool {
+	if !isInited() {
+		return false
+	}
+	return kbCtx.MobileAppState.State() == keybase1.MobileAppState_FOREGROUND
+}
+
+// FlushLogs synchronously flushes any buffered log data to disk. Call this
+// before background suspension and after foreground resume to prevent log loss.
+func FlushLogs() {
+	logger.FlushLogFile()
+}
+
+func SetAppStateForeground() {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("SetAppStateForeground", nil)()
+	kbCtx.MobileAppState.Update(keybase1.MobileAppState_FOREGROUND)
+}
+
+func SetAppStateBackground() {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("SetAppStateBackground", nil)()
+	kbCtx.MobileAppState.Update(keybase1.MobileAppState_BACKGROUND)
+	flushLocalDbs()
+}
+
+// flushLocalDbs flushes the leveldb memtables in the background. An unclean
+// kill while suspended (routine on iOS) with a non-empty journal forces a
+// journal replay — or a whole-DB recovery — during the next launch, which is
+// the main cold-start cost. Called when the app heads to the background so
+// the journals are empty if the OS kills the process.
+func flushLocalDbs() {
+	if kbCtx == nil {
+		return
+	}
+	flush := func(name string, db *libkb.JSONLocalDb) {
+		if db == nil {
+			return
+		}
+		ldb, ok := db.GetEngine().(*libkb.LevelDb)
+		if !ok {
+			return
+		}
+		begin := time.Now()
+		if err := ldb.Flush(); err != nil {
+			log("Go: flushLocalDbs: %s flush error: %v", name, err)
+			return
+		}
+		log("Go: flushLocalDbs: %s flushed in %s", name, time.Since(begin))
+	}
+	go flush("LocalDb", kbCtx.LocalDb)
+	go flush("LocalChatDb", kbCtx.LocalChatDb)
+}
+
+func SetAppStateInactive() {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("SetAppStateInactive", nil)()
+	kbCtx.MobileAppState.Update(keybase1.MobileAppState_INACTIVE)
+}
+
+func SetAppStateBackgroundActive() {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("SetAppStateBackgroundActive", nil)()
+	kbCtx.MobileAppState.Update(keybase1.MobileAppState_BACKGROUNDACTIVE)
+}
+
+func waitForInit(maxDur time.Duration) error {
+	if isInited() {
+		return nil
+	}
+	maxCh := time.After(maxDur)
+	for {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			if isInited() {
+				return nil
+			}
+		case <-maxCh:
+			return errors.New("waitForInit timeout")
+		}
+	}
+}
+
+// BackgroundSync runs a short background sync pulse. Returns a non-empty status
+// string on early exit or error so Swift can log it via NSLog.
+func BackgroundSync() string {
+	// On Android there is a race where this function can be called before Init when starting up in the
+	// background. Let's wait a little bit here for Init to get run, and bail out if it never does.
+	if err := waitForInit(5 * time.Second); err != nil {
+		return fmt.Sprintf("waitForInit timeout: %v", err)
+	}
+	defer kbCtx.Trace("BackgroundSync", nil)()
+
+	// Skip the sync if we aren't in the background
+	if state := kbCtx.MobileAppState.State(); state != keybase1.MobileAppState_BACKGROUND {
+		msg := fmt.Sprintf("skipping, app not in background state: %v", state)
+		kbCtx.Log.Debug("BackgroundSync: %s", msg)
+		return msg
+	}
+
+	// Flip to BACKGROUNDACTIVE only if still BACKGROUND, so a foreground
+	// transition that lands after the check above isn't overwritten. If the
+	// check fails, NextUpdate below fires immediately and we bail out.
+	nextState := keybase1.MobileAppState_BACKGROUNDACTIVE
+	kbCtx.MobileAppState.UpdateWithCheck(nextState, func(s keybase1.MobileAppState) bool {
+		return s == keybase1.MobileAppState_BACKGROUND
+	})
+	select {
+	case <-kbCtx.MobileAppState.NextUpdate(nextState):
+		// if literally anything happens, let's get out of here
+		state := kbCtx.MobileAppState.State()
+		msg := fmt.Sprintf("bailing out early, appstate change: %v", state)
+		kbCtx.Log.Debug("BackgroundSync: %s", msg)
+		return msg
+	case <-time.After(10 * time.Second):
+		// Drop back to BACKGROUND only if we still hold BACKGROUNDACTIVE;
+		// the app may have foregrounded between the timer firing and this
+		// update, and clobbering FOREGROUND would cancel live RPCs and
+		// strand the service in BACKGROUND while the user is in the app.
+		kbCtx.MobileAppState.UpdateWithCheck(keybase1.MobileAppState_BACKGROUND,
+			func(s keybase1.MobileAppState) bool {
+				return s == keybase1.MobileAppState_BACKGROUNDACTIVE
+			})
+		return "completed 10s window"
+	}
+}
+
+// pushPendingMessageFailure sends at most one notification that a message
+// failed to send. We only notify the user about visible messages that have
+// failed.
+func pushPendingMessageFailure(obrs []chat1.OutboxRecord, pusher PushNotifier) {
+	for _, obr := range obrs {
+		if topicType := obr.Msg.ClientHeader.Conv.TopicType; obr.Msg.IsBadgableType() && topicType == chat1.TopicType_CHAT {
+			kbCtx.Log.Debug("pushPendingMessageFailure: pushing convID: %s", obr.ConvID)
+			pusher.LocalNotification("failedpending", "",
+				"Heads up! Your message hasn't sent yet, tap here to retry.",
+				-1, "default", obr.ConvID.String(), "chat.failedpending", "")
+			return
+		}
+	}
+	kbCtx.Log.Debug("pushPendingMessageFailure: skipped notification for: %d items", len(obrs))
+}
+
+// AppWillExit is called reliably on iOS when the app is about to terminate
+// not as reliably on android
+func AppWillExit(pusher PushNotifier) {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("AppWillExit", nil)()
+	ctx := context.Background()
+	obrs, err := kbChatCtx.MessageDeliverer.ActiveDeliveries(ctx)
+	if err == nil {
+		// We are about to get killed with messages still to send, let the user
+		// know they will get stuck
+		pushPendingMessageFailure(obrs, pusher)
+	}
+	kbCtx.MobileAppState.Update(keybase1.MobileAppState_BACKGROUND)
+	flushLocalDbs()
+}
+
+// AppDidEnterBackground notifies the service that the app is in the background
+// [iOS] returning true will request about ~3mins from iOS to continue execution
+func AppDidEnterBackground() bool {
+	if !isInited() {
+		return false
+	}
+	defer kbCtx.Trace("AppDidEnterBackground", nil)()
+	ctx := context.Background()
+	convs, err := kbChatCtx.MessageDeliverer.ActiveDeliveries(ctx)
+	if err != nil {
+		kbCtx.Log.Debug("AppDidEnterBackground: failed to get active deliveries: %s", err)
+		convs = nil
+	}
+	stayRunning := false
+	switch {
+	case len(convs) > 0:
+		kbCtx.Log.Debug("AppDidEnterBackground: active deliveries in progress")
+		stayRunning = true
+	case kbChatCtx.LiveLocationTracker.ActivelyTracking(ctx):
+		kbCtx.Log.Debug("AppDidEnterBackground: active live location in progress")
+		stayRunning = true
+	case kbChatCtx.CoinFlipManager.HasActiveGames(ctx):
+		kbCtx.Log.Debug("AppDidEnterBackground: active coin flip games in progress")
+		stayRunning = true
+	}
+	if stayRunning {
+		kbCtx.Log.Debug("AppDidEnterBackground: setting background active")
+		kbCtx.MobileAppState.Update(keybase1.MobileAppState_BACKGROUNDACTIVE)
+		flushLocalDbs()
+		return true
+	}
+	SetAppStateBackground()
+	return false
+}
+
+func AppBeginBackgroundTaskNonblock(pusher PushNotifier) {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("AppBeginBackgroundTaskNonblock", nil)()
+	go AppBeginBackgroundTask(pusher)
+}
+
+// AppBeginBackgroundTask notifies us that an app background task has been started on our behalf. This
+// function will return once we no longer need any time in the background.
+func AppBeginBackgroundTask(pusher PushNotifier) {
+	if !isInited() {
+		return
+	}
+	defer kbCtx.Trace("AppBeginBackgroundTask", nil)()
+	ctx := context.Background()
+	// Poll active deliveries in case we can shutdown early
+	beginTime := libkb.ForceWallClock(time.Now())
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	appState := kbCtx.MobileAppState.State()
+	if appState != keybase1.MobileAppState_BACKGROUNDACTIVE {
+		kbCtx.Log.Debug("AppBeginBackgroundTask: not in background mode, early out")
+		return
+	}
+	var g *errgroup.Group
+	g, ctx = errgroup.WithContext(ctx)
+	g.Go(func() error {
+		select {
+		case <-kbCtx.MobileAppState.NextUpdate(appState):
+			appState = kbCtx.MobileAppState.State()
+			kbCtx.Log.Debug(
+				"AppBeginBackgroundTask: app state change, aborting with no task shutdown: %v", appState)
+			return errors.New("app state change")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	g.Go(func() error {
+		ch, cancel := kbChatCtx.MessageDeliverer.NextFailure()
+		defer cancel()
+		select {
+		case obrs := <-ch:
+			kbCtx.Log.Debug(
+				"AppBeginBackgroundTask: failure received, alerting the user: %d marked", len(obrs))
+			pushPendingMessageFailure(obrs, pusher)
+			return errors.New("failure received")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	g.Go(func() error {
+		successCount := 0
+		for {
+			select {
+			case <-ticker.C:
+				obrs, err := kbChatCtx.MessageDeliverer.ActiveDeliveries(ctx)
+				if err != nil {
+					kbCtx.Log.Debug("AppBeginBackgroundTask: failed to query active deliveries: %s", err)
+					continue
+				}
+				if len(obrs) == 0 {
+					kbCtx.Log.Debug("AppBeginBackgroundTask: delivered everything: successCount: %d",
+						successCount)
+					// We can race the failure case here, so lets go a couple passes of no pending
+					// convs before we abort due to ths condition.
+					if successCount > 1 {
+						return errors.New("delivered everything")
+					}
+					successCount++
+				}
+				curTime := libkb.ForceWallClock(time.Now())
+				if curTime.Sub(beginTime) >= 10*time.Minute {
+					kbCtx.Log.Debug("AppBeginBackgroundTask: failed to deliver and time is up, aborting")
+					pushPendingMessageFailure(obrs, pusher)
+					return errors.New("time expired")
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	if err := g.Wait(); err != nil {
+		kbCtx.Log.Debug("AppBeginBackgroundTask: dropped out of wait because: %s", err)
+	}
+}
+
+func startTrace(logFile string) {
+	if os.Getenv("KEYBASE_TRACE_MOBILE") != "1" {
+		return
+	}
+	if logFile == "" {
+		return
+	}
+
+	tname := filepath.Join(filepath.Dir(logFile), "svctrace.out")
+	f, err := os.Create(tname)
+	if err != nil {
+		log("error creating %s", tname)
+		return
+	}
+	log("Go: starting trace %s", tname)
+	_ = trace.Start(f)
+	go func() {
+		log("Go: sleeping 30s for trace")
+		time.Sleep(30 * time.Second)
+		log("Go: stopping trace %s", tname)
+		trace.Stop()
+		time.Sleep(5 * time.Second)
+		log("Go: trace stopped")
+	}()
 }

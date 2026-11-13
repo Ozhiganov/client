@@ -1,8 +1,6 @@
-// @flow
 var os = require('os')
 var path = require('path')
-// $FlowIssue
-var tmpDir = os.tmpDir()
+var tmpDir = os.tmpdir()
 var fs = require('fs')
 var exec = require('child_process').exec
 
@@ -16,12 +14,12 @@ fs.readdir(tmpDir, function (err, files) {
     })
 
     toWipe.forEach(function (f) {
-      f = path.join(tmpDir, f)
+      const fullPath = path.join(tmpDir, f)
 
       if (dryRun) {
-        console.log('Dry run: wiping ', f)
+        console.log('Dry run: wiping ', fullPath)
       } else {
-        exec('rm -r ' + f, function (err, stdout, stderr) {
+        exec('rm -r ' + fullPath, function (err, stdout, stderr) {
           if (err) {
             console.log(err)
           }

@@ -1,0 +1,315 @@
+package unfurl
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/keybase/client/go/chat/globals"
+	"github.com/keybase/client/go/externalstest"
+	"github.com/keybase/client/go/protocol/chat1"
+	"github.com/keybase/client/go/protocol/gregor1"
+	"github.com/stretchr/testify/require"
+)
+
+const codeBlock = "```"
+
+func TestExtractor(t *testing.T) {
+	tc := externalstest.SetupTest(t, "chat_extractor", 1)
+	defer tc.Cleanup()
+	g := globals.NewContext(tc.G, &globals.ChatContext{})
+
+	uid := gregor1.UID([]byte{0, 1})
+	convID := chat1.ConversationID([]byte{0, 1})
+	settingsMod := NewSettings(g, newMemConversationBackedStorage())
+	extractor := NewExtractor(g)
+	type testCase struct {
+		message   string
+		mode      chat1.UnfurlMode
+		whitelist []string
+		blocklist []string
+		result    []ExtractorHit
+	}
+	var maxCase strings.Builder
+	var maxRes []ExtractorHit
+	for i := 0; i < extractor.maxHits+5; i++ {
+		maxCase.WriteString(" http://www.wsj.com")
+	}
+	for i := 0; i < extractor.maxHits; i++ {
+		maxRes = append(maxRes, ExtractorHit{
+			URL: "http://www.wsj.com",
+			Typ: ExtractorHitUnfurl,
+		})
+	}
+	cases := []testCase{
+		{
+			message: "check out this lame post: http://www.twitter.com/mike/383878473873",
+			mode:    chat1.UnfurlMode_NEVER,
+		},
+		{
+			message: "check out this lame site: www.google.com",
+			mode:    chat1.UnfurlMode_ALWAYS,
+		},
+		{
+			message: maxCase.String(),
+			mode:    chat1.UnfurlMode_ALWAYS,
+			result:  maxRes,
+		},
+		{
+			message: "check out this lame post: http://www.twitter.com/mike/383878473873",
+			mode:    chat1.UnfurlMode_ALWAYS,
+			result: []ExtractorHit{
+				{
+					URL: "http://www.twitter.com/mike/383878473873",
+					Typ: ExtractorHitUnfurl,
+				},
+			},
+		},
+		{
+			message: "check out this lame post: `http://www.twitter.com/mike/383878473873`",
+			mode:    chat1.UnfurlMode_ALWAYS,
+			result:  nil,
+		},
+		{
+			message: fmt.Sprintf(`%s
+			[mike@lisa-keybase]-[~/go/src/github.com/keybase/client/go] (mike/markdown)$ scraper https://www.wsj.com/articles/a-silicon-valley-tech-leader-walks-a-high-wire-between-the-u-s-and-china-1542650707?mod=hp_lead_pos4
+			2018/11/19 16:33:52 ++Chat: + Scraper: Scrape
+			2018/11/19 16:33:53 ++Chat: | Scraper: scrapeGeneric: pubdate: 2018-11-19T18:05:00.000Z
+			2018/11/19 16:33:53 ++Chat: | Scraper: scrapeGeneric: success: 1542650700
+			2018/11/19 16:33:53 ++Chat: - Scraper: Scrape -> ok [time=893.809968ms]
+			Title: A Silicon Valley Tech Leader Walks a High Wire Between the U.S. and China
+			Url: https://www.wsj.com/articles/a-silicon-valley-tech-leader-walks-a-high-wire-between-the-u-s-and-china-1542650707
+			SiteName: WSJ
+			PublishTime: 2018-11-19 13:05:00 -0500 EST
+			Description: Nvidia sells lots of artificial-intelligence chips in China. That creates a dilemma as the company tries to navigate political and trade tensions.
+			ImageUrl: https://images.wsj.net/im-37707/social,
+			FaviconUrl: https://s.wsj.net/media/wsj_apple-touch-icon-180x180.png
+			%s`, codeBlock, codeBlock),
+			mode:   chat1.UnfurlMode_ALWAYS,
+			result: nil,
+		},
+		{
+			message: "check out this lame post: `http://www.twitter.com/mike/383878473873` http://www.twitter.com/mike/MIKE",
+			mode:    chat1.UnfurlMode_ALWAYS,
+			result: []ExtractorHit{
+				{
+					URL: "http://www.twitter.com/mike/MIKE",
+					Typ: ExtractorHitUnfurl,
+				},
+			},
+		},
+		{
+			message: "check out this lame post: ```http://www.twitter.com/mike/383878473873````",
+			mode:    chat1.UnfurlMode_ALWAYS,
+			result:  nil,
+		},
+		{
+			message: "check out this lame post: http://www.twitter.com/mike/383878473873",
+			mode:    chat1.UnfurlMode_WHITELISTED,
+			result: []ExtractorHit{
+				{
+					URL: "http://www.twitter.com/mike/383878473873",
+					Typ: ExtractorHitPrompt,
+				},
+			},
+		},
+		{
+			message:   "check out this lame post: http://www.twitter.com/mike/383878473873",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			whitelist: []string{"twitter.com"},
+			result: []ExtractorHit{
+				{
+					URL: "http://www.twitter.com/mike/383878473873",
+					Typ: ExtractorHitUnfurl,
+				},
+			},
+		},
+		{
+			message:   "http://www.github.com/keybase/client check out this lame post: http://www.twitter.com/mike/383878473873",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			whitelist: []string{"twitter.com", "github.com"},
+			result: []ExtractorHit{
+				{
+					URL: "http://www.github.com/keybase/client",
+					Typ: ExtractorHitUnfurl,
+				},
+				{
+					URL: "http://www.twitter.com/mike/383878473873",
+					Typ: ExtractorHitUnfurl,
+				},
+			},
+		},
+		{
+			message:   "http://www.twitter.com/mike/1",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			blocklist: []string{"twitter.com"},
+		},
+		{
+			message:   "http://www.twitter.com/mike/1",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			blocklist: []string{"wsj.com"},
+			result:    []ExtractorHit{{URL: "http://www.twitter.com/mike/1", Typ: ExtractorHitPrompt}},
+		},
+		{
+			message:   "http://www.twitter.com/mike/1",
+			mode:      chat1.UnfurlMode_ALWAYS,
+			blocklist: []string{"twitter.com"},
+			result:    []ExtractorHit{{URL: "http://www.twitter.com/mike/1", Typ: ExtractorHitUnfurl}},
+		},
+		{
+			message:   "http://www.twitter.com/mike/1",
+			mode:      chat1.UnfurlMode_NEVER,
+			whitelist: []string{"twitter.com"},
+		},
+		{
+			message:   "https://giphy.com/gifs/x http://www.twitter.com/mike/1",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			blocklist: []string{"twitter.com"},
+			result:    []ExtractorHit{{URL: "https://giphy.com/gifs/x", Typ: ExtractorHitUnfurl}},
+		},
+		{
+			message:   "http://www.TWITTER.com/mike/1",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			blocklist: []string{"twitter.com"},
+		},
+		{
+			message:   "http://www.Twitter.COM/mike/1",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			whitelist: []string{"twitter.com"},
+			result:    []ExtractorHit{{URL: "http://www.Twitter.COM/mike/1", Typ: ExtractorHitUnfurl}},
+		},
+		{
+			message: "https://GIPHY.com/gifs/x",
+			mode:    chat1.UnfurlMode_WHITELISTED,
+			result:  []ExtractorHit{{URL: "https://GIPHY.com/gifs/x", Typ: ExtractorHitUnfurl}},
+		},
+		{
+			message:   "http://[2001:db8::1]/x",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			whitelist: []string{"2001:db8::1"},
+			result:    []ExtractorHit{{URL: "http://[2001:db8::1]/x", Typ: ExtractorHitUnfurl}},
+		},
+		{
+			message:   "http://[2001:db8::1]/x",
+			mode:      chat1.UnfurlMode_WHITELISTED,
+			blocklist: []string{"2001:db8::1"},
+		},
+		{
+			message: "https://GIPHY.com/gifs/x",
+			mode:    chat1.UnfurlMode_NEVER,
+			result:  []ExtractorHit{{URL: "https://GIPHY.com/gifs/x", Typ: ExtractorHitUnfurl}},
+		},
+	}
+	for _, tcase := range cases {
+		settings := chat1.NewUnfurlSettings()
+		settings.Mode = tcase.mode
+		for _, w := range tcase.whitelist {
+			settings.Whitelist[w] = true
+		}
+		settings.Blocklist = make(map[string]bool)
+		for _, b := range tcase.blocklist {
+			settings.Blocklist[b] = true
+		}
+		require.NoError(t, settingsMod.Set(context.TODO(), uid, settings))
+		res, err := extractor.Extract(context.TODO(), uid, convID, 1, tcase.message, settingsMod)
+		require.NoError(t, err)
+		require.Equal(t, tcase.result, res)
+	}
+}
+
+func TestExtractorExemptions(t *testing.T) {
+	tc := externalstest.SetupTest(t, "chat_extractor", 1)
+	defer tc.Cleanup()
+	g := globals.NewContext(tc.G, &globals.ChatContext{})
+
+	uid := gregor1.UID([]byte{0, 1})
+	convID := chat1.ConversationID([]byte{0, 1})
+	msgID := chat1.MessageID(1)
+	extractor := NewExtractor(g)
+	settings := chat1.NewUnfurlSettings()
+	settings.Mode = chat1.UnfurlMode_WHITELISTED
+	settings.Whitelist["amazon.com"] = true
+	settingsMod := NewSettings(g, newMemConversationBackedStorage())
+
+	extractor.AddWhitelistExemption(context.TODO(), uid,
+		NewOneTimeWhitelistExemption(convID, msgID, "amazon.com"))
+	res, err := extractor.Extract(context.TODO(), uid, convID, msgID, "http://amazon.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+	extractor.AddWhitelistExemption(context.TODO(), uid,
+		NewOneTimeWhitelistExemption(convID, msgID, "cnn.com"))
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://amazon.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitPrompt, res[0].Typ)
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://cnn.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://cnn.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitPrompt, res[0].Typ)
+
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://google.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitPrompt, res[0].Typ)
+	extractor.AddWhitelistExemption(context.TODO(), uid,
+		NewSingleMessageWhitelistExemption(convID, msgID, "google.com"))
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://google.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://google.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+
+	require.NoError(t, settingsMod.Set(context.TODO(), uid, settings))
+	res, err = extractor.Extract(context.TODO(), uid, convID, msgID, "http://amazon.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+
+	// a one-time exemption proves the block check runs first: had the blocked
+	// extract consumed it, the unblocked extract would prompt
+	blockedMsgID := chat1.MessageID(2)
+	extractor.AddWhitelistExemption(context.TODO(), uid,
+		NewOneTimeWhitelistExemption(convID, blockedMsgID, "yahoo.com"))
+	blocked := chat1.NewUnfurlSettings()
+	blocked.Mode = chat1.UnfurlMode_WHITELISTED
+	blocked.Blocklist = map[string]bool{"yahoo.com": true}
+	require.NoError(t, settingsMod.Set(context.TODO(), uid, blocked))
+	res, err = extractor.Extract(context.TODO(), uid, convID, blockedMsgID, "http://yahoo.com", settingsMod)
+	require.NoError(t, err)
+	require.Empty(t, res)
+	blocked.Blocklist = map[string]bool{}
+	require.NoError(t, settingsMod.Set(context.TODO(), uid, blocked))
+	res, err = extractor.Extract(context.TODO(), uid, convID, blockedMsgID, "http://yahoo.com", settingsMod)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Equal(t, ExtractorHitUnfurl, res[0].Typ)
+}
+
+func TestExtractorExtractAll(t *testing.T) {
+	tc := externalstest.SetupTest(t, "extractor", 0)
+	defer tc.Cleanup()
+	extractor := NewExtractor(globals.NewContext(tc.G, &globals.ChatContext{}))
+
+	urls := func(hits []ExtractorHit) (res []string) {
+		for _, h := range hits {
+			require.Equal(t, ExtractorHitUnfurl, h.Typ)
+			res = append(res, h.URL)
+		}
+		return res
+	}
+	// schemes that cannot be scraped are not unfurled, and neither is a quoted link
+	require.Equal(t, []string{"https://a.com"},
+		urls(extractor.ExtractAll("https://a.com mailto:testuser@a.com ftp://a.com/x `https://b.com`")))
+	// a repeated url counts once toward the cap, so the fifth distinct one still makes it
+	require.Equal(t, []string{"http://a.com", "http://b.com", "http://c.com", "http://d.com", "http://e.com"},
+		urls(extractor.ExtractAll("http://a.com http://a.com http://b.com http://c.com http://d.com http://e.com http://f.com")))
+}

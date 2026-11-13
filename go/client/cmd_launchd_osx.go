@@ -1,7 +1,7 @@
 // Copyright 2015 Keybase, Inc. All rights reserved. Use of
 // this source code is governed by the included BSD license.
 
-// +build darwin
+//go:build darwin
 
 package client
 
@@ -21,7 +21,6 @@ import (
 func NewCmdLaunchd(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.Command {
 	return cli.Command{
 		Name:         "launchd",
-		Usage:        "Manage launchd",
 		ArgumentHelp: "[arguments...]",
 		Subcommands: []cli.Command{
 			NewCmdLaunchdInstall(cl, g),
@@ -92,7 +91,7 @@ func NewCmdLaunchdList(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli.C
 		Flags: []cli.Flag{
 			cli.StringFlag{
 				Name:  "f, format",
-				Usage: "Format for output. Specify 'j' for JSON or blank for default.",
+				Usage: "Format for output. Specify 'json' for JSON or blank for default.",
 			},
 		},
 		Action: func(c *cli.Context) {
@@ -154,7 +153,7 @@ func NewCmdLaunchdStatus(cl *libcmdline.CommandLine, g *libkb.GlobalContext) cli
 			},
 			cli.StringFlag{
 				Name:  "f, format",
-				Usage: "Format for output. Specify 'j' for JSON or blank for default.",
+				Usage: "Format for output. Specify 'json' for JSON or blank for default.",
 			},
 			cli.DurationFlag{
 				Name:  "t, timeout",
@@ -193,7 +192,8 @@ func (v *CmdLaunchdList) ParseArgv(ctx *cli.Context) error {
 }
 
 func (v *CmdLaunchdList) Run() error {
-	if v.format == "json" {
+	switch v.format {
+	case "json":
 		servicesStatus, err := install.ListServices(v.G(), 0, v.G().Log)
 		if err != nil {
 			return err
@@ -203,20 +203,20 @@ func (v *CmdLaunchdList) Run() error {
 			return err
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", out)
-	} else if v.format == "" {
+	case "":
 		return v.ShowServices()
-	} else {
+	default:
 		return fmt.Errorf("Invalid format: %s", v.format)
 	}
 	return nil
 }
 
 func (v *CmdLaunchdList) ShowServices() error {
-	err := v.showServices([]string{"keybase.service.", "homebrew.mxcl.keybase"}, "Keybase")
+	err := v.showServices([]string{"keybase.service."}, "Keybase")
 	if err != nil {
 		return err
 	}
-	err = v.showServices([]string{"keybase.kbfs.", "homebrew.mxcl.kbfs"}, "KBFS")
+	err = v.showServices([]string{"keybase.kbfs."}, "KBFS")
 	if err != nil {
 		return err
 	}
@@ -344,19 +344,6 @@ func (v *CmdLaunchdAction) Run() error {
 		return launchd.Uninstall(v.label, defaultLaunchdWait, v.G().Log)
 	}
 
-	return nil
-}
-
-func startLaunchdService(g *libkb.GlobalContext, label string, serviceInfoPath string, wait bool) error {
-	launchService := launchd.NewService(label)
-	launchService.SetLogger(g.Log)
-	err := launchService.Start(defaultLaunchdWait)
-	if err != nil {
-		return err
-	}
-	if wait {
-		return WaitForService(g, launchService, serviceInfoPath)
-	}
 	return nil
 }
 

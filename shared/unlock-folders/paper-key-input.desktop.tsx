@@ -1,0 +1,58 @@
+import * as React from 'react'
+import * as Kb from '@/common-adapters'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+export type Props = {
+  onBack: () => void
+  onContinue: (paperkey: string) => void
+  paperkeyError?: string
+  waiting: boolean
+}
+
+const PaperKeyInput = (props: Props) => {
+  const styles = useStyles()
+  const [paperkey, setPaperkey] = React.useState('')
+  const {onContinue} = props
+
+  return (
+    <Kb.Box2
+      alignSelf="center"
+      alignItems="center"
+      direction="vertical"
+      padding="small"
+      testID={TestIDs.UNLOCK_FOLDERS_PAPER_KEY_INPUT}
+    >
+      <Kb.BackButton onClick={props.onBack} style={styles.back} />
+      <Kb.ImageIcon style={styles.icon} type="icon-paper-key-48" />
+      <Kb.Input3
+        textType="BodySemibold"
+        multiline={true}
+        rowsMax={3}
+        containerStyle={styles.input}
+        onChangeText={setPaperkey}
+        error={!!props.paperkeyError}
+        placeholder="Enter your paper key"
+      />
+      {!!props.paperkeyError && <Kb.Text type="BodySmallError">{props.paperkeyError}</Kb.Text>}
+      <Kb.Button
+        label="Continue"
+        style={styles.button}
+        waiting={props.waiting}
+        onClick={() => onContinue(paperkey)}
+      />
+    </Kb.Box2>
+  )
+}
+
+const useStyles = Kb.Styles.createStyleHook(() => ({
+  back: {
+    left: 30,
+    position: 'absolute',
+    top: 30,
+  },
+  button: {marginTop: Kb.Styles.globalMargins.small},
+  icon: {marginBottom: Kb.Styles.globalMargins.tiny},
+  input: {width: 400},
+}))
+
+export default PaperKeyInput

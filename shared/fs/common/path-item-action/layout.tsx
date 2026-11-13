@@ -1,0 +1,128 @@
+import * as T from '@/constants/types'
+import * as FS from '@/constants/fs'
+
+export type Layout = {
+  archive: boolean
+  delete: boolean
+  download: boolean
+  ignoreTlf: boolean
+  moveOrCopy: boolean
+  newFolder: boolean
+  openChatNonTeam: boolean
+  openChatTeam: boolean
+  rename: boolean
+  saveMedia: boolean
+  showInSystemFileManager: boolean
+  sendAttachmentToChat: boolean
+  sendToOtherApp: boolean
+}
+
+const empty = {
+  archive: false,
+  delete: false,
+  download: false,
+  ignoreTlf: false,
+  moveOrCopy: false,
+  newFolder: false,
+  openChatNonTeam: false,
+  openChatTeam: false,
+  rename: false,
+  saveMedia: false,
+  showInSystemFileManager: false,
+  // share items
+  // eslint-disable-next-line sort-keys
+  sendAttachmentToChat: false,
+  sendToOtherApp: false,
+}
+
+const isMyOwn = (parsedPath: T.FS.ParsedPathGroupTlf, me: string) =>
+  !parsedPath.readers?.length && parsedPath.writers.length === 1 && parsedPath.writers[0] === me
+
+export const getRootLayout = (
+  mode: 'row' | 'screen',
+  path: T.FS.Path,
+  pathItem: T.FS.PathItem,
+  fileContext: T.FS.FileContext,
+  me: string
+): Layout => {
+  const parsedPath = FS.parsePath(path)
+  switch (parsedPath.kind) {
+    case T.FS.PathKind.Root:
+      // should never happen
+      return empty
+    case T.FS.PathKind.TlfList:
+      return {
+        ...empty,
+        showInSystemFileManager: !isMobile,
+      }
+    case T.FS.PathKind.GroupTlf:
+    case T.FS.PathKind.TeamTlf:
+      return {
+        ...empty,
+        ...(mode === 'screen'
+          ? {
+              newFolder: pathItem.writable,
+              openChatNonTeam: parsedPath.kind === T.FS.PathKind.GroupTlf,
+              openChatTeam: parsedPath.kind === T.FS.PathKind.TeamTlf,
+            }
+          : {}),
+        archive: true,
+        // An empty `me` means the username isn't known yet, so we can't tell
+        // whether this is the user's own tlf. Don't offer to ignore it.
+        ignoreTlf: parsedPath.kind === T.FS.PathKind.TeamTlf || (!!me && !isMyOwn(parsedPath, me)),
+        showInSystemFileManager: !isMobile,
+      }
+    case T.FS.PathKind.InGroupTlf:
+    case T.FS.PathKind.InTeamTlf:
+      // inside tlf
+      return {
+        ...empty,
+        ...(mode === 'screen'
+          ? {
+              newFolder: pathItem.writable && pathItem.type === T.FS.PathType.Folder,
+              openChatNonTeam: parsedPath.kind === T.FS.PathKind.InGroupTlf,
+              openChatTeam: parsedPath.kind === T.FS.PathKind.InTeamTlf,
+            }
+          : {}),
+        archive: true,
+        delete: pathItem.writable,
+        download: pathItem.type === T.FS.PathType.File && !isIOS,
+        moveOrCopy: true,
+        rename: pathItem.writable && mode === 'row',
+        saveMedia:
+          isMobile && pathItem.type === T.FS.PathType.File && FS.canSaveMedia(pathItem, fileContext),
+        showInSystemFileManager: !isMobile,
+        // share menu items
+        // eslint-disable-next-line sort-keys
+        sendAttachmentToChat: pathItem.type === T.FS.PathType.File,
+        sendToOtherApp: pathItem.type === T.FS.PathType.File && isMobile,
+      }
+    default:
+      return empty
+  }
+}
+
+const totalShare = (layout: Layout) => (layout.sendAttachmentToChat ? 1 : 0) + (layout.sendToOtherApp ? 1 : 0)
+
+const filterForOnlyShares = (layout: Layout): Layout => ({
+  ...empty,
+  sendAttachmentToChat: layout.sendAttachmentToChat,
+  sendToOtherApp: layout.sendToOtherApp,
+})
+
+export const getShareLayout = (
+  mode: 'row' | 'screen',
+  path: T.FS.Path,
+  pathItem: T.FS.PathItem,
+  fileContext: T.FS.FileContext,
+  me: string
+): Layout => filterForOnlyShares(getRootLayout(mode, path, pathItem, fileContext, me))
+
+export const hasShare = (
+  mode: 'row' | 'screen',
+  path: T.FS.Path,
+  pathItem: T.FS.PathItem,
+  fileContext: T.FS.FileContext
+): boolean =>
+  totalShare(getRootLayout(mode, path, pathItem, fileContext, '' /* username doesn't matter for shares */)) >
+  0

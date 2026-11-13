@@ -1,0 +1,34 @@
+import * as C from '@/constants'
+import * as Kb from '@/common-adapters'
+import * as T from '@/constants/types'
+import * as TestIDs from '@/tests/e2e/shared/test-ids'
+
+const DbNukeConfirm = () => {
+  const dbNuke = C.useRPC(T.RPCGen.ctlDbNukeRpcPromise)
+  const onCancel = C.Router2.navigateUp
+  const onDBNuke = () => {
+    C.Router2.navigateUp()
+    dbNuke([undefined, C.waitingKeySettingsGeneric], () => {}, () => {})
+  }
+
+  return (
+    <Kb.Box2
+      direction="vertical"
+      centerChildren={true}
+      fullWidth={true}
+      flex={1}
+      padding="medium"
+      testID={TestIDs.SETTINGS_DB_NUKE_CONFIRM}
+    >
+      <Kb.Text center={true} type="Header" style={{marginTop: Kb.Styles.globalMargins.medium, width: 320}}>
+        Are you sure you want to blast away your local database?
+      </Kb.Text>
+      <Kb.ButtonBar>
+        <Kb.Button type="Dim" label="Cancel" onClick={onCancel} />
+        <Kb.Button type="Danger" label="Yes, blow it away" onClick={onDBNuke} />
+      </Kb.ButtonBar>
+    </Kb.Box2>
+  )
+}
+
+export default DbNukeConfirm

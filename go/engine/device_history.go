@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/keybase/client/go/kbcrypto"
 	"github.com/keybase/client/go/libkb"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 )
@@ -46,7 +47,7 @@ func (e *DeviceHistory) Prereqs() Prereqs {
 	if len(e.username) > 0 {
 		return Prereqs{}
 	}
-	return Prereqs{Session: true}
+	return Prereqs{Device: true}
 }
 
 // RequiredUIs returns the required UIs.
@@ -60,11 +61,10 @@ func (e *DeviceHistory) SubConsumers() []libkb.UIConsumer {
 }
 
 // Run starts the engine.
-func (e *DeviceHistory) Run(ctx *Context) error {
-
-	arg := e.loadUserArg()
-	err := e.G().GetFullSelfer().WithUser(arg, func(u *libkb.User) error {
-		return e.loadDevices(u)
+func (e *DeviceHistory) Run(m libkb.MetaContext) error {
+	arg := e.loadUserArg(m)
+	err := m.G().GetFullSelfer().WithUser(arg, func(u *libkb.User) error {
+		return e.loadDevices(m, u)
 	})
 	return err
 }
@@ -73,17 +73,17 @@ func (e *DeviceHistory) Devices() []keybase1.DeviceDetail {
 	return e.devices
 }
 
-func (e *DeviceHistory) loadUserArg() libkb.LoadUserArg {
-	arg := libkb.NewLoadUserPubOptionalArg(e.G())
+func (e *DeviceHistory) loadUserArg(m libkb.MetaContext) libkb.LoadUserArg {
+	arg := libkb.NewLoadUserPubOptionalArg(m.G())
 	if len(e.username) == 0 {
-		arg.Self = true
+		arg = arg.WithSelf(true)
 	} else {
-		arg.Name = e.username
+		arg = arg.WithName(e.username)
 	}
 	return arg
 }
 
-func (e *DeviceHistory) loadDevices(user *libkb.User) error {
+func (e *DeviceHistory) loadDevices(m libkb.MetaContext, user *libkb.User) error {
 	ckf := user.GetComputedKeyFamily()
 	if ckf == nil {
 		return errors.New("nil ComputedKeyFamily for user")
@@ -94,7 +94,7 @@ func (e *DeviceHistory) loadDevices(user *libkb.User) error {
 	}
 
 	for _, d := range ckf.GetAllDevices() {
-		exp := keybase1.DeviceDetail{Device: *(d.ProtExport())}
+		exp := keybase1.DeviceDetail{Device: *d.ProtExportWithDeviceNum()}
 		cki, ok := ckis.Infos[d.Kid]
 		if !ok {
 			return fmt.Errorf("no ComputedKeyInfo for device %s, kid %s", d.ID, d.Kid)
@@ -103,7 +103,7 @@ func (e *DeviceHistory) loadDevices(user *libkb.User) error {
 		if cki.Eldest {
 			exp.Eldest = true
 		} else {
-			prov, err := e.provisioner(d, ckis, cki)
+			prov, err := e.provisioner(m, d, ckis, cki)
 			if err != nil {
 				return err
 			}
@@ -127,7 +127,7 @@ func (e *DeviceHistory) loadDevices(user *libkb.User) error {
 			}
 		}
 
-		if e.G().Env.GetDeviceIDForUsername(user.GetNormalizedName()).Eq(d.ID) {
+		if m.G().Env.GetDeviceIDForUsername(user.GetNormalizedName()).Eq(d.ID) {
 			exp.CurrentDevice = true
 		}
 
@@ -136,20 +136,31 @@ func (e *DeviceHistory) loadDevices(user *libkb.User) error {
 
 	// Load the last used times, but only if these are your own devices. The
 	// API won't give you those times for other people's devices.
-	if user.GetNormalizedName().Eq(e.G().Env.GetUsername()) {
-		lastUsedTimes, err := e.getLastUsedTimes()
+	if user.GetNormalizedName().Eq(m.G().Env.GetUsername()) {
+		lastUsedTimes, err := e.getLastUsedTimes(m)
 		if err != nil {
 			return err
+		}
+		// If any active device is absent from the cache (e.g. a paper key
+		// provisioned after the last secrets sync), force a network sync so
+		// every device gets a real LastUsedTime on this first load.
+		for _, detail := range e.devices {
+			if detail.RevokedAt != nil {
+				continue
+			}
+			if _, ok := lastUsedTimes[detail.Device.DeviceID]; !ok {
+				lastUsedTimes, err = e.getLastUsedTimesForce(m)
+				if err != nil {
+					return err
+				}
+				break
+			}
 		}
 		for i := range e.devices {
 			detail := &e.devices[i]
 			lastUsedTime, ok := lastUsedTimes[detail.Device.DeviceID]
 			if !ok {
-				if detail.RevokedAt != nil {
-					// The server only provides last used times for active devices.
-					continue
-				}
-				return fmt.Errorf("Failed to load last used time for device %s", detail.Device.DeviceID)
+				continue
 			}
 			detail.Device.LastUsedTime = keybase1.TimeFromSeconds(lastUsedTime.Unix())
 		}
@@ -158,9 +169,9 @@ func (e *DeviceHistory) loadDevices(user *libkb.User) error {
 	return nil
 }
 
-func (e *DeviceHistory) provisioner(d *libkb.Device, ckis *libkb.ComputedKeyInfos, info *libkb.ComputedKeyInfo) (*libkb.Device, error) {
+func (e *DeviceHistory) provisioner(m libkb.MetaContext, d libkb.DeviceWithDeviceNumber, ckis *libkb.ComputedKeyInfos, info *libkb.ComputedKeyInfo) (*libkb.Device, error) {
 	for _, v := range info.Delegations {
-		if v.GetKeyType() != libkb.KIDNaclEddsa {
+		if kbcrypto.AlgoType(v.GetKeyType()) != kbcrypto.KIDNaclEddsa {
 			// only concerned with device history, not pgp provisioners
 			continue
 		}
@@ -179,24 +190,44 @@ func (e *DeviceHistory) provisioner(d *libkb.Device, ckis *libkb.ComputedKeyInfo
 	return nil, nil
 }
 
-func (e *DeviceHistory) getLastUsedTimes() (map[keybase1.DeviceID]time.Time, error) {
-	uid := e.G().GetMyUID()
-	var err error
+func (e *DeviceHistory) getLastUsedTimes(m libkb.MetaContext) (ret map[keybase1.DeviceID]time.Time, err error) {
+	defer m.Trace("DeviceHistory#getLastUsedTimes", &err)()
 	var devs libkb.DeviceKeyMap
-	aerr := e.G().LoginState().Account(func(a *libkb.Account) {
-		if err = libkb.RunSyncer(a.SecretSyncer(), uid, a.LoggedIn(), a.LocalSession()); err != nil {
-			return
-		}
-		devs, err = a.SecretSyncer().ActiveDevices(libkb.AllDeviceTypes)
-	}, "DeviceHistory - ")
-	if aerr != nil {
-		return nil, aerr
-	}
+	var ss *libkb.SecretSyncer
+	// Use local cache to avoid a blocking network call on every page load.
+	// Falls back to a forced network sync when the cache is empty.
+	ss, err = m.ActiveDevice().SyncSecretsFromCache(m)
 	if err != nil {
 		return nil, err
 	}
+	if !ss.HasDevices() {
+		ss, err = m.ActiveDevice().SyncSecretsForce(m)
+		if err != nil {
+			return nil, err
+		}
+	}
+	devs, err = ss.ActiveDevices(libkb.AllDeviceTypes)
+	if err != nil {
+		return nil, err
+	}
+	ret = map[keybase1.DeviceID]time.Time{}
+	for deviceID, dev := range devs {
+		ret[deviceID] = time.Unix(dev.LastUsedTime, 0)
+	}
+	return ret, nil
+}
 
-	ret := map[keybase1.DeviceID]time.Time{}
+func (e *DeviceHistory) getLastUsedTimesForce(m libkb.MetaContext) (ret map[keybase1.DeviceID]time.Time, err error) {
+	defer m.Trace("DeviceHistory#getLastUsedTimesForce", &err)()
+	ss, err := m.ActiveDevice().SyncSecretsForce(m)
+	if err != nil {
+		return nil, err
+	}
+	devs, err := ss.ActiveDevices(libkb.AllDeviceTypes)
+	if err != nil {
+		return nil, err
+	}
+	ret = map[keybase1.DeviceID]time.Time{}
 	for deviceID, dev := range devs {
 		ret[deviceID] = time.Unix(dev.LastUsedTime, 0)
 	}

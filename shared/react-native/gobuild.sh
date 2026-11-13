@@ -2,101 +2,118 @@
 
 set -e -u -o pipefail # Fail on error
 
-dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
-cd $dir
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+client_dir="$dir/../.."
+# shellcheck source=packaging/lib.sh
+source "$client_dir/packaging/lib.sh"
+cd "$client_dir/go"
 
 arg=${1:-}
 
-local_client=${LOCAL_CLIENT:-"1"}
-local_kbfs=${LOCAL_KBFS:-}
-skip_gomobile_init=${SKIP_GOMOBILE_INIT:-}
-tmp_gopath=${TMP_GOPATH:-"/tmp/go-${arg}"}
+if [[ "$arg" != "ios" && "$arg" != "android" ]]; then
+	echo "Nothing to build, you need to specify 'ios' or 'android'"
+	exit 1
+fi
 
-# Original sources
-client_go_dir="$GOPATH/src/github.com/keybase/client/go"
-kbfs_dir="$GOPATH/src/github.com/keybase/kbfs"
+# For CI, this is run like
+#
+#  env KEYBASE_BUILD=ci DEST_DIR=/tmp ... /path/to/gobuild.sh android|ios
+#
+# so make sure doing so doesn't assume anything about where this file is.
 
-# Our custom gopath for iOS build
-GOPATH="$tmp_gopath"
-echo "Using temp GOPATH: $GOPATH"
-
-# Clear source
-echo "Clearing $GOPATH/src"
-rm -rf "$GOPATH/src/"/*
-mkdir -p "$GOPATH/src/github.com/keybase"
-
-# Copy source
-go_client_dir="$GOPATH/src/github.com/keybase/client/go"
-
-if [ ! "$local_client" = "1" ]; then
-  echo "Getting client (via git clone)... To use local copy, set LOCAL_CLIENT=1"
-  (cd "$GOPATH/src/github.com/keybase"; git clone https://github.com/keybase/client)
-  # echo "Getting client (via go get)..."
-  # go get -u github.com/keybase/client/go/...
+# If KEYBASE_BUILD is set and non-empty (e.g., for CI), use it.
+if [[ -n ${KEYBASE_BUILD+x} && "$KEYBASE_BUILD" ]]; then
+	keybase_build="$KEYBASE_BUILD"
 else
-  echo "Getting client (using local GOPATH)... To use git master, set LOCAL_CLIENT=0"
-  mkdir -p "$go_client_dir"
-  cp -R "$client_go_dir"/* "$go_client_dir"
+	keybase_build="$(kb_build_id)"
 fi
 
-go_kbfs_dir="$GOPATH/src/github.com/keybase/kbfs"
+check_ci=${CHECK_CI:-}
 
-if [ ! "$local_kbfs" = "1" ]; then
-  echo "Getting KBFS (via git clone)... To use local copy, set LOCAL_KBFS=1"
-  (cd "$GOPATH/src/github.com/keybase"; git clone https://github.com/keybase/kbfs)
-  # echo "Getting KBFS (via go get)..."
-  # go get -u github.com/keybase/kbfs/...
-else
-  # For testing local KBFS changes
-  echo "Getting KBFS (using local GOPATH)... To use git master, set LOCAL_KBFS=0"
-  mkdir -p "$go_kbfs_dir"
-  cp -R "$kbfs_dir"/* "$go_kbfs_dir"
+GOPATH=${GOPATH:-$(go env GOPATH)}
+echo "Using GOPATH: $GOPATH"
+echo "Using go version: $(go version)"
+
+# gomobile looks for gobind in $PATH, so put $GOPATH/bin in $PATH. We
+# also want executables from our own GOPATH to override anything
+# already in $PATH (like the old GOPATH), so put $GOPATH/bin first.
+PATH="$GOPATH/bin:$PATH"
+
+# need to allowlist some flags we use
+export CGO_CFLAGS_ALLOW="-fmodules|-fblocks"
+
+if [ "$check_ci" = "1" ]; then
+	kb_release_bin
+	"$KB_RELEASE_BIN" wait-ci --repo="client" --commit="$(git rev-parse HEAD)" "${KB_CI_CONTEXTS[@]}"
 fi
-
-# Move all vendoring up a directory to github.com/keybase/vendor
-echo "Re-vendoring..."
-mkdir -p "$GOPATH/src/github.com/keybase/vendor"
-# Remove client vendored in kbfs
-rm -rf "$go_kbfs_dir/vendor/github.com/keybase/client/go"
-# Vendoring client over kbfs (ignore time)
-rsync -pr --ignore-times "$go_kbfs_dir/vendor" "$GOPATH/src/github.com/keybase"
-rsync -pr --ignore-times "$go_client_dir/vendor" "$GOPATH/src/github.com/keybase"
-# Remove their vendoring
-rm -rf "$go_kbfs_dir/vendor"
-rm -rf "$go_client_dir/vendor"
-
-vendor_path="$GOPATH/src/github.com/keybase/vendor"
-gomobile_path="$vendor_path/golang.org/x/mobile/cmd/gomobile"
-
-echo "Build gomobile..."
-(cd "$gomobile_path" && go build -o "$GOPATH/bin/gomobile")
-# The gomobile binary only looks for packages in the GOPATH,
-rsync -pr --ignore-times "$vendor_path/" "$GOPATH/src/"
-
-if [ ! "$skip_gomobile_init" = "1" ]; then
-  echo "Doing gomobile init (to skip, set SKIP_GOMOBILE_INIT=1)"
-  "$GOPATH/bin/gomobile" init
-fi
-
 
 package="github.com/keybase/client/go/bind"
-
-## TODO(mm) consolidate this with packaging/prerelease/
-current_date=`date -u +%Y%m%d%H%M%S` # UTC
-commit_short=`git log -1 --pretty=format:%h`
-build="$current_date+$commit_short"
-keybase_build=${KEYBASE_BUILD:-$build}
 tags=${TAGS:-"prerelease production"}
-ldflags="-X github.com/keybase/client/go/libkb.PrereleaseBuild=$keybase_build"
+ldflags="-X github.com/keybase/client/go/libkb.PrereleaseBuild=$keybase_build -s -w"
+
+# KB_GO_DEBUG=1 builds the Go side with its pointer-safety checks on, for
+# running the app under the Xcode ASan/TSan schemes.
+#
+# This is as far as instrumenting Go goes on mobile: -race, -asan and -msan are
+# all unsupported on ios/arm64 and darwin/arm64, which is exactly why a C++
+# sanitizer cannot see the Go runtime and shared/ios/tsan-suppressions.txt has
+# to exist. What is left still covers the interesting hazard here -- Go pointers
+# reaching C and outliving the call that passed them:
+#
+#   cgocheck2  every cgo pointer-passing rule, not just the cheap subset the
+#              default cgocheck applies. Catches a Go pointer stored into C
+#              memory, which is the failure mode WriteArr's defensive copy and
+#              ReadArr's copy-out both exist to prevent.
+#   checkptr   validates unsafe.Pointer arithmetic and alignment. Normally
+#              implied by -race; enabled here by hand since -race is unavailable.
+#
+# Expect a slower build and slower runtime. Violations panic with a stack, so
+# they land in the device log rather than in the sanitizer's report.
+gcflags=""
+if [[ -n ${KB_GO_DEBUG:-} && "${KB_GO_DEBUG}" != "0" ]]; then
+	echo "KB_GO_DEBUG: building with cgocheck2 + checkptr"
+	export GOEXPERIMENT="${GOEXPERIMENT:+$GOEXPERIMENT,}cgocheck2"
+	gcflags="all=-d=checkptr"
+	# The symbol table is what turns a violation's stack into something
+	# readable, and -s -w discards it.
+	#
+	# The +godebug suffix rides along in the build version so the variant is
+	# identifiable after the fact -- it shows up wherever PrereleaseBuild is
+	# logged or displayed. The artifact keeps its normal filename (the Xcode
+	# link phase and the podspec header search paths both hardcode
+	# keybasego.xcframework), so this string is the thing that tells you which
+	# variant is actually installed.
+	ldflags="-X github.com/keybase/client/go/libkb.PrereleaseBuild=$keybase_build+godebug"
+fi
+
+# gomobile shells out to `gobind` found in $PATH; install the go.mod-pinned
+# version. (Do not use `gomobile init` for this — it installs gobind@latest,
+# which can skew against the x/mobile version pinned in go.mod.)
+go install golang.org/x/mobile/cmd/gobind
 
 if [ "$arg" = "ios" ]; then
-  ios_dest="$dir/ios/keybase.framework"
-  echo "Building for iOS ($ios_dest)..."
-  "$GOPATH/bin/gomobile" bind -target=ios -tags="ios" -ldflags "$ldflags" -o "$ios_dest" "$package"
+	ios_dir=${DEST_DIR:-"$client_dir/shared/ios"}
+	ios_dest="$ios_dir/keybasego.xcframework"
+	# Keep in sync with IPHONEOS_DEPLOYMENT_TARGET
+	ios_version="15.1"
+	echo "Building for iOS ($ios_dest)..."
+	go tool gomobile bind -target=ios -iosversion="$ios_version" -tags="ios $tags" -trimpath ${gcflags:+-gcflags="$gcflags"} -ldflags "$ldflags" -o "$ios_dest" "$package"
+	# gobind emits `@import Foundation;` which breaks ObjC++ consumers (Kb.mm); rewrite to a plain include
+	find "$ios_dest" -name '*.objc.h' -exec sed -i '' 's/@import Foundation;/#include <Foundation\/Foundation.h>/' {} +
 elif [ "$arg" = "android" ]; then
-  android_dest="$dir/android/keybaselib/keybaselib.aar"
-  echo "Building for Android ($android_dest)..."
-  "$GOPATH/bin/gomobile" bind -target=android -tags="android" -ldflags "$ldflags" -o "$android_dest" "$package"
+	android_dir=${DEST_DIR:-"$client_dir/shared/android/keybaselib"}
+	android_dest="$android_dir/keybaselib.aar"
+	android_api="23"
+	# support 16kb page sizes on this ndk
+	android_ldflags="$ldflags \"-extldflags=-Wl,-z,max-page-size=16384\""
+	# No 32-bit x86: dead hardware, and emulator images are x86_64/arm64.
+	# Keep in sync with reactNativeArchitectures in shared/android/gradle.properties.
+	# Override for faster local iteration, e.g. TARGETS=android/arm64.
+	android_targets=${TARGETS:-"android/arm,android/arm64,android/amd64"}
+	echo "Building for Android ($android_dest)..."
+	go tool gomobile bind -target="$android_targets" -androidapi "$android_api" -tags="android $tags" -trimpath ${gcflags:+-gcflags="$gcflags"} -ldflags "$android_ldflags" -o "$android_dest" "$package"
 else
-  echo "Nothing to build, you need to specify 'ios' or 'android'"
+	# Shouldn't get here.
+	echo "Nothing to build, you need to specify 'ios' or 'android'"
+	exit 1
 fi

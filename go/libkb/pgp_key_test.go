@@ -4,15 +4,18 @@
 package libkb
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
 	"github.com/keybase/go-crypto/openpgp"
+	pgpErrors "github.com/keybase/go-crypto/openpgp/errors"
+	"github.com/keybase/go-crypto/openpgp/packet"
+	"github.com/stretchr/testify/require"
 )
 
 // See Issue #40: https://github.com/keybase/client/issues/40
 func TestPGPGetPrimaryUID(t *testing.T) {
-
 	armored := `
 -----BEGIN PGP PUBLIC KEY BLOCK-----
 Comment: GPGTools - https://gpgtools.org
@@ -45,17 +48,12 @@ HKfiyXs8709e067vsE5FCTMvZCq4vt/lkEJ59xn58QBfEILMwQDNLqVGyA54MPwh
 -----END PGP PUBLIC KEY BLOCK-----
 `
 	expected := "Primary Primary <primary@uid.com>"
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		key, _, err := ReadOneKeyFromString(armored)
-		if err != nil {
-			t.Error(err)
-		}
+		require.NoError(t, err)
 		primary := key.GetPrimaryUID()
-		if primary != expected {
-			t.Errorf("Expected '%s' as a primary UID; got '%s'", expected, primary)
-		}
+		require.Equal(t, expected, primary, "Expected '%s' as a primary UID; got '%s'", expected, primary)
 	}
-	return
 }
 
 func TestOpenPGPMultipleArmored(t *testing.T) {
@@ -63,49 +61,38 @@ func TestOpenPGPMultipleArmored(t *testing.T) {
 	// comment says.  Here's a test for that:
 	r := strings.NewReader(issue454Keys)
 	el, err := openpgp.ReadArmoredKeyRing(r)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// len(el) should be 2, but it's 1:
 	/*
-		if len(el) != 2 {
-			t.Errorf("number of entities: %d, expected 2", len(el))
-		}
+		require.Equal(t, 2, len(el), "number of entities: %d, expected 2", len(el))
 	*/
 
 	// we'll make sure that this bug still exists in openpgp, so if it ever
 	// gets fixed we can take appropriate action:
 	if len(el) != 1 {
 		if len(el) == 2 {
-			t.Errorf("openpgp.ReadArmoredKeyRing multiple keys bug fixed!")
+			require.Fail(t, "openpgp.ReadArmoredKeyRing multiple keys bug fixed!")
 		} else {
-			t.Errorf("openpgp.ReadArmoredKeyRing bug changed...number entities: %d, expected 1.", len(el))
+			require.Fail(t, "openpgp.ReadArmoredKeyRing bug changed",
+				"number entities: %d, expected 1", len(el))
 		}
 	}
 }
 
 func TestMultipleArmored(t *testing.T) {
-
 	// ReadOneKeyFromString will return the public key for issue454Keys
 	b1, _, err := ReadOneKeyFromString(issue454Keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b1.HasSecretKey() {
-		t.Errorf("ReadOneKeyFromString returned a private key for issue454Keys.  Expected just the public key (the first one).")
-	}
+	require.NoError(t, err)
+	require.False(t, b1.HasSecretKey(), "ReadOneKeyFromString returned a private key for issue454Keys.  Expected just the public key (the first one).")
 
 	// ReadPrivateKeyFromString should skip the first public key in issue454Keys
 	// and use the private key that follows it.
 	b2, _, err := ReadPrivateKeyFromString(issue454Keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !b2.HasSecretKey() {
-		t.Errorf("ReadPrivateKeyFromString returned only a public key for issue454Keys.  Expected a private key.")
-	}
+	require.NoError(t, err)
+	require.True(t, b2.HasSecretKey(), "ReadPrivateKeyFromString returned only a public key for issue454Keys.  Expected a private key.")
 }
 
+//nolint:gosec // G101: Test PGP key for issue 454 regression testing, not real credentials
 const issue454Keys = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 Comment: GPGTools - http://gpgtools.org
 
@@ -267,7 +254,6 @@ LpRtxqDTDVA6H/R+dqEhg/ni2jAapEr4VzIbew==
 -----END PGP PRIVATE KEY BLOCK-----`
 
 func TestReadOneKeyFromBytes(t *testing.T) {
-
 	t.Log("If this test panics for you, then you need to update github.com/keybase/go-crypto/openpgp")
 	// found by go-fuzz:
 	// (errors are ok, panics are not...these all caused panics with an older version of
@@ -287,7 +273,6 @@ func TestReadOneKeyFromBytes(t *testing.T) {
 }
 
 func TestPGPSubkeyWarning(t *testing.T) {
-
 	const missingCrossSignatureKey = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 Charset: UTF-8
 
@@ -320,11 +305,42 @@ CXQxLBizEEmSNVNxsp7KPGTLnqO3bPtqFirxS9PJLIMPTPLNBY7ZYuPNTMqVIUWF
 -----END PGP PUBLIC KEY BLOCK-----`
 
 	_, w, err := ReadOneKeyFromString(missingCrossSignatureKey)
-	if err != nil {
-		t.Error(err)
+	require.NoError(t, err)
+
+	require.False(t, w.IsEmpty(), "Expected a bad subkey warning")
+}
+
+func TestPGPSigMessageSizeLimit(t *testing.T) {
+	tc := SetupTest(t, "pgp_sig_limit", 1)
+	defer tc.Cleanup()
+	key, err := tc.MakePGPKey("src@keybase.io")
+	require.NoError(t, err)
+
+	sign := func(payload []byte, algo packet.CompressionAlgo) string {
+		var out bytes.Buffer
+		config := &packet.Config{DefaultCompressionAlgo: algo}
+		in, _, err := ArmoredAttachedSign(NopWriteCloser{&out}, *key.Entity, nil, config)
+		require.NoError(t, err)
+		_, err = in.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, in.Close())
+		return out.String()
 	}
 
-	if w.IsEmpty() {
-		t.Errorf("Expected a bad subkey warning")
+	for _, algo := range []packet.CompressionAlgo{packet.CompressionNone, packet.CompressionZLIB} {
+		small := []byte("hello")
+		sig := sign(small, algo)
+		msg, _, err := key.VerifyStringAndExtract(tc.G.Log, sig)
+		require.NoError(t, err)
+		require.Equal(t, small, msg)
+		payload, _, err := SigExtractPGPPayload(sig)
+		require.NoError(t, err)
+		require.Equal(t, small, payload)
+
+		big := sign(bytes.Repeat([]byte{'a'}, int(maxSigMessageSize)+1024), algo)
+		_, _, err = key.VerifyStringAndExtract(tc.G.Log, big)
+		require.ErrorIs(t, err, pgpErrors.ErrMessageTooLarge, "algo %d", algo)
+		_, _, err = SigExtractPGPPayload(big)
+		require.ErrorIs(t, err, pgpErrors.ErrMessageTooLarge, "algo %d", algo)
 	}
 }
